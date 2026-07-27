@@ -23,8 +23,21 @@
     #opfsbadge[hidden] { display: none; }
     #imelog { position: fixed; inset: auto 0 0 0; background: #0009; color: #9f9;
               font: 12px/1.6 monospace; padding: 2px 10px; z-index: 2; min-height: 20px; }
-    #strip { padding: 56px 0 40px; display: flex; flex-direction: column; align-items: center; gap: 14px; }
+    #strip { padding: 56px 0 40px; display: flex; flex-direction: column; align-items: center; gap: 14px;
+             position: relative; /* the faint-box layer positions inside it */ }
     #strip canvas { background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.45); display: block; }
+    /* Faint paragraph boxes (edit mode) — the Android overlay's analog. They
+       live inside #strip so they scroll with the pages for free; the open
+       run's box is omitted while it is being edited. */
+    .parabox { position: absolute; border: 1px solid #3f51b566; background: #3f51b50d;
+               pointer-events: none; border-radius: 1px; }
+    #editmode { width: auto !important; padding: 0 10px; }
+    #editmode.active { background: #fff; color: #673ab7; font-weight: 600; }
+    /* Selection handles: the app's round knobs (never the OS teardrops),
+       hanging under the selection ends, draggable. */
+    .handle { position: fixed; width: 18px; height: 18px; border-radius: 50%;
+              background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
+              z-index: 3; display: none; touch-action: none; cursor: grab; }
     /* The IME sink (§7): 1x1, transparent, positioned at the caret. NEVER a
        visible editor — it exists only to summon the keyboard and receive
        keystrokes/composition. pointer-events:none is LOAD-BEARING (I9): the
@@ -68,6 +81,7 @@
     <button id="zout" title="zoom out">−</button>
     <span id="zoomlabel">100%</span>
     <button id="zin" title="zoom in">+</button>
+    <button id="editmode" title="toggle edit mode">✎ Edit</button>
     <button id="save" title="save PDF" style="width:auto;padding:0 10px">Save</button>
     <!-- Persistent §7 badge: unlike #status (which every paint overwrites),
          this stays visible for as long as saves cannot stream. -->
@@ -77,6 +91,8 @@
   <div id="strip"></div>
   <div id="caret"></div>
   <div id="selrects"></div>
+  <div class="handle" id="h0"></div>
+  <div class="handle" id="h1"></div>
   <textarea id="sink" autocapitalize="off" autocomplete="off" autocorrect="off"
             spellcheck="false" aria-hidden="true" tabindex="-1"></textarea>
   <div id="warn">
@@ -89,7 +105,7 @@
       </div>
     </div>
   </div>
-  <div id="imelog">tap a paragraph, then type — keystrokes edit the PDF via pdfe_edit_set_text</div>
+  <div id="imelog">view mode — click ✎ Edit to enable editing</div>
   <script type="module" src="main.js"></script>
 </body>
 </html>

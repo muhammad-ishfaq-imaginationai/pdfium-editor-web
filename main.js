@@ -19,6 +19,73 @@ let painted = new Set();   // page indexes already painted at the current zoom
 let zoom = 1;              // user zoom over fit-width
 let fitScale = 1;          // CSS px per PDF point at zoom 1
 const DPR = Math.min(window.devicePixelRatio || 1, 2);
+let pageCanvases = [];     // page index -> canvas (strip also holds #boxes now)
+
+// ---- edit mode (the Android FAB analog) -----------------------------------------
+// The viewer opens in VIEW mode: taps scroll/zoom only, nothing edits. The ✎
+// button toggles edit mode — faint paragraph boxes appear (worker "groups"),
+// taps open runs, long-press selects a word. Leaving edit mode commits any
+// open run, exactly like Android's bottom FAB.
+let editMode = false;
+const editBtn = document.getElementById("editmode");
+const pageGroups = new Map();     // page -> [{index, bounds:[l,b,r,t]}]
+const groupsPending = new Set();  // pages with a "groups" request in flight
+let editingParaIndex = -1;        // faint box to hide while its run is open
+
+function setEditMode(on) {
+  if (editMode === on) return;
+  editMode = on;
+  editBtn.textContent = on ? "✓ Done" : "✎ Edit";
+  editBtn.classList.toggle("active", on);
+  if (on) {
+    for (const canvas of pageCanvases) {
+      const r = canvas.getBoundingClientRect();
+      if (r.bottom > -300 && r.top < innerHeight + 300) {
+        requestGroups(Number(canvas.dataset.page));
+      }
+    }
+    imeLog.textContent = "edit mode — tap a paragraph to edit, long-press to select a word";
+  } else {
+    if (editingPage >= 0) worker.postMessage({ type: "commit" });
+    pageGroups.clear(); groupsPending.clear();
+    renderBoxes();
+    imeLog.textContent = "view mode — click ✎ Edit to enable editing";
+  }
+}
+
+function requestGroups(page) {
+  if (!editMode || pageGroups.has(page) || groupsPending.has(page)) return;
+  groupsPending.add(page);
+  worker.postMessage({ type: "groups", page });
+}
+
+// Faint paragraph boxes live INSIDE #strip (absolute within its relative
+// context) so they scroll with the document for free; only zoom/regroup
+// changes need a redraw.
+function renderBoxes() {
+  const boxesEl = document.getElementById("boxes");
+  if (!boxesEl) return;
+  boxesEl.innerHTML = "";
+  if (!editMode) return;
+  const scaleCss = fitScale * zoom;
+  for (const [page, paras] of pageGroups) {
+    const canvas = pageCanvases[page];
+    if (!canvas) continue;
+    for (const para of paras) {
+      if (page === editingPage && para.index === editingParaIndex) continue;
+      const b = para.bounds;
+      const div = document.createElement("div");
+      div.className = "parabox";
+      div.style.left = `${canvas.offsetLeft + b[0] * scaleCss}px`;
+      div.style.top = `${canvas.offsetTop + (pages[page].h - b[3]) * scaleCss}px`;
+      div.style.width = `${(b[2] - b[0]) * scaleCss}px`;
+      div.style.height = `${(b[3] - b[1]) * scaleCss}px`;
+      boxesEl.appendChild(div);
+    }
+  }
+}
+
+editBtn.addEventListener("click", () => setEditMode(!editMode));
 
 function setStatus(s) { status.textContent = s; }
 
@@ -50,11 +117,14 @@ worker.onmessage = (e) => {
     // Prime the sink with the run's logical text (no 'input' event fires for a
     // programmatic set, so this can't echo back as a keystroke).
     editingPage = msg.page;
+    editingParaIndex = msg.paraIndex ?? -1;
+    renderBoxes();                    // hide the open run's faint box
     sink.value = msg.text;
     sink.setSelectionRange(msg.caretIndex, msg.caretIndex);
     sink.focus({ preventScroll: true });
     drawCaret(msg.caret);
     drawSelection([]);
+    drawHandles(null, null);
     imeLog.textContent =
       `editing p${msg.page + 1} (${msg.isParagraph ? "paragraph" : "line"}, ` +
       `${msg.text.length} chars) — type; tap outside to commit`;
@@ -66,12 +136,25 @@ worker.onmessage = (e) => {
     sink.focus({ preventScroll: true });
     drawCaret(msg.caret);
     drawSelection([]);
+    drawHandles(null, null);
+  } else if (msg.type === "selectionChanged") {
+    // Word-select / handle drag: mirror the range into the sink (typing or
+    // Backspace then replaces/deletes it natively) and draw the app's own
+    // highlight + round handles from CORE geometry — never the OS selection.
+    selRange = [msg.start, msg.end];
+    // Direction matters: the next Shift+arrow must keep moving the same HEAD.
+    sink.setSelectionRange(msg.start, msg.end, msg.headAtStart ? "backward" : "forward");
+    sink.focus({ preventScroll: true });
+    drawCaret(null);
+    drawSelection(msg.rects || []);
+    drawHandles(msg.h0, msg.h1);
   } else if (msg.type === "editApplied") {
     // Keystroke fully applied: PDFium pixels already blitted by the worker;
     // reposition the caret/selection overlays from CORE geometry. Latency is
     // closed on THIS thread's clock (postedAt echoed verbatim).
     drawCaret(msg.caret);
     drawSelection(msg.selection || []);
+    if (!msg.selection || !msg.selection.length) { selRange = null; drawHandles(null, null); }
     const total = performance.now() - msg.postedAt;
     latencySamples.push(total);
     if (latencySamples.length > 200) latencySamples.shift();
@@ -82,18 +165,30 @@ worker.onmessage = (e) => {
       `${latencySamples.length} (gate ≤ 16 ms)`;
   } else if (msg.type === "editClosed") {
     editingPage = -1;
+    editingParaIndex = -1;
     sink.value = "";
     drawCaret(null);
     drawSelection([]);
+    drawHandles(null, null);
+    // The commit may have moved/re-split paragraphs: refresh this page's boxes.
+    if (editMode) { pageGroups.delete(msg.page); groupsPending.delete(msg.page); requestGroups(msg.page); }
+    renderBoxes();
     imeLog.textContent = `committed p${msg.page + 1} (${msg.ok ? "ok" : "REJECTED"})`;
+  } else if (msg.type === "groups") {
+    groupsPending.delete(msg.page);
+    pageGroups.set(msg.page, msg.paras);
+    renderBoxes();
   } else if (msg.type === "editEcho") {
     const rtt = Math.round((performance.now() - msg.postedAt) * 10) / 10;
     imeLog.textContent =
       `no run open — latch echo: ${msg.chars} chars, round-trip ${rtt} ms`;
   } else if (msg.type === "saved") {
     editingPage = -1;
+    editingParaIndex = -1;
     drawCaret(null);
     drawSelection([]);
+    drawHandles(null, null);
+    renderBoxes();
     window.lastSavedFile = msg.file;   // verification hook
     window.lastSave = msg;             // verification hook (ms / io stats / heap)
     deliver(msg.file).then((how) => {
@@ -135,7 +230,7 @@ function percentile(arr, p) {
 
 // Page points -> viewport CSS px for the editing page's canvas.
 function pageToCss(xPt, yPt) {
-  const canvas = strip.children[editingPage];
+  const canvas = pageCanvases[editingPage];
   if (!canvas) return null;
   const rect = canvas.getBoundingClientRect();
   const scaleCss = fitScale * zoom;
@@ -178,6 +273,58 @@ function drawSelection(rects) {
   }
 }
 
+// ---- selection handles (the Android round-knob analog) --------------------------
+// Two draggable round knobs hanging under the selection ends. Their geometry
+// is CORE caret geometry ([x, topPt, botPt] page points) mirrored to CSS;
+// dragging maps the pointer back to page points and lets the worker's
+// boundary map move ONE end (clamped inside the run — SEL6/SEL7).
+const handleEls = [document.getElementById("h0"), document.getElementById("h1")];
+let selRange = null;         // [start, end] while a handle selection is live
+let lastHandles = [null, null];   // page-point caret geometry per knob
+
+function drawHandles(h0, h1) {
+  lastHandles = [h0, h1];
+  [h0, h1].forEach((h, i) => {
+    const el = handleEls[i];
+    if (!h || editingPage < 0) { el.style.display = "none"; return; }
+    const bot = pageToCss(h[0], h[2]);   // knob hangs below the caret bottom
+    if (!bot) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    el.style.left = `${bot.x - 9}px`;
+    el.style.top = `${bot.y}px`;
+  });
+}
+
+handleEls.forEach((el, which) => {
+  el.addEventListener("pointerdown", (ev) => {
+    if (!selRange || editingPage < 0) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    try { el.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic/stale pointer */ }
+    const move = (mv) => {
+      const canvas = pageCanvases[editingPage];
+      if (!canvas || !selRange) return;
+      const rect = canvas.getBoundingClientRect();
+      const scaleCss = fitScale * zoom;
+      // The finger is on the knob BELOW the line — sample a point ~knob height
+      // above it so the boundary lookup lands on the line being dragged.
+      const xPt = (mv.clientX - rect.left) / scaleCss;
+      const yPt = pages[editingPage].h - (mv.clientY - 22 - rect.top) / scaleCss;
+      worker.postMessage({
+        type: "dragHandle", which,
+        start: selRange[0], end: selRange[1], xPt, yPt,
+      });
+    };
+    const up = () => {
+      el.removeEventListener("pointermove", move);
+      sink.focus({ preventScroll: true });   // the drag must not kill the keyboard
+    };
+    el.addEventListener("pointermove", move);
+    el.addEventListener("pointerup", up, { once: true });
+    el.addEventListener("pointercancel", up, { once: true });
+  });
+});
+
 // I9: taps that miss every canvas (the strip's gray gutter, the imelog bar)
 // used to do NOTHING except let the browser blur the sink — the edit stayed
 // open but the keyboard was silently dead. Route them as an explicit commit
@@ -197,6 +344,7 @@ document.addEventListener("pointerdown", (ev) => {
 function repositionOverlays() {
   drawCaret(lastCaretGeom);
   drawSelection(lastSelection);
+  drawHandles(lastHandles[0], lastHandles[1]);
 }
 window.addEventListener("scroll", repositionOverlays, { passive: true });
 window.addEventListener("resize", repositionOverlays);
@@ -239,7 +387,9 @@ const io = new IntersectionObserver(
   (entries) => {
     for (const en of entries) {
       if (!en.isIntersecting) continue;
-      requestPaint(Number(en.target.dataset.page));
+      const page = Number(en.target.dataset.page);
+      requestPaint(page);
+      requestGroups(page);   // no-op outside edit mode / when already cached
     }
   },
   { rootMargin: "300px" }
@@ -248,7 +398,7 @@ const io = new IntersectionObserver(
 function requestPaint(page) {
   if (painted.has(page)) return;
   painted.add(page);
-  const canvas = strip.children[page];
+  const canvas = pageCanvases[page];
   worker.postMessage({
     type: "paint",
     page,
@@ -261,20 +411,27 @@ function requestPaint(page) {
 function buildStrip() {
   strip.innerHTML = "";
   io.disconnect();
+  pageCanvases = [];
+  pageGroups.clear(); groupsPending.clear();
+  editingParaIndex = -1;
   const maxWpt = Math.max(...pages.map((p) => p.w));
   fitScale = Math.min(strip.clientWidth - 24, 900) / maxWpt;
   pages.forEach((p, i) => {
     const canvas = document.createElement("canvas");
     canvas.dataset.page = i;
     strip.appendChild(canvas);
+    pageCanvases[i] = canvas;
     // One-time ownership transfer; from here the WORKER draws (§2).
     const off = canvas.transferControlToOffscreen();
     worker.postMessage({ type: "attach", page: i, canvas: off }, [off]);
     io.observe(canvas);
     // Tap -> page points -> worker (hit-test + edit_begin / caret move / commit
-    // all happen where the engine state lives). Focus the sink immediately —
-    // browsers only show a keyboard for a focus inside the user gesture.
+    // all happen where the engine state lives). Edit mode only: in VIEW mode a
+    // tap scrolls/zooms and never edits (the Android FAB-off behavior).
+    // The tap itself fires on pointerUP (small movement, no long-press) so a
+    // held press can become a word-select instead — the Android gesture split.
     canvas.addEventListener("pointerdown", (ev) => {
+      if (!editMode) return;
       // I9: killing the default action stops the browser from moving focus to
       // <body> after this handler (a mousedown on a non-focusable canvas blurs
       // whatever is focused — i.e. the sink). Without this, every
@@ -282,14 +439,70 @@ function buildStrip() {
       // refocused in editOpened, but the caretMoved path never did.
       ev.preventDefault();
       const page = Number(canvas.dataset.page);
-      const rect = canvas.getBoundingClientRect();
-      const scaleCss = fitScale * zoom;
-      const xPt = (ev.clientX - rect.left) / scaleCss;
-      const yPt = pages[page].h - (ev.clientY - rect.top) / scaleCss;
-      worker.postMessage({ type: "tap", page, xPt, yPt });
-      focusSinkAt(ev.clientX, ev.clientY);
+      const startX = ev.clientX, startY = ev.clientY;
+      const toPt = (cx, cy) => {
+        const rect = canvas.getBoundingClientRect();
+        const scaleCss = fitScale * zoom;
+        return {
+          xPt: (cx - rect.left) / scaleCss,
+          yPt: pages[page].h - (cy - rect.top) / scaleCss,
+        };
+      };
+      let lpFired = false;
+      // Long-press (600 ms, < 8 px movement) selects the word under the
+      // finger — inside the OPEN run only, same as Android (the worker
+      // ignores it when no session is open on this page).
+      const lpTimer = setTimeout(() => {
+        lpFired = true;
+        const { xPt, yPt } = toPt(startX, startY);
+        worker.postMessage({ type: "selectWord", page, xPt, yPt });
+        sink.focus({ preventScroll: true });
+      }, 600);
+      let dragging = false;   // mouse/touch drag selection in the open run
+      const cleanup = () => {
+        clearTimeout(lpTimer);
+        canvas.removeEventListener("pointermove", move);
+        canvas.removeEventListener("pointerup", up);
+        canvas.removeEventListener("pointercancel", cleanup);
+      };
+      const move = (mv) => {
+        if (!dragging) {
+          if (Math.hypot(mv.clientX - startX, mv.clientY - startY) <= 8) return;
+          clearTimeout(lpTimer);   // moved: it is no longer a tap or long-press
+          if (editingPage !== page) { cleanup(); return; }  // no open run: plain pan
+          dragging = true;
+          try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+        }
+        // Anchor = press point, head = current point; the worker's boundary
+        // map clamps both to the open run (desktop mouse-drag selection).
+        const a = toPt(startX, startY);
+        const c = toPt(mv.clientX, mv.clientY);
+        worker.postMessage({
+          type: "dragSelect", page,
+          ax: a.xPt, ay: a.yPt, xPt: c.xPt, yPt: c.yPt,
+        });
+      };
+      const up = (uv) => {
+        cleanup();
+        if (lpFired) return;
+        if (dragging) {           // selection made: keep it (and the keyboard)
+          sink.focus({ preventScroll: true });
+          return;
+        }
+        const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
+        worker.postMessage({ type: "tap", page, xPt, yPt });
+        // Focus inside the user gesture — browsers only show a keyboard then.
+        focusSinkAt(uv.clientX, uv.clientY);
+      };
+      canvas.addEventListener("pointermove", move);
+      canvas.addEventListener("pointerup", up);
+      canvas.addEventListener("pointercancel", cleanup);
     });
   });
+  // The faint-box layer scrolls with the strip (absolute inside relative).
+  const boxesEl = document.createElement("div");
+  boxesEl.id = "boxes";
+  strip.appendChild(boxesEl);
   applyZoom(); // sets CSS + device sizes, then visible pages paint via IO
 }
 
@@ -297,7 +510,7 @@ function buildStrip() {
 function applyZoom() {
   const scaleCss = fitScale * zoom;        // CSS px per point
   const scaleDev = scaleCss * DPR;         // device px per point
-  for (const canvas of strip.children) {
+  for (const canvas of pageCanvases) {
     const p = pages[Number(canvas.dataset.page)];
     canvas.style.width = Math.round(p.w * scaleCss) + "px";
     canvas.style.height = Math.round(p.h * scaleCss) + "px";
@@ -305,12 +518,13 @@ function applyZoom() {
     canvas.dataset.h = Math.round(p.h * scaleDev);
     canvas.dataset.scale = scaleDev;
   }
+  renderBoxes();   // faint boxes track the new scale immediately
   // Old pixels keep showing, CSS-scaled (instant feedback, maybe blurry);
   // repaint at the new resolution after a short settle.
   painted = new Set();
   clearTimeout(applyZoom._t);
   applyZoom._t = setTimeout(() => {
-    for (const canvas of strip.children) {
+    for (const canvas of pageCanvases) {
       const r = canvas.getBoundingClientRect();
       if (r.bottom > -300 && r.top < innerHeight + 300) {
         requestPaint(Number(canvas.dataset.page));
@@ -491,11 +705,36 @@ sink.addEventListener("input", () => {
   imeLog.textContent = `sink: "${sink.value.slice(-40)}" caret ${sink.selectionStart} [${seenEvents.join(" → ")}]`;
 });
 sink.addEventListener("keydown", (e) => {
-  // Arrows/Home/End move the caret (or extend the selection with Shift)
-  // without an input event — mirror those too so the caret/selection overlays
-  // track. Up/Down move by the sink's own layout, not the PDF wrap (the
-  // Android deferral carries over) — left/right/tap are exact.
-  if (["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End"].includes(e.key)) {
+  // Up/Down must move by the PDF wrap, not the sink textarea's own layout —
+  // the 1×1 sink wraps at every char, so its native up/down degenerates to
+  // left/right. Route through the core: current caret/head geometry, one line
+  // height up/down, boundaryAt picks the char. Shift extends the selection
+  // (the moved end is the HEAD, the anchor stays); unshifted with a selection
+  // collapses to the edge in the travel direction first, like native editors.
+  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && editingPage >= 0) {
+    e.preventDefault();
+    const dir = e.key === "ArrowUp" ? -1 : 1;
+    const s = sink.selectionStart, en = sink.selectionEnd;
+    if (e.shiftKey) {
+      const headAtStart = s !== en && sink.selectionDirection === "backward";
+      worker.postMessage({
+        type: "caretLine", dir, extend: true,
+        index: headAtStart ? s : en,
+        anchor: headAtStart ? en : s,
+      });
+    } else {
+      worker.postMessage({
+        type: "caretLine", dir,
+        index: s !== en ? (dir < 0 ? s : en) : s,
+      });
+    }
+    return;
+  }
+  // Left/Right/Home/End move the caret (or extend the selection with Shift)
+  // without an input event — mirror those so the caret/selection overlays
+  // track. Left/right are exact (index math); Home/End follow the sink's own
+  // line model (the Android deferral carries over).
+  if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
     setTimeout(pushEdit, 0);
   }
 });

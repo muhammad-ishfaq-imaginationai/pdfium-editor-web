@@ -682,10 +682,124 @@ onmessage = async (e) => {
     postMessage({
       type: "editOpened",
       page: msg.page,
+      paraIndex: hit.index,   // the shell hides this paragraph's faint box
       text,
       caretIndex: caretIdx,
       caret: readCaret(caretIdx),
       isParagraph: F.editIsPara(editor) === 1,
+    });
+    return;
+  }
+
+  if (msg.type === "groups") {
+    // Faint paragraph boxes (the Android edit-mode overlay): group the page
+    // and hand back every paragraph's union bounds. Grouping is cached on the
+    // doc handle per page; re-running it here is the same call tap routing
+    // makes, so the fresh-open gate stays satisfied.
+    if (!doc) return;
+    const n = F.group(doc, acquirePage(msg.page), textPageOf(msg.page));
+    const bp = mod._malloc(16);
+    const paras = [];
+    for (let i = 0; i < n; i++) {
+      if (!F.paraInfo(doc, i, bp, 0, 0, 0)) continue;
+      paras.push({ index: i, bounds: readF32(bp, 4) });
+    }
+    mod._free(bp);
+    postMessage({ type: "groups", page: msg.page, paras });
+    return;
+  }
+
+  if (msg.type === "selectWord") {
+    // Long-press word selection (the Android onSelectWord analog): boundary at
+    // the pressed point, expanded to the containing non-whitespace run. The
+    // boundary map clamps to the open run, so selection can never leave it
+    // (the SEL6 invariant holds by construction).
+    if (!editor || msg.page !== editPage) return;
+    const text = readEditorText();
+    let idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    idx = Math.max(0, Math.min(idx, text.length));
+    const isWord = (c) => c !== undefined && !/\s/.test(c);
+    // A boundary can sit just past the pressed word's last char — step back
+    // one when the left neighbour is a word char but the right isn't.
+    if (!isWord(text[idx]) && isWord(text[idx - 1])) idx--;
+    if (!isWord(text[idx])) {   // pressed whitespace: just move the caret
+      postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+      return;
+    }
+    let ws = idx, we = idx + 1;
+    while (ws > 0 && isWord(text[ws - 1])) ws--;
+    while (we < text.length && isWord(text[we])) we++;
+    postMessage({
+      type: "selectionChanged", start: ws, end: we,
+      rects: readSelectionRects(ws, we),
+      h0: readCaret(ws), h1: readCaret(we),
+    });
+    return;
+  }
+
+  if (msg.type === "dragSelect") {
+    // Mouse/touch drag selection: anchor = the press point, head = the drag
+    // point, both mapped through the boundary map (clamped to the run, so the
+    // SEL6 invariant holds here too). Collapsing back to the anchor becomes a
+    // plain caret move.
+    if (!editor || msg.page !== editPage) return;
+    const a = F.editBoundary(editor, msg.ax, msg.ay);
+    const b = F.editBoundary(editor, msg.xPt, msg.yPt);
+    const s = Math.min(a, b), e = Math.max(a, b);
+    if (e <= s) {
+      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      return;
+    }
+    postMessage({
+      type: "selectionChanged", start: s, end: e, headAtStart: b < a,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  if (msg.type === "caretLine") {
+    // ArrowUp/Down: move one VISUAL line using core geometry — the 1×1 sink
+    // textarea wraps at every char, so its native up/down degenerates to
+    // left/right. Take the caret's x, step one line height up/down (PDF y
+    // grows upward), and let the wrap map's boundaryAt pick the char. Past
+    // the first/last line it lands back on the same line — a harmless no-op.
+    // With |extend| (Shift held) the moved index is the selection HEAD and
+    // |anchor| stays fixed — vertical selection extension by the PDF wrap.
+    if (!editor) return;
+    const c = readCaret(msg.index);   // [x, topPt, botPt], topPt > botPt
+    if (!c) return;
+    const h = Math.max(2, c[1] - c[2]);
+    const y = msg.dir < 0 ? c[1] + 0.7 * h : c[2] - 0.7 * h;
+    const idx = F.editBoundary(editor, c[0], y);
+    if (msg.extend) {
+      const s = Math.min(msg.anchor, idx), e = Math.max(msg.anchor, idx);
+      if (e > s) {
+        postMessage({
+          type: "selectionChanged", start: s, end: e, headAtStart: idx < msg.anchor,
+          rects: readSelectionRects(s, e),
+          h0: readCaret(s), h1: readCaret(e),
+        });
+        return;
+      }
+    }
+    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    return;
+  }
+
+  if (msg.type === "dragHandle") {
+    // Selection handle drag: map the dragged point to a char boundary and move
+    // ONE end, never flipping past the other (start stays < end — SEL4).
+    if (!editor) return;
+    const len = readEditorText().length;
+    let s = msg.start, e = msg.end;
+    const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    if (msg.which === 0) s = Math.max(0, Math.min(idx, e - 1));
+    else e = Math.min(len, Math.max(idx, s + 1));
+    postMessage({
+      type: "selectionChanged", start: s, end: e, headAtStart: msg.which === 0,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
     });
     return;
   }

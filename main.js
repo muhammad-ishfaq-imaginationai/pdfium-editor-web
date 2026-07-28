@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=99cc065"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=bbb5d40"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");
@@ -643,8 +643,28 @@ document.addEventListener("touchstart", (ev) => {
   ev.preventDefault();
   const mid = touchMid(ev.touches);
   pinchActive = true;
-  pinch = { dist0: touchDist(ev.touches), zoom0: zoom,
-            anchor: pagePointAt(mid.x, mid.y) };
+  // Anchor on the page point under the midpoint; a midpoint over the gray
+  // gutter/margins (no canvas) anchors on the NEAREST page instead — with no
+  // anchor at all the browser keeps a clamped scroll and the view lurches
+  // toward the page end (iPhone report, I17 follow-up).
+  let anchor = pagePointAt(mid.x, mid.y);
+  if (!anchor) {
+    let best = null, bestD = Infinity;
+    for (const canvas of pageCanvases) {
+      const r = canvas.getBoundingClientRect();
+      const dx = Math.max(r.left - mid.x, 0, mid.x - r.right);
+      const dy = Math.max(r.top - mid.y, 0, mid.y - r.bottom);
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = { canvas, r }; }
+    }
+    if (best) {
+      const scaleCss = fitScale * zoom;
+      anchor = { page: Number(best.canvas.dataset.page),
+                 xPt: (Math.min(Math.max(mid.x, best.r.left), best.r.right) - best.r.left) / scaleCss,
+                 yPt: (Math.min(Math.max(mid.y, best.r.top), best.r.bottom) - best.r.top) / scaleCss };
+    }
+  }
+  pinch = { dist0: touchDist(ev.touches), zoom0: zoom, anchor };
 }, { passive: false });
 
 document.addEventListener("touchmove", (ev) => {

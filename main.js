@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=bbb5d40"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=cf38aa8"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");
@@ -861,30 +861,33 @@ sink.addEventListener("keydown", (e) => {
   // height up/down, boundaryAt picks the char. Shift extends the selection
   // (the moved end is the HEAD, the anchor stays); unshifted with a selection
   // collapses to the edge in the travel direction first, like native editors.
-  if ((e.key === "ArrowUp" || e.key === "ArrowDown") && editingPage >= 0) {
+  // Home/End share the caretLine path: the sink's own Home/End are as
+  // degenerate as its up/down (every char is a "line"), so the core clamps
+  // an extreme x to the caret's visual line instead (edge = -1/+1).
+  if (["ArrowUp", "ArrowDown", "Home", "End"].includes(e.key) && editingPage >= 0) {
     e.preventDefault();
-    const dir = e.key === "ArrowUp" ? -1 : 1;
+    const dir = e.key === "ArrowUp" || e.key === "Home" ? -1 : 1;
+    const edge = e.key === "Home" ? -1 : e.key === "End" ? 1 : 0;
     const s = sink.selectionStart, en = sink.selectionEnd;
     if (e.shiftKey) {
       const headAtStart = s !== en && sink.selectionDirection === "backward";
       worker.postMessage({
-        type: "caretLine", dir, extend: true,
+        type: "caretLine", dir, edge, extend: true,
         index: headAtStart ? s : en,
         anchor: headAtStart ? en : s,
       });
     } else {
       worker.postMessage({
-        type: "caretLine", dir,
+        type: "caretLine", dir, edge,
         index: s !== en ? (dir < 0 ? s : en) : s,
       });
     }
     return;
   }
-  // Left/Right/Home/End move the caret (or extend the selection with Shift)
-  // without an input event — mirror those so the caret/selection overlays
-  // track. Left/right are exact (index math); Home/End follow the sink's own
-  // line model (the Android deferral carries over).
-  if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) {
+  // Left/Right move the caret (or extend the selection with Shift) without an
+  // input event — mirror those so the caret/selection overlays track (exact
+  // index math in the sink).
+  if (["ArrowLeft", "ArrowRight"].includes(e.key)) {
     setTimeout(pushEdit, 0);
   }
 });

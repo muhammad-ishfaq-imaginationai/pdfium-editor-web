@@ -9,7 +9,7 @@
 // slot + tile queue). The engine edit pass is STUBBED until the edit-session
 // ABI lands (core Steps 3–4); the keystroke pipe and its coalescing are real.
 
-importScripts("./editor.js?v=bbb5d40"); // classic worker: defines createPdfe
+importScripts("./editor.js?v=cf38aa8"); // classic worker: defines createPdfe
 
 const PDFE_RENDER_RGBA = 0x1;
 
@@ -44,7 +44,7 @@ let pool = { ptr: 0, size: 0 };
 
 // locateFile: the Emscripten glue resolves editor.wasm relative to the
 // WORKER's URL (/web/), not the glue's — point it back at /wasm/dist/.
-const ready = createPdfe({ locateFile: (f) => "./" + f + "?v=bbb5d40" }).then((m) => {
+const ready = createPdfe({ locateFile: (f) => "./" + f + "?v=cf38aa8" }).then((m) => {
   mod = m;
   F.init         = m.cwrap("pdfe_init", "number", ["number"]);
   F.openMem      = m.cwrap("pdfe_open_mem", "number", ["number", "number", "number"]);
@@ -792,14 +792,35 @@ onmessage = async (e) => {
     // left/right. Take the caret's x, step one line height up/down (PDF y
     // grows upward), and let the wrap map's boundaryAt pick the char. Past
     // the first/last line it lands back on the same line — a harmless no-op.
+    // With |edge| (Home/End — same degenerate-sink problem) stay ON the
+    // caret's line (mid-line y) and clamp an extreme x to its first/last
+    // boundary instead.
     // With |extend| (Shift held) the moved index is the selection HEAD and
     // |anchor| stays fixed — vertical selection extension by the PDF wrap.
     if (!editor) return;
     const c = readCaret(msg.index);   // [x, topPt, botPt], topPt > botPt
     if (!c) return;
-    const h = Math.max(2, c[1] - c[2]);
-    const y = msg.dir < 0 ? c[1] + 0.7 * h : c[2] - 0.7 * h;
-    const idx = F.editBoundary(editor, c[0], y);
+    let x, y;
+    if (msg.edge) {
+      x = msg.edge < 0 ? -1e6 : 1e6;
+      y = (c[1] + c[2]) / 2;
+    } else {
+      const h = Math.max(2, c[1] - c[2]);
+      x = c[0];
+      y = msg.dir < 0 ? c[1] + 0.7 * h : c[2] - 0.7 * h;
+    }
+    let idx = F.editBoundary(editor, x, y);
+    if (msg.edge > 0) {
+      // The line-end boundary IS the wrap point, and the wrap point's caret
+      // renders at the NEXT line's start — step back while the caret still
+      // draws below the starting line so End visually stays on its own line.
+      const h = Math.max(2, c[1] - c[2]);
+      while (idx > msg.index) {
+        const cc = readCaret(idx);
+        if (cc && cc[2] < c[2] - 0.5 * h) idx--;
+        else break;
+      }
+    }
     if (msg.extend) {
       const s = Math.min(msg.anchor, idx), e = Math.max(msg.anchor, idx);
       if (e > s) {

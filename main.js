@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=cf38aa8"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=537b953"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");

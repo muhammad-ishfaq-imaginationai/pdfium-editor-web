@@ -9,7 +9,7 @@
 // slot + tile queue). The engine edit pass is STUBBED until the edit-session
 // ABI lands (core Steps 3–4); the keystroke pipe and its coalescing are real.
 
-importScripts("./editor.js?v=82f0ae3"); // classic worker: defines createPdfe
+importScripts("./editor.js?v=b4d50b5"); // classic worker: defines createPdfe
 
 const PDFE_RENDER_RGBA = 0x1;
 
@@ -44,7 +44,7 @@ let pool = { ptr: 0, size: 0 };
 
 // locateFile: the Emscripten glue resolves editor.wasm relative to the
 // WORKER's URL (/web/), not the glue's — point it back at /wasm/dist/.
-const ready = createPdfe({ locateFile: (f) => "./" + f + "?v=82f0ae3" }).then((m) => {
+const ready = createPdfe({ locateFile: (f) => "./" + f + "?v=b4d50b5" }).then((m) => {
   mod = m;
   F.init         = m.cwrap("pdfe_init", "number", ["number"]);
   F.openMem      = m.cwrap("pdfe_open_mem", "number", ["number", "number", "number"]);

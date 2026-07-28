@@ -45,7 +45,7 @@
     #editmode.active { background: #fff; color: #673ab7; font-weight: 600; }
     /* Selection handles: the app's round knobs (never the OS teardrops),
        hanging under the selection ends, draggable. */
-    .handle { position: fixed; width: 18px; height: 18px; border-radius: 50%;
+    .handle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
               background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
               z-index: 3; display: none; touch-action: none; cursor: grab; }
     /* The IME sink (§7): 1x1, transparent, positioned at the caret. NEVER a
@@ -55,7 +55,7 @@
        hit-testing on it swallows that tap — the canvas never sees it, so the
        caret doesn't move and commit-on-tap-outside doesn't fire. Programmatic
        focus() still works on a pointer-events:none element. */
-    #sink { position: fixed; left: -100px; top: -100px; width: 1px; height: 1px;
+    #sink { position: absolute; left: -100px; top: -100px; width: 1px; height: 1px;
             padding: 0; border: 0; outline: 0; background: transparent; color: transparent;
             caret-color: transparent; resize: none; overflow: hidden; z-index: 1;
             pointer-events: none;
@@ -77,16 +77,27 @@
     #warnbtns button#warnok { background: #673ab7; color: #fff; border-color: #673ab7; }
     #warnbtns button#warnok[hidden] { display: none; }
     /* Caret + selection overlays (§6): drawn by the viewer from CORE geometry
-       (page points -> CSS), never from browser text metrics. */
-    #caret { position: fixed; width: 2px; background: #000; z-index: 1;
+       (page points -> CSS), never from browser text metrics.
+       DOCUMENT-SPACE, not fixed (I16, iPhone pinch-zoom 2026-07-28): iOS
+       pinch is a visual-viewport camera move that fires no window scroll/
+       resize and slides content under position:fixed elements — the caret
+       visibly detached from its text. position:absolute at document coords
+       (pure offsetLeft/offsetTop layout math) moves with the content under
+       ANY camera transform, exactly like the immune .parabox overlays. */
+    #caret { position: absolute; width: 2px; background: #000; z-index: 1;
              display: none; pointer-events: none; animation: caretblink 1s steps(1) infinite; }
     @keyframes caretblink { 50% { opacity: 0; } }
-    .selrect { position: fixed; background: #3f51b555; z-index: 1; pointer-events: none; }
+    .selrect { position: absolute; background: #3f51b555; z-index: 1; pointer-events: none; }
   </style>
 </head>
 <body>
   <div id="bar">
     <strong>pdfium-editor</strong>
+    <!-- Deploy identity: build_site.sh stamps the source commit here so a
+         tester can always tell WHICH version their browser is running
+         (user request 2026-07-28, after a stale-cache false alarm). -->
+    <span id="appver" title="deployed version"
+          style="font-size:11px;background:#fff3;border-radius:3px;padding:1px 5px">b4d50b5</span>
     <input id="file" type="file" accept="application/pdf">
     <button id="zout" title="zoom out">−</button>
     <span id="zoomlabel">100%</span>
@@ -126,6 +137,6 @@
     </div>
   </div>
   <div id="imelog">view mode — click ✎ Edit to enable editing</div>
-  <script type="module" src="main.js?v=82f0ae3"></script>
+  <script type="module" src="main.js?v=b4d50b5"></script>
 </body>
 </html>

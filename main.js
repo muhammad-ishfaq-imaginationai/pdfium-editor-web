@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=82f0ae3"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=b4d50b5"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");
@@ -258,15 +258,20 @@ function percentile(arr, p) {
   return s[Math.min(s.length - 1, Math.ceil((p / 100) * s.length) - 1)];
 }
 
-// Page points -> viewport CSS px for the editing page's canvas.
+// Page points -> DOCUMENT CSS px for the editing page's canvas (I16): pure
+// layout offsets, no viewport rects — the overlays are position:absolute in
+// document space, so scroll and iOS pinch-zoom move them WITH the glyphs
+// (position:fixed + client rects detached the caret under Safari's
+// visual-viewport camera, which fires no window scroll/resize).
+// offset chain: canvas.offsetParent is #strip (position:relative),
+// #strip's offsetParent is body (margin 0) — the sum IS the document coord.
 function pageToCss(xPt, yPt) {
   const canvas = pageCanvases[editingPage];
   if (!canvas) return null;
-  const rect = canvas.getBoundingClientRect();
   const scaleCss = fitScale * zoom;
   return {
-    x: rect.left + xPt * scaleCss,
-    y: rect.top + (pages[editingPage].h - yPt) * scaleCss,
+    x: strip.offsetLeft + canvas.offsetLeft + xPt * scaleCss,
+    y: strip.offsetTop + canvas.offsetTop + (pages[editingPage].h - yPt) * scaleCss,
   };
 }
 
@@ -370,13 +375,14 @@ document.addEventListener("pointerdown", (ev) => {
   worker.postMessage({ type: "commit" });
 });
 
-// Overlays are position:fixed — track scroll/zoom/resize.
+// Overlays live in DOCUMENT space (I16) — scroll and pinch-zoom move them
+// with the content for free; only a LAYOUT change (window resize re-centers
+// the strip, app zoom rescales it) needs a redraw.
 function repositionOverlays() {
   drawCaret(lastCaretGeom);
   drawSelection(lastSelection);
   drawHandles(lastHandles[0], lastHandles[1]);
 }
-window.addEventListener("scroll", repositionOverlays, { passive: true });
 window.addEventListener("resize", repositionOverlays);
 
 // The bar WRAPS on narrow screens (see index.html): keep the page strip below
@@ -540,7 +546,8 @@ function buildStrip() {
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
         worker.postMessage({ type: "tap", page, xPt, yPt });
         // Focus inside the user gesture — browsers only show a keyboard then.
-        focusSinkAt(uv.clientX, uv.clientY);
+        // The sink is DOCUMENT-space absolute (I16): client -> document coords.
+        focusSinkAt(uv.clientX + scrollX, uv.clientY + scrollY);
       };
       canvas.addEventListener("pointermove", move);
       canvas.addEventListener("pointerup", up);

@@ -68,6 +68,9 @@ const ready = createPdfe({ locateFile: (f) => "./" + f }).then((m) => {
     ["number", "number", "number", "number", "number", "number"]);
   F.editBegin     = m.cwrap("pdfe_edit_begin", "number",
     ["number", "number", "number", "number"]);
+  F.editBeginEx   = m.cwrap("pdfe_edit_begin_ex", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editLineMode  = m.cwrap("pdfe_edit_line_mode", "number", ["number"]);
   F.editTextPage  = m.cwrap("pdfe_edit_text_page", "number", ["number"]);
   F.editIsPara    = m.cwrap("pdfe_edit_is_paragraph", "number", ["number"]);
   F.editText      = m.cwrap("pdfe_edit_text", "number", ["number", "number", "number"]);
@@ -228,6 +231,29 @@ function commitEditor() {
   if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
   editor = 0; editPage = -1; editParaBounds = null;
   postMessage({ type: "editClosed", page, ok: ok === 1 });
+}
+
+// Open the core editor on |hit| (a hitParagraph result) at page point
+// (xPt, yPt). |lineMode|: -1 auto (the core heuristic classifies list-like
+// paragraphs as line-preserving), 0 force reflow, 1 force line-preserving.
+function openEditorAt(page, hit, xPt, yPt, lineMode) {
+  const ed = F.editBeginEx(doc, acquirePage(page), textPageOf(page), hit.index, lineMode);
+  if (!ed) return;
+  editor = ed;
+  editPage = page;
+  editParaBounds = hit.bounds;
+  const text = readEditorText();
+  const caretIdx = F.editBoundary(editor, xPt, yPt);
+  postMessage({
+    type: "editOpened",
+    page,
+    paraIndex: hit.index,   // the shell hides this paragraph's faint box
+    text,
+    caretIndex: caretIdx,
+    caret: readCaret(caretIdx),
+    isParagraph: F.editIsPara(editor) === 1,
+    linePreserve: F.editLineMode(editor) === 1,
+  });
 }
 
 // ---- tier-2 lazy load (docs/WEB_IO.md §3) --------------------------------------
@@ -672,22 +698,24 @@ onmessage = async (e) => {
     if (!hit) return;             // empty space: nothing more to do
     // The grouping ran just above (hitParagraph), so the core's fresh-open
     // gate is satisfied by construction.
-    const ed = F.editBegin(doc, acquirePage(msg.page), textPageOf(msg.page), hit.index);
-    if (!ed) return;
-    editor = ed;
-    editPage = msg.page;
-    editParaBounds = hit.bounds;
-    const text = readEditorText();
-    const caretIdx = F.editBoundary(editor, msg.xPt, msg.yPt);
-    postMessage({
-      type: "editOpened",
-      page: msg.page,
-      paraIndex: hit.index,   // the shell hides this paragraph's faint box
-      text,
-      caretIndex: caretIdx,
-      caret: readCaret(caretIdx),
-      isParagraph: F.editIsPara(editor) === 1,
-    });
+    openEditorAt(msg.page, hit, msg.xPt, msg.yPt, -1);
+    return;
+  }
+
+  if (msg.type === "toggleLineMode") {
+    // Commit the open paragraph and reopen it in the OTHER line mode, forced
+    // past the core heuristic (the Android btnLineMode analog). The paragraph
+    // is re-resolved by hit-testing its own box center against the fresh
+    // grouping commitEditor left behind.
+    if (!editor || !editParaBounds) return;
+    const page = editPage;
+    const cx = (editParaBounds[0] + editParaBounds[2]) / 2;
+    const cy = (editParaBounds[1] + editParaBounds[3]) / 2;
+    const forced = F.editLineMode(editor) === 1 ? 0 : 1;
+    commitEditor();
+    const hit = hitParagraph(page, cx, cy);
+    if (!hit) return;
+    openEditorAt(page, hit, cx, cy, forced);
     return;
   }
 

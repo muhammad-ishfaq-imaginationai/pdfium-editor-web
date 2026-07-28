@@ -28,6 +28,29 @@ let pageCanvases = [];     // page index -> canvas (strip also holds #boxes now)
 // open run, exactly like Android's bottom FAB.
 let editMode = false;
 const editBtn = document.getElementById("editmode");
+
+// Per-paragraph line mode (the Android btnLineMode/config parity). The core
+// heuristic decides reflow vs line-preserving; the manual toggle button is a
+// CONFIG-GATED extra (checkbox in the bar, persisted in localStorage).
+const lineModeBtn = document.getElementById("linemode");
+const lmConf = document.getElementById("lmtoggleconf");
+const LM_PREF = "pdfe.lineModeToggle";
+lmConf.checked = localStorage.getItem(LM_PREF) === "1";
+let editingIsParagraph = false;
+let editingLinePreserve = false;
+
+function updateLineModeButton() {
+  const show = lmConf.checked && editingPage >= 0 && editingIsParagraph;
+  lineModeBtn.hidden = !show;
+  lineModeBtn.textContent = editingLinePreserve ? "≡ Lines" : "¶ Reflow";
+}
+lmConf.addEventListener("change", () => {
+  localStorage.setItem(LM_PREF, lmConf.checked ? "1" : "0");
+  updateLineModeButton();
+});
+lineModeBtn.addEventListener("click", () => {
+  if (editingPage >= 0) worker.postMessage({ type: "toggleLineMode" });
+});
 const pageGroups = new Map();     // page -> [{index, bounds:[l,b,r,t]}]
 const groupsPending = new Set();  // pages with a "groups" request in flight
 let editingParaIndex = -1;        // faint box to hide while its run is open
@@ -125,8 +148,13 @@ worker.onmessage = (e) => {
     drawCaret(msg.caret);
     drawSelection([]);
     drawHandles(null, null);
+    editingIsParagraph = msg.isParagraph;
+    editingLinePreserve = !!msg.linePreserve;
+    updateLineModeButton();
     imeLog.textContent =
-      `editing p${msg.page + 1} (${msg.isParagraph ? "paragraph" : "line"}, ` +
+      `editing p${msg.page + 1} (${msg.isParagraph
+        ? (msg.linePreserve ? "paragraph ≡ lines" : "paragraph ¶ reflow")
+        : "line"}, ` +
       `${msg.text.length} chars) — type; tap outside to commit`;
   } else if (msg.type === "caretMoved") {
     sink.setSelectionRange(msg.index, msg.index);
@@ -166,6 +194,8 @@ worker.onmessage = (e) => {
   } else if (msg.type === "editClosed") {
     editingPage = -1;
     editingParaIndex = -1;
+    editingIsParagraph = false;
+    updateLineModeButton();
     sink.value = "";
     drawCaret(null);
     drawSelection([]);

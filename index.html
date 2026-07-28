@@ -82,6 +82,16 @@
     <span id="zoomlabel">100%</span>
     <button id="zin" title="zoom in">+</button>
     <button id="editmode" title="toggle edit mode">✎ Edit</button>
+    <!-- Per-paragraph line mode (Android btnLineMode parity): visible only
+         while a multi-line paragraph is open AND the config checkbox is on
+         (production stays heuristic-only). -->
+    <button id="linemode" hidden
+            title="toggle reflow / keep-lines for this paragraph"
+            style="width:auto;padding:0 10px">¶ Reflow</button>
+    <label id="lmconfig" title="config: show the line-mode toggle while editing"
+           style="font-size:12px;white-space:nowrap">
+      <input type="checkbox" id="lmtoggleconf"> mode btn
+    </label>
     <button id="save" title="save PDF" style="width:auto;padding:0 10px">Save</button>
     <!-- Persistent §7 badge: unlike #status (which every paint overwrites),
          this stays visible for as long as saves cannot stream. -->

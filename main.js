@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=b4d50b5"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=99cc065"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");
@@ -507,6 +507,7 @@ function buildStrip() {
       // finger — inside the OPEN run only, same as Android (the worker
       // ignores it when no session is open on this page).
       const lpTimer = setTimeout(() => {
+        if (pinchActive) return;   // two held fingers are a pinch, not a long-press
         lpFired = true;
         const { xPt, yPt } = toPt(startX, startY);
         worker.postMessage({ type: "selectWord", page, xPt, yPt });
@@ -520,6 +521,7 @@ function buildStrip() {
         canvas.removeEventListener("pointercancel", cleanup);
       };
       const move = (mv) => {
+        if (pinchActive) { cleanup(); return; }   // a pinch owns both fingers (I17)
         if (!dragging) {
           if (Math.hypot(mv.clientX - startX, mv.clientY - startY) <= 8) return;
           clearTimeout(lpTimer);   // moved: it is no longer a tap or long-press
@@ -538,6 +540,9 @@ function buildStrip() {
       };
       const up = (uv) => {
         cleanup();
+        // A finger lifting off a pinch must not read as a tap (I17): the
+        // caret would jump to wherever the pinch ended.
+        if (pinchActive || performance.now() - lastPinchEnd < 350) return;
         if (lpFired) return;
         if (dragging) {           // selection made: keep it (and the keyboard)
           sink.focus({ preventScroll: true });
@@ -597,6 +602,76 @@ function setZoom(z) {
 
 document.getElementById("zin").addEventListener("click", () => setZoom(zoom * 1.25));
 document.getElementById("zout").addEventListener("click", () => setZoom(zoom / 1.25));
+
+// ---- mobile pinch = APP zoom (I17) ----------------------------------------------
+// Native mobile pinch is a visual-viewport camera zoom: it STRETCHES the
+// already-rendered canvas bitmap and the text goes blurry (iPhone + Android
+// Chrome report, 2026-07-28). Desktop is sharp because −/+ go through
+// setZoom, which repaints tiles at the new scale. So: suppress the browser's
+// pinch (viewport meta + touch-action for Chrome; the cancelable iOS gesture
+// events below for Safari, which ignores both) and drive setZoom from a
+// two-finger gesture. The page point between the fingers is PINNED: after
+// each zoom step, scroll so it lands back under the pinch midpoint.
+let pinchActive = false;          // canvas tap/drag handlers bail while true
+let lastPinchEnd = 0;             // suppress the trailing pointerup "tap"
+let pinch = null;                 // {dist0, zoom0, anchor}
+const touchDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+const touchMid = (t) => ({ x: (t[0].clientX + t[1].clientX) / 2,
+                           y: (t[0].clientY + t[1].clientY) / 2 });
+
+// The page canvas under a client point + the (top-origin) page point under it.
+function pagePointAt(clientX, clientY) {
+  const el = document.elementsFromPoint(clientX, clientY).find((e) => e.tagName === "CANVAS");
+  if (!el || el.dataset.page === undefined) return null;
+  const r = el.getBoundingClientRect();
+  const scaleCss = fitScale * zoom;
+  return { page: Number(el.dataset.page),
+           xPt: (clientX - r.left) / scaleCss,
+           yPt: (clientY - r.top) / scaleCss };
+}
+// That page point's DOCUMENT position at the CURRENT zoom (layout offsets are
+// already updated synchronously when this runs after setZoom).
+function pagePointDocCss(pt) {
+  const canvas = pageCanvases[pt.page];
+  const scaleCss = fitScale * zoom;
+  return { x: strip.offsetLeft + canvas.offsetLeft + pt.xPt * scaleCss,
+           y: strip.offsetTop + canvas.offsetTop + pt.yPt * scaleCss };
+}
+
+document.addEventListener("touchstart", (ev) => {
+  if (ev.touches.length !== 2 || !pages.length) return;
+  ev.preventDefault();
+  const mid = touchMid(ev.touches);
+  pinchActive = true;
+  pinch = { dist0: touchDist(ev.touches), zoom0: zoom,
+            anchor: pagePointAt(mid.x, mid.y) };
+}, { passive: false });
+
+document.addEventListener("touchmove", (ev) => {
+  if (!pinch || ev.touches.length !== 2) return;
+  ev.preventDefault();
+  const mid = touchMid(ev.touches);
+  setZoom(pinch.zoom0 * (touchDist(ev.touches) / pinch.dist0));
+  if (pinch.anchor) {
+    const css = pagePointDocCss(pinch.anchor);
+    scrollTo(css.x - mid.x, css.y - mid.y);
+  }
+}, { passive: false });
+
+const endPinch = (ev) => {
+  if (!pinchActive) return;
+  if (ev.touches && ev.touches.length >= 2) return;   // still pinching
+  pinchActive = false;
+  pinch = null;
+  lastPinchEnd = performance.now();
+};
+document.addEventListener("touchend", endPinch);
+document.addEventListener("touchcancel", endPinch);
+
+// iOS Safari ignores touch-action/viewport meta for its page zoom, but the
+// proprietary gesture events are cancelable and DO block it.
+for (const t of ["gesturestart", "gesturechange", "gestureend"])
+  document.addEventListener(t, (ev) => ev.preventDefault(), { passive: false });
 // ---- saving: warning gate, destination, delivery (docs/WEB_IO.md §6–§7) --------
 let opfsAvailable = true;     // set from the worker's probe at ready
 let inHeapMaxMB = 0;

@@ -6,7 +6,7 @@
 // Step 7 additions: zoom (CSS-instant, sharp tiles refill async — §5) and the
 // hidden-input IME sink (§7) feeding the worker's newest-wins latch (§9).
 
-const worker = new Worker("worker.js?v=2a5cbd7"); // classic worker (importScripts glue)
+const worker = new Worker("worker.js?v=82f0ae3"); // classic worker (importScripts glue)
 window.worker = worker;                 // verification hook (drive the worker directly)
 const strip = document.getElementById("strip");
 const status = document.getElementById("status");
@@ -379,6 +379,23 @@ function repositionOverlays() {
 window.addEventListener("scroll", repositionOverlays, { passive: true });
 window.addEventListener("resize", repositionOverlays);
 
+// The bar WRAPS on narrow screens (see index.html): keep the page strip below
+// its REAL height, whatever row count it wrapped to (small-phone report
+// 2026-07-28 — a fixed padding assumed the one-row 44px bar).
+function syncStripTop() {
+  const bar = document.getElementById("bar");
+  document.getElementById("strip").style.paddingTop = (bar.offsetHeight + 12) + "px";
+}
+window.addEventListener("resize", syncStripTop);
+// Kept in a module binding: an unreferenced observer's firing is GC-dependent.
+// Called DIRECTLY (never via requestAnimationFrame — rAF starves in a
+// non-composited tab and the padding would stall at a stale height); the
+// observer fires after layout, which is exactly when offsetHeight is right.
+// Belt and braces: buildStrip() also re-syncs on every document open.
+const barObserver = new ResizeObserver(syncStripTop);
+barObserver.observe(document.getElementById("bar"));
+syncStripTop();
+
 // Two-tier load (docs/WEB_IO.md §3): the main thread hands the worker the
 // Blob/File itself — never the bytes. The worker picks the tier by size (a
 // structured-clone of a Blob is by reference, so a 1 GB file costs nothing
@@ -439,6 +456,7 @@ function requestPaint(page) {
 }
 
 function buildStrip() {
+  syncStripTop();   // the filename in the bar may have re-wrapped it just now
   strip.innerHTML = "";
   io.disconnect();
   pageCanvases = [];

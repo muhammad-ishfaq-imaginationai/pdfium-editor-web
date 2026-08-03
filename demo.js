@@ -6,12 +6,18 @@
 // editor itself contributes no chrome; it is created once here and driven
 // entirely through its API + events.
 //
+// The chrome was redesigned 2026-08-03 (this page IS the published tester site,
+// so it is a product surface): stage states, drag-and-drop open, the theme-driven
+// canvas colour, the ⋯ menu and the status bar all live here. Only presentation —
+// every SDK call and event below is the same one a third-party host makes. The
+// patterns are written up in docs/EDITOR_SDK.md §4a.
+//
 // It is also our browser test harness, so the window.* hooks earlier sessions'
 // verification scripts use are re-exported verbatim (window.worker,
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.1-9876443";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.2-e89453c";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -20,6 +26,22 @@ const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
 const imeLog = $("imelog");
 const setStatus = (s) => { statusEl.textContent = s; };
+
+// ---- chrome state (host-owned presentation only) ----------------------------
+// The stage has three looks and CSS picks between them off this one attribute:
+// "loading" (engine starting), "empty" (no document — what a tester sees first
+// on the published site, which ships no sample PDF), "doc" (the editor).
+const stage = $("stage");
+const setStage = (s) => { stage.dataset.state = s; };
+// The edit/save buttons carry an icon, so their label lives in a <span> — never
+// assign to button.textContent here or the icon goes with it.
+const label = (btn, text) => { btn.querySelector("span").textContent = text; };
+const modeChip = $("modechip");
+const setHint = (mode, text) => {
+  modeChip.textContent = mode;
+  modeChip.classList.toggle("editing", mode !== "View");
+  imeLog.textContent = text;
+};
 
 // Dev knobs kept from the old viewer: ?tier=1|2 forces a load tier, ?block=KB
 // sets the lazy cache block size, ?noopfs pretends this browser cannot stream
@@ -52,6 +74,17 @@ const editor = new PdfeEditor({
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
 window.latencySamples = editor.latencySamples; // the latency-gate harness reads this
+
+// The surround behind the pages follows this page's theme. The host owns the
+// colour (setBackgroundColor) and takes it straight from the --canvas token, so
+// the chrome and the editor can never drift apart in light or dark mode.
+const darkQ = matchMedia("(prefers-color-scheme: dark)");
+function syncCanvasColor() {
+  const c = getComputedStyle(document.documentElement).getPropertyValue("--canvas").trim();
+  if (c) editor.setBackgroundColor(c);
+}
+darkQ.addEventListener("change", syncCanvasColor);
+syncCanvasColor();
 
 // ---- password-protected documents (HOST chrome) -----------------------------
 // The SDK never prompts: open() rejects with 'password-required' (encrypted, we
@@ -101,6 +134,7 @@ async function openDocument(source, opts = {}) {
         wrong: e.code === "password-wrong",
       });
       if (password === null) {       // user cancelled: leave the viewer empty
+        if (!editor.pageCount) setStage("empty");
         setStatus("locked document — no password given");
         return null;
       }
@@ -122,21 +156,37 @@ fetch(ENGINE_URL.replace(/\.js$/, ".wasm"), { method: "HEAD" })
     if (!built) return;
     const badge = $("appver");
     badge.title = `engine built ${built}`;
+    // Also readable without hovering: the overflow menu states it in words, so a
+    // tester filing "this is stale" can quote the engine's build time.
+    $("enginenote").textContent = `engine built ${built}`;
     console.log(`[pdfe] engine editor.wasm built ${built} — version stamp "${version}"`);
   })
-  .catch(() => {});
+  .catch(() => { $("enginenote").textContent = "engine build time unavailable"; });
 
 // ---- engine ready → load the corpus sample ---------------------------------
 editor.on("ready", (caps) => {
   $("opfsbadge").hidden = caps.canStreamSave;
   setStatus("engine ready — loading corpus PDF…");
-  openDocument(SAMPLE_PDF).catch(() => setStatus("engine ready — pick a PDF"));
+  // The published site ships no sample (build_site.sh), so this normally fails
+  // there and the empty state takes over — that is the intended first screen.
+  openDocument(SAMPLE_PDF).catch(() => {
+    setStage("empty");
+    setStatus("engine ready");
+  });
 });
 
 editor.on("opened", (info) => {
   window.lastOpen = info;                      // verification hook (tier / io / heap)
-  setStatus(`${info.pages} pages — ${describeLoad(info)}`);
+  setStage("doc");
+  const name = editor.documentName || "";
+  $("docname").textContent = name;
+  $("docname").hidden = !name;
+  $("docname").title = name;
+  setStatus(`${info.pages} ${info.pages === 1 ? "page" : "pages"} — ${describeLoad(info)}`);
 });
+
+// Unsaved-changes dot on the Save button.
+editor.on("dirty", ({ dirty }) => { $("save").classList.toggle("dirty", dirty); });
 
 function describeLoad(info) {
   const mb = (info.bytes / (1024 * 1024)).toFixed(1);
@@ -155,32 +205,68 @@ editor.on("tile", (t) => {
 editor.on("error", (e) => setStatus(`error: ${e.detail}`));
 
 // ---- open (host-owned file picking) ----------------------------------------
-$("file").addEventListener("change", (ev) => {
-  const f = ev.target.files[0];
-  if (f) openDocument(f, { tier: forcedTier, blockKB }).catch((e) => setStatus(`error: ${e.message}`));
+function openFile(f) {
+  if (!f) return;
+  openDocument(f, { tier: forcedTier, blockKB }).catch((e) => {
+    if (!editor.pageCount) setStage("empty");
+    setStatus(`error: ${e.message}`);
+  });
+}
+$("file").addEventListener("change", (ev) => openFile(ev.target.files[0]));
+
+// Drag-and-drop onto the stage — host chrome, same one call as the picker. The
+// window-level handlers exist because a drop that misses the stage would
+// otherwise make the browser NAVIGATE to the PDF and throw the tab away.
+["dragenter", "dragover"].forEach((t) => stage.addEventListener(t, (ev) => {
+  if (![...(ev.dataTransfer?.types || [])].includes("Files")) return;
+  ev.preventDefault();
+  ev.dataTransfer.dropEffect = "copy";
+  stage.classList.add("drag");
+}));
+stage.addEventListener("dragleave", (ev) => {
+  if (!ev.relatedTarget || !stage.contains(ev.relatedTarget)) stage.classList.remove("drag");
 });
+stage.addEventListener("drop", (ev) => {
+  ev.preventDefault();
+  stage.classList.remove("drag");
+  openFile(ev.dataTransfer?.files?.[0]);
+});
+window.addEventListener("dragover", (ev) => ev.preventDefault());
+window.addEventListener("drop", (ev) => { ev.preventDefault(); stage.classList.remove("drag"); });
+
+// ---- overflow menu (keeps the dev-only knobs out of a tester's way) --------
+const menu = $("menu"), moreBtn = $("more");
+const closeMenu = () => { menu.classList.remove("show"); moreBtn.setAttribute("aria-expanded", "false"); };
+moreBtn.addEventListener("click", (ev) => {
+  ev.stopPropagation();
+  const open = !menu.classList.contains("show");
+  menu.classList.toggle("show", open);
+  moreBtn.setAttribute("aria-expanded", String(open));
+});
+document.addEventListener("click", (ev) => { if (!menu.contains(ev.target)) closeMenu(); });
+document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 
 // ---- edit mode + line mode -------------------------------------------------
 const editBtn = $("editmode");
 editBtn.addEventListener("click", () => editor.toggleEditMode());
 editor.on("editmode", ({ editMode }) => {
-  editBtn.textContent = editMode ? "✓ Done" : "✎ Edit";
+  label(editBtn, editMode ? "Done" : "Edit");
   editBtn.classList.toggle("active", editMode);
-  imeLog.textContent = editMode
-    ? "edit mode — tap a paragraph to select it, then Edit or Delete"
-    : "view mode — click ✎ Edit to enable editing";
+  setHint(editMode ? "Edit" : "View", editMode
+    ? "Edit mode — tap a paragraph to select it, then Edit or Delete"
+    : "View mode — press Edit to enable editing");
 });
 
 // Select-then-act: the SDK draws the selected box and its Edit/Delete bar; the
 // host only reports it (and could drive the same actions from its own chrome).
 editor.on("select", ({ selection }) => {
-  imeLog.textContent = selection
-    ? `selected p${selection.page + 1} box #${selection.index} — Edit, Delete, ` +
+  setHint(selection ? "Selected" : "Edit", selection
+    ? `Selected p${selection.page + 1} box #${selection.index} — Edit, Delete, ` +
       "or tap it again to type"
-    : "edit mode — tap a paragraph to select it, then Edit or Delete";
+    : "Edit mode — tap a paragraph to select it, then Edit or Delete");
 });
 editor.on("deleted", ({ page, ok }) => {
-  imeLog.textContent = `deleted a paragraph on p${page + 1} (${ok ? "ok" : "FAILED"})`;
+  setHint("Edit", `Deleted a paragraph on p${page + 1} (${ok ? "ok" : "FAILED"})`);
 });
 
 const lineModeBtn = $("linemode");
@@ -201,23 +287,23 @@ function updateLineModeButton() {
 
 editor.on("editopen", (ed) => {
   updateLineModeButton();
-  imeLog.textContent =
-    `editing p${ed.page + 1} (${ed.isParagraph
+  setHint("Typing",
+    `Editing p${ed.page + 1} (${ed.isParagraph
       ? (ed.linePreserve ? "paragraph ≡ lines" : "paragraph ¶ reflow")
-      : "line"}, ${ed.chars} chars) — type; tap outside to commit`;
+      : "line"}, ${ed.chars} chars) — type; tap outside to commit`);
 });
 editor.on("editclose", ({ page, ok }) => {
   updateLineModeButton();
-  imeLog.textContent = `committed p${page + 1} (${ok ? "ok" : "REJECTED"})`;
+  setHint("Edit", `Committed p${page + 1} (${ok ? "ok" : "REJECTED"})`);
 });
 editor.on("edit", (m) => {
-  imeLog.textContent =
+  setHint("Typing",
     `edit#${m.generation}: engine ${m.engineMs} ms, strip blit ${m.blitMs} ms, ` +
     `keystroke→blit ${m.totalMs.toFixed(1)} ms — p95 ${m.p95.toFixed(1)} ms over ` +
-    `${m.samples} (gate ≤ 16 ms)`;
+    `${m.samples} (gate ≤ 16 ms)`);
 });
 editor.on("echo", (m) =>
-  { imeLog.textContent = `no run open — latch echo: ${m.chars} chars, round-trip ${m.rttMs.toFixed(1)} ms`; });
+  setHint("Edit", `No run open — latch echo: ${m.chars} chars, round-trip ${m.rttMs.toFixed(1)} ms`));
 
 // ---- live page number + go to page -----------------------------------------
 // The SDK reports which page is being read (`page`, 0-based) and performs the

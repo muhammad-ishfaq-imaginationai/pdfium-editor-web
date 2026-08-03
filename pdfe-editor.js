@@ -21,6 +21,21 @@
 
 const PDFE_STYLE_ID = "pdfe-editor-styles";
 
+// The surround behind the pages. Requested by the DocuFence web team
+// (2026-08-03); it was #9e9e9e before. Kept here as the ONE definition so the
+// CSS fallback, the option default and the docs cannot drift apart.
+const PDFE_DEFAULT_BG = "#f8f9fb";
+
+// Double-tap / double-click word select. 350 ms matches the pinch-suppression
+// window already used in the tap path; 20 px is generous enough for a fingertip
+// yet far below a deliberate second tap on a different word.
+const DOUBLE_TAP_MS = 350;
+const DOUBLE_TAP_SLOP = 20;
+// The caret thumb is sampled this far ABOVE the finger, so the boundary lookup
+// lands on the caret's own line rather than the one the fingertip covers. Same
+// constant and same reason as the selection-handle drag.
+const HANDLE_TOUCH_LIFT = 22;
+
 // Injected once per document. Class-scoped (never ids) so several editors can
 // coexist on one page, and minimal so a host's own CSS reset can't break the
 // geometry the overlays depend on.
@@ -28,7 +43,13 @@ const PDFE_CSS = `
 .pdfe-host { position: relative; overflow: hidden; }
 .pdfe-scroll {
   position: relative; width: 100%; height: 100%; overflow: auto;
-  background: #9e9e9e; -webkit-overflow-scrolling: touch;
+  /* The surround behind the pages (each page paints its own white). A custom
+     property, not a hard-coded value, so a host can theme it with one option
+     (backgroundColor) or one CSS line of its own, and so several editors on a
+     page can differ. The default is the light neutral the DocuFence web team
+     asked for (2026-08-03); it was #9e9e9e until then.
+     NOTE no backticks in this comment: it lives inside a template literal. */
+  background: var(--pdfe-bg, #f8f9fb); -webkit-overflow-scrolling: touch;
   /* No native text selection over the pages: on iOS a long-press otherwise
      raises the callout bar / magnifier on top of OUR word selection, and the
      drawn round handles are the only selection UI we ship. The sink is exempt —
@@ -87,6 +108,14 @@ const PDFE_CSS = `
 .pdfe-handle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
                background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
                z-index: 3; display: none; touch-action: none; cursor: grab; }
+/* The CARET thumb: the insertion handle under a COLLAPSED caret, so a finger can
+   drag the caret instead of having to tap the exact glyph. Its own class (not
+   .pdfe-handle) because _drawHandles owns those two and hides them on every
+   collapsed-caret message. Deliberately NOT inside .pdfe-caret: the caret blinks,
+   and a blinking grip reads as a rendering fault. */
+.pdfe-carethandle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
+                    background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
+                    z-index: 3; display: none; touch-action: none; cursor: grab; }
 /* The IME sink (WEB_VIEWER.md §7): 1x1, transparent, parked at the caret. NEVER
    a visible editor — it exists only to summon the keyboard and receive
    keystrokes/composition. pointer-events:none is LOAD-BEARING (I9): the sink
@@ -132,8 +161,13 @@ export class PdfeEditor {
    *  engineUrl       URL of editor.js glue       (default: next to the worker)
    *  version         cache-buster appended to worker/engine URLs (optional)
    *  maxPageWidthCss fit-width ceiling in CSS px (default 900; 0 = no cap)
-   *  minZoom/maxZoom zoom clamps (default 0.5 / 3)
+   *  initialZoom     zoom the document opens at, as a ratio of fit-width
+   *                  (default 0.5 — i.e. the toolbar reads 50%). 1 = fit-width.
+   *  minZoom/maxZoom zoom clamps (default 0.25 / 3)
    *  longPressMs     word-select press duration (default 600)
+ *  backgroundColor surround behind the pages, any CSS colour
+ *                  (default '#f8f9fb'); also settable later via
+ *                  setBackgroundColor()
    *  simulateNoOpfs  dev knob: pretend saves cannot stream (exercises the
    *                  host's in-memory-consent path on a browser that has OPFS)
    */
@@ -149,10 +183,14 @@ export class PdfeEditor {
     injectStyles(this._doc);
 
     this.maxPageWidthCss = opts.maxPageWidthCss ?? 900;
-    this.minZoom = opts.minZoom ?? 0.5;
+    // minZoom sits BELOW initialZoom on purpose: at 0.5 (the old floor) the
+    // zoom-out button would be dead the moment a document opened.
+    this.minZoom = opts.minZoom ?? 0.25;
     this.maxZoom = opts.maxZoom ?? 3;
+    this.initialZoom = opts.initialZoom ?? 0.5;
     this.longPressMs = opts.longPressMs ?? 600;
     this._simulateNoOpfs = !!opts.simulateNoOpfs;
+    this._backgroundColor = opts.backgroundColor || PDFE_DEFAULT_BG;
 
     // ---- document/view state --------------------------------------------------
     this._pages = [];            // [{w,h}] PDF points
@@ -160,7 +198,7 @@ export class PdfeEditor {
     this._livePages = new Set(); // pages whose canvas holds a bitmap (any zoom) —
                                  // the eviction sweep's working set (7000-page
                                  // documents cannot keep every visited bitmap)
-    this._zoom = 1;              // user zoom over fit-width
+    this._zoom = Math.min(this.maxZoom, Math.max(this.minZoom, this.initialZoom));
     this._fitScale = 1;          // CSS px per PDF point at zoom 1
     this._dpr = Math.min(this._win.devicePixelRatio || 1, 2);
     this._pageCanvases = [];
@@ -194,6 +232,16 @@ export class PdfeEditor {
     this._selRange = null;
     this._editGeneration = 0;
     this._composing = false;
+    // The caret thumb is TOUCH-ONLY (a permanent grip under a mouse caret is
+    // not a desktop idiom), so the last pointer type that touched a page decides
+    // whether it is drawn.
+    this._lastPointerType = "mouse";
+    this._draggingCaret = false;
+    // Double-tap/double-click word select: the last tap's time, point and page.
+    this._lastTapAt = 0;
+    this._lastTapX = 0;
+    this._lastTapY = 0;
+    this._lastTapPage = -1;
 
     this.latencySamples = [];    // keystroke->blit ms (dev telemetry / gates)
     this._listeners = new Map();
@@ -383,6 +431,21 @@ export class PdfeEditor {
   /** Reset to fit-width (zoom 1) and re-measure the container. */
   fitWidth() { this._zoom = 1; this._refit(); this._emit("zoom", { zoom: 1 }); }
 
+  /** The surround behind the pages (each page paints its own white). */
+  get backgroundColor() { return this._backgroundColor; }
+
+  /**
+   * Recolour the surround at runtime — any CSS colour. Pass a falsy value to
+   * return to the default. Purely visual: no re-render, no reflow, nothing
+   * cached, so a host may drive it from a theme switch on every frame if it
+   * likes. Native shells reach it through the bridge command of the same name.
+   */
+  setBackgroundColor(color) {
+    this._backgroundColor = color || PDFE_DEFAULT_BG;
+    if (this.root) this.root.style.setProperty("--pdfe-bg", this._backgroundColor);
+    return this._backgroundColor;
+  }
+
   /**
    * Per-paragraph line mode (the Android btnLineMode analog): reflow (¶) vs
    * keep-lines (≡). The core's heuristic already picks one when a run opens;
@@ -520,12 +583,18 @@ export class PdfeEditor {
     };
     this.root = mk("div", "pdfe-scroll");
     this.scroller = this.root;
+    // Drive the CSS custom property rather than the element's own
+    // background, so a host that would rather theme it in its own
+    // stylesheet (--pdfe-bg on any ancestor) still wins for the editors it
+    // did not pass the option to.
+    this.root.style.setProperty("--pdfe-bg", this._backgroundColor);
     this.strip = mk("div", "pdfe-strip");
     this.boxesEl = mk("div", "pdfe-layer pdfe-boxes");
     this.selEl = mk("div", "pdfe-layer pdfe-sel");
     this.caretEl = mk("div", "pdfe-caret");
     this.editBoxEl = mk("div", "pdfe-editbox");
     this.handleEls = [mk("div", "pdfe-handle"), mk("div", "pdfe-handle")];
+    this.caretHandleEl = mk("div", "pdfe-carethandle");
     this.actionsEl = mk("div", "pdfe-actions");
     this.editBtn = mk("button", "pdfe-act-edit");
     this.deleteBtn = mk("button", "pdfe-act-del");
@@ -541,12 +610,13 @@ export class PdfeEditor {
     })) this.sink.setAttribute(k, v);
 
     this.strip.append(this.boxesEl, this.editBoxEl, this.selEl, this.caretEl,
-      ...this.handleEls, this.actionsEl, this.sink);
+      ...this.handleEls, this.caretHandleEl, this.actionsEl, this.sink);
     this.root.appendChild(this.strip);
     this.container.appendChild(this.root);
 
     this._wireSink();
     this._wireHandles();
+    this._wireCaretHandle();
     this._wireActions();
     this._wireViewportGestures();
 
@@ -1155,10 +1225,18 @@ export class PdfeEditor {
 
   _drawCaret(geom) {
     this._lastCaretGeom = geom;
-    if (!geom || this._editingPage < 0) { this.caretEl.style.display = "none"; return; }
+    if (!geom || this._editingPage < 0) {
+      this.caretEl.style.display = "none";
+      this.caretHandleEl.style.display = "none";
+      return;
+    }
     const top = this._pageToCss(geom[0], geom[1]);
     const bot = this._pageToCss(geom[0], geom[2]);
-    if (!top) { this.caretEl.style.display = "none"; return; }
+    if (!top) {
+      this.caretEl.style.display = "none";
+      this.caretHandleEl.style.display = "none";
+      return;
+    }
     this.caretEl.style.display = "block";
     this.caretEl.style.left = `${top.x - 1}px`;
     this.caretEl.style.top = `${top.y}px`;
@@ -1166,6 +1244,22 @@ export class PdfeEditor {
     // Keep the sink under the caret so an IME candidate window follows (§7).
     this.sink.style.left = `${Math.round(top.x)}px`;
     this.sink.style.top = `${Math.round(top.y)}px`;
+    // The thumb rides the caret. Mutual exclusion with the two selection
+    // handles is free: every message that draws a RANGE calls _drawCaret(null),
+    // and every collapsed-caret message calls _drawHandles(null, null).
+    this._drawCaretHandle(bot);
+  }
+
+  /** The insertion grip under a collapsed caret — touch only. |bot| is the
+   *  caret's bottom in strip CSS px (the same anchor the selection knobs hang
+   *  from, so all three line up). */
+  _drawCaretHandle(bot) {
+    const el = this.caretHandleEl;
+    const touch = this._lastPointerType === "touch" || this._lastPointerType === "pen";
+    if (!touch || !bot || this._editingPage < 0) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    el.style.left = `${bot.x - 9}px`;
+    el.style.top = `${bot.y}px`;
   }
 
   /** The blue box around the run being edited. |b| is [l,b,r,t] page points (the
@@ -1239,7 +1333,8 @@ export class PdfeEditor {
           // The finger is on the knob BELOW the line — sample ~a knob height
           // above it so the boundary lookup lands on the dragged line.
           const xPt = (mv.clientX - rect.left) / scaleCss;
-          const yPt = this._pages[this._editingPage].h - (mv.clientY - 22 - rect.top) / scaleCss;
+          const yPt = this._pages[this._editingPage].h -
+            (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss;
           this._post({
             type: "dragHandle", which,
             start: this._selRange[0], end: this._selRange[1], xPt, yPt,
@@ -1256,9 +1351,47 @@ export class PdfeEditor {
     });
   }
 
+  // ---- the caret thumb (the Android insertion-handle analog) ---------------
+  //
+  // Dragging it moves the CARET, so the reply is `caretMoved`, not
+  // `selectionChanged`. It deliberately does NOT post `tap`: `tap` commits the
+  // run when the point falls outside its bounds, and a fingertip dragging along
+  // a line will do exactly that.
+  _wireCaretHandle() {
+    const el = this.caretHandleEl;
+    this._listen(el, "pointerdown", (ev) => {
+      if (this._editingPage < 0) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      this._draggingCaret = true;
+      try { el.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic/stale pointer */ }
+      const move = (mv) => {
+        const canvas = this._pageCanvases[this._editingPage];
+        if (!canvas) return;
+        const rect = canvas.getBoundingClientRect();
+        const scaleCss = this._fitScale * this._zoom;
+        const xPt = (mv.clientX - rect.left) / scaleCss;
+        const yPt = this._pages[this._editingPage].h -
+          (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss;
+        this._post({ type: "dragCaret", page: this._editingPage, xPt, yPt });
+      };
+      const up = () => {
+        this._draggingCaret = false;
+        el.removeEventListener("pointermove", move);
+        this.sink.focus({ preventScroll: true });   // the drag must not kill the keyboard
+      };
+      el.addEventListener("pointermove", move);
+      el.addEventListener("pointerup", up, { once: true });
+      el.addEventListener("pointercancel", up, { once: true });
+    });
+  }
+
   // ---- canvas gestures: tap / long-press / drag-select --------------------
   _wireCanvas(canvas) {
     this._listen(canvas, "pointerdown", (ev) => {
+      // Recorded before the edit-mode gate: the caret thumb is touch-only, and
+      // the input type is a property of the DEVICE, not of the mode.
+      this._lastPointerType = ev.pointerType || "mouse";
       if (!this._editMode) return;
       // I9: killing the default action stops the browser from moving focus to
       // <body> after this handler (a mousedown on a non-focusable canvas blurs
@@ -1314,7 +1447,24 @@ export class PdfeEditor {
         if (lpFired) return;
         if (dragging) { this.sink.focus({ preventScroll: true }); return; }
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
-        this._post({ type: "tap", page, xPt, yPt });
+        // Double-tap / double-click selects the word — the mouse-and-touch
+        // sibling of long-press, reusing the SAME `selectWord` message so the
+        // word-expansion rule lives in exactly one place (the worker). Detected
+        // by hand rather than via `dblclick`, which never fires for touch here
+        // (touch-action: pan-x pan-y suppresses the browser's double-tap).
+        // Gated on the open run: before one is open there is no word to select,
+        // so a double tap stays two plain taps and the select-then-open flow
+        // (first tap picks the box, second opens it) is untouched.
+        const dbl = this._editingPage === page &&
+          this._lastTapPage === page &&
+          performance.now() - this._lastTapAt < DOUBLE_TAP_MS &&
+          Math.hypot(uv.clientX - this._lastTapX, uv.clientY - this._lastTapY) <= DOUBLE_TAP_SLOP;
+        this._lastTapAt = dbl ? 0 : performance.now();   // a third tap starts over
+        this._lastTapX = uv.clientX;
+        this._lastTapY = uv.clientY;
+        this._lastTapPage = page;
+        this._post(dbl ? { type: "selectWord", page, xPt, yPt }
+                       : { type: "tap", page, xPt, yPt });
         // Focus inside the user gesture — browsers only show a keyboard then.
         this.sink.focus({ preventScroll: true });
       };
@@ -1340,6 +1490,9 @@ export class PdfeEditor {
       if (this._editingPage < 0) return;
       if (ev.target.tagName === "CANVAS") return;          // canvas handler owns these
       if (ev.target.classList.contains("pdfe-handle")) return;
+      // The caret thumb lives in the strip too — without this, grabbing it would
+      // COMMIT the run instead of dragging the caret.
+      if (ev.target.classList.contains("pdfe-carethandle")) return;
       ev.preventDefault();                                 // keep the sink focused
       this._post({ type: "commit" });
     });
@@ -1470,6 +1623,20 @@ export class PdfeEditor {
     this._listen(this.sink, "compositionend", () => { this._composing = false; push(); });
     this._listen(this.sink, "input", () => { if (!this._composing) push(); });
     this._listen(this.sink, "keydown", (e) => {
+      // Ctrl/Cmd+A selects the whole open run. The sink's own select-all would
+      // "work" invisibly — the range lands in the textarea, but nothing posts it
+      // to the worker, so no highlight and no handles ever appear (and the next
+      // keystroke silently replaces the run). preventDefault, then drive the same
+      // selectionChanged path every other selection gesture uses.
+      if ((e.ctrlKey || e.metaKey) && !e.altKey &&
+          (e.key === "a" || e.key === "A") && this._editingPage >= 0) {
+        e.preventDefault();
+        const len = this.sink.value.length;
+        if (!len) return;                     // empty run: stay a collapsed caret
+        this.sink.setSelectionRange(0, len);
+        this._post({ type: "selectRange", start: 0, end: len });
+        return;
+      }
       // Up/Down/Home/End must move by the PDF wrap, not the sink textarea's own
       // layout — the 1×1 sink wraps at every char, so its native motion
       // degenerates. Route through the core: caret/head geometry, one line up or

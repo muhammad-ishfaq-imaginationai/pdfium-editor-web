@@ -1171,6 +1171,37 @@ onmessage = async (e) => {
     return;
   }
 
+  if (msg.type === "selectRange") {
+    // Select an explicit char range — the index-based sibling of selectWord, and
+    // what Ctrl/Cmd+A drives with (0, length). Same reply, so the shell needs no
+    // new case; a collapsed range degrades to a caret move.
+    if (!editor) return;
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start, len));
+    const e = Math.max(s, Math.min(msg.end, len));
+    if (e <= s) {
+      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      return;
+    }
+    postMessage({
+      type: "selectionChanged", start: s, end: e,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  if (msg.type === "dragCaret") {
+    // The caret thumb: move the COLLAPSED caret to the dragged point. Same
+    // boundary map as tap/drag (so it can never leave the open run), but it must
+    // never take the `tap` path — tap commits the run when the point lands
+    // outside its bounds, which a fingertip mid-drag will do.
+    if (!editor || msg.page !== editPage) return;
+    const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    return;
+  }
+
   if (msg.type === "dragSelect") {
     // Mouse/touch drag selection: anchor = the press point, head = the drag
     // point, both mapped through the boundary map (clamped to the run, so the

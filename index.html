@@ -1,7 +1,11 @@
 <!doctype html>
-<!-- Step 7 viewer (docs/WEB_VIEWER.md): worker-owned editor.wasm, tiled page
-     painting (§5), hidden-input IME sink (§7), newest-wins latch (§9).
-     Plain ES modules for now; the TS build arrives with the real viewer.
+<!-- The DEMO HOST for the embeddable editor SDK (docs/EDITOR_SDK.md).
+     Everything in this file is HOST chrome — the toolbar, the save dialogs, the
+     status/telemetry lines. The editor itself is only the #editor box below; it
+     ships zero chrome so a website or an iOS/Android app can wrap it in their
+     own UI (user decision 2026-07-28). This page doubles as our browser test
+     harness, so it keeps the same window.* verification hooks it always had.
+
      Serve the REPO ROOT so /wasm/dist and /wasm/testdata resolve: e.g.
      python -m http.server 8734  → open  http://localhost:8734/web/ -->
 <html lang="en">
@@ -9,24 +13,20 @@
   <meta charset="utf-8">
   <!-- maximum-scale/user-scalable: Android Chrome honors this and disables its
        native pinch (which only STRETCHES the rendered bitmap — blurry text,
-       I17). iOS ignores it; there the gesture events are intercepted in
-       main.js. Pinch still zooms — through the APP's zoom, re-rendered sharp. -->
+       I17). iOS ignores it; there the SDK cancels the gesture events. Pinch
+       still zooms — through the APP's zoom, re-rendered sharp. EVERY host page
+       embedding the SDK on mobile needs this meta tag (docs/EDITOR_SDK.md). -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
   <title>pdfium-editor — web viewer</title>
   <style>
-    /* touch-action pan-x pan-y: one finger pans/scrolls natively, but the
-       browser's pinch-zoom and double-tap zoom are suppressed — pinch is
-       reimplemented as APP zoom (I17: native pinch scales the bitmap and
-       blurs the text; app zoom repaints sharp tiles). */
-    html, body { margin: 0; height: 100%; background: #9e9e9e; font-family: system-ui, sans-serif;
-                 touch-action: pan-x pan-y; }
-    /* The bar WRAPS on narrow screens (small-phone report 2026-07-28: the
-       fixed 44px row pushed Edit/Save off-screen once a filename loaded).
-       min-height keeps the desktop look; main.js syncs #strip's top padding
-       to the bar's real height so a wrapped bar never covers page 1. */
-    #bar { position: fixed; inset: 0 0 auto 0; min-height: 44px; background: #673ab7; color: #fff;
+    html, body { margin: 0; height: 100%; background: #9e9e9e; font-family: system-ui, sans-serif; }
+    /* Column layout: the bar may wrap to any height and the editor takes the
+       rest (small-phone report 2026-07-28 — the old fixed bar pushed Edit/Save
+       off-screen and needed JS padding sync; flexbox does it for free). */
+    body { display: flex; flex-direction: column; height: 100dvh; }
+    #bar { flex: none; min-height: 44px; background: #673ab7; color: #fff;
            display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px;
-           padding: 4px 12px; z-index: 2; box-sizing: border-box; }
+           padding: 4px 12px; box-sizing: border-box; z-index: 2; }
     #bar input[type=file] { color: #fff; max-width: min(220px, 38vw); font-size: 13px; }
     @media (max-width: 640px) {
       #bar { gap: 4px 6px; padding: 4px 8px; }
@@ -36,53 +36,35 @@
     #bar button { background: #fff2; color: #fff; border: 1px solid #fff5; border-radius: 4px;
                   width: 28px; height: 28px; font-size: 16px; cursor: pointer; }
     #zoomlabel { min-width: 44px; text-align: center; font-size: 13px; }
+    /* Live page number + go-to-page box (SDK `page` event + goToPage()). Host
+       chrome — the editor has no status UI of its own. Tabular digits so 9→10
+       doesn't shift the bar. */
+    #pagebox { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+    #pagebox[hidden] { display: none; }
+    #pagelabel { font-size: 13px; background: #fff2; border-radius: 3px;
+                 padding: 2px 7px; font-variant-numeric: tabular-nums; }
+    #pagenum { width: 52px; height: 24px; font-size: 13px; text-align: center;
+               border: 1px solid #fff5; border-radius: 4px; background: #fff2; color: #fff; }
+    /* Rejected page (goToPage returned false): the host's own invalid state. */
+    #pagenum.bad { border-color: #ff5252; background: #ff525233; }
+    #pagego { width: 24px !important; height: 24px; font-size: 12px; }
     #status { font-size: 13px; opacity: .9; flex: 1; }
     #opfsbadge { font-size: 12px; background: #ffca28; color: #4a2c00; border-radius: 3px;
                  padding: 2px 6px; white-space: nowrap; }
     #opfsbadge[hidden] { display: none; }
-    #imelog { position: fixed; inset: auto 0 0 0; background: #0009; color: #9f9;
-              font: 12px/1.6 monospace; padding: 2px 10px; z-index: 2; min-height: 20px; }
-    /* min-width: max-content (I17 follow-up, 2026-07-28): when a zoomed
-       canvas grows wider than the viewport, a centered flex child overflows
-       BOTH sides and the LEFT half is unreachable by scrolling (the user was
-       "stuck horizontally", and the focal-scroll clamped against the broken
-       range, shoving the view to the page end). Sizing the strip to its
-       content makes the DOCUMENT as wide as the widest canvas — horizontal
-       scroll reaches everything and the centering happens inside the strip. */
-    #strip { padding: 56px 0 40px; display: flex; flex-direction: column; align-items: center; gap: 14px;
-             min-width: max-content;
-             position: relative; /* the faint-box layer positions inside it */ }
-    #strip canvas { background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.45); display: block; }
-    /* Faint paragraph boxes (edit mode) — the Android overlay's analog. They
-       live inside #strip so they scroll with the pages for free; the open
-       run's box is omitted while it is being edited. */
-    .parabox { position: absolute; border: 1px solid #3f51b566; background: #3f51b50d;
-               pointer-events: none; border-radius: 1px; }
+    /* THE EDITOR: one sized box. The SDK fills it and owns nothing outside it. */
+    #editor { flex: 1; min-height: 0; }
+    #imelog { flex: none; background: #0009; color: #9f9;
+              font: 12px/1.6 monospace; padding: 2px 10px; min-height: 20px; }
     #editmode { width: auto !important; padding: 0 10px; }
     #editmode.active { background: #fff; color: #673ab7; font-weight: 600; }
-    /* Selection handles: the app's round knobs (never the OS teardrops),
-       hanging under the selection ends, draggable. */
-    .handle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
-              background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
-              z-index: 3; display: none; touch-action: none; cursor: grab; }
-    /* The IME sink (§7): 1x1, transparent, positioned at the caret. NEVER a
-       visible editor — it exists only to summon the keyboard and receive
-       keystrokes/composition. pointer-events:none is LOAD-BEARING (I9): the
-       sink sits exactly where the user taps next (the caret), and with
-       hit-testing on it swallows that tap — the canvas never sees it, so the
-       caret doesn't move and commit-on-tap-outside doesn't fire. Programmatic
-       focus() still works on a pointer-events:none element. */
-    #sink { position: absolute; left: -100px; top: -100px; width: 1px; height: 1px;
-            padding: 0; border: 0; outline: 0; background: transparent; color: transparent;
-            caret-color: transparent; resize: none; overflow: hidden; z-index: 1;
-            pointer-events: none;
-            font-size: 16px; /* prevents iOS focus-zoom */ }
     /* Save-fallback warning (docs/WEB_IO.md §7): shown when the browser has no
-       OPFS sync handle, so the save cannot stream and holds the whole output
-       in memory. Blocking on purpose — the user chooses before we spend it. */
-    #warn { position: fixed; inset: 0; background: #0007; z-index: 4; display: none;
+         OPFS sync handle, so the save cannot stream and holds the whole output
+         in memory. Blocking on purpose — the user chooses before we spend it.
+         HOST chrome: the SDK only reports the condition, it never dialogs. */
+    #warn, #pw { position: fixed; inset: 0; background: #0007; z-index: 4; display: none;
             align-items: center; justify-content: center; }
-    #warn.show { display: flex; }
+    #warn.show, #pw.show { display: flex; }
     #warnbox { background: #fff; color: #222; max-width: 460px; padding: 18px 20px;
                border-radius: 8px; box-shadow: 0 6px 30px #0006; font-size: 14px; line-height: 1.5; }
     #warnbox h3 { margin: 0 0 8px; font-size: 15px; }
@@ -93,18 +75,22 @@
        otherwise the primary button renders white-on-white. */
     #warnbtns button#warnok { background: #673ab7; color: #fff; border-color: #673ab7; }
     #warnbtns button#warnok[hidden] { display: none; }
-    /* Caret + selection overlays (§6): drawn by the viewer from CORE geometry
-       (page points -> CSS), never from browser text metrics.
-       DOCUMENT-SPACE, not fixed (I16, iPhone pinch-zoom 2026-07-28): iOS
-       pinch is a visual-viewport camera move that fires no window scroll/
-       resize and slides content under position:fixed elements — the caret
-       visibly detached from its text. position:absolute at document coords
-       (pure offsetLeft/offsetTop layout math) moves with the content under
-       ANY camera transform, exactly like the immune .parabox overlays. */
-    #caret { position: absolute; width: 2px; background: #000; z-index: 1;
-             display: none; pointer-events: none; animation: caretblink 1s steps(1) infinite; }
-    @keyframes caretblink { 50% { opacity: 0; } }
-    .selrect { position: absolute; background: #3f51b555; z-index: 1; pointer-events: none; }
+    /* Password prompt for an encrypted PDF. HOST chrome for the same reason the
+       save warning is: the SDK rejects open() with 'password-required' /
+       'password-wrong' and shows nothing itself, so each host words and styles
+       this its own way. Reuses the #warn overlay's look deliberately — a real
+       integrator should see that both dialogs are THEIRS. */
+    #pwbox { background: #fff; color: #222; max-width: 400px; padding: 18px 20px;
+             border-radius: 8px; box-shadow: 0 6px 30px #0006; font-size: 14px; line-height: 1.5; }
+    #pwbox h3 { margin: 0 0 8px; font-size: 15px; }
+    #pwname { font-size: 12px; color: #666; word-break: break-all; }
+    #pwinput { width: 100%; box-sizing: border-box; margin-top: 12px; padding: 7px 9px;
+               font-size: 14px; border: 1px solid #bbb; border-radius: 4px; }
+    #pwerr { color: #c62828; font-size: 12.5px; min-height: 17px; margin-top: 6px; }
+    #pwbtns { margin-top: 10px; display: flex; gap: 8px; justify-content: flex-end; }
+    #pwbtns button { padding: 6px 14px; border-radius: 4px; border: 1px solid #bbb;
+                     background: #f3f3f3; cursor: pointer; font-size: 13px; }
+    #pwbtns button#pwok { background: #673ab7; color: #fff; border-color: #673ab7; }
   </style>
 </head>
 <body>
@@ -112,13 +98,22 @@
     <strong>pdfium-editor</strong>
     <!-- Deploy identity: build_site.sh stamps the source commit here so a
          tester can always tell WHICH version their browser is running
-         (user request 2026-07-28, after a stale-cache false alarm). -->
+         (user request 2026-07-28, after a stale-cache false alarm). The SDK
+         also appends it to the worker/engine URLs as a cache-buster. -->
     <span id="appver" title="deployed version"
-          style="font-size:11px;background:#fff3;border-radius:3px;padding:1px 5px">537b953</span>
+          style="font-size:11px;background:#fff3;border-radius:3px;padding:1px 5px">1.7.0-2686ba4</span>
     <input id="file" type="file" accept="application/pdf">
     <button id="zout" title="zoom out">−</button>
     <span id="zoomlabel">100%</span>
     <button id="zin" title="zoom in">+</button>
+    <!-- Live page number + GO TO PAGE. Both are host chrome: the SDK reports the
+         page (`page` event, 0-based) and performs the jump (goToPage), the box and
+         its validation are ours. Type a page and press Enter, or click ⏎. -->
+    <span id="pagebox" hidden>
+      <label for="pagenum" id="pagelabel" title="page being read">Page –</label>
+      <input id="pagenum" type="number" min="1" step="1" title="go to page (Enter)">
+      <button id="pagego" title="go to that page">⏎</button>
+    </span>
     <button id="editmode" title="toggle edit mode">✎ Edit</button>
     <!-- Per-paragraph line mode (Android btnLineMode parity): visible only
          while a multi-line paragraph is open AND the config checkbox is on
@@ -136,13 +131,8 @@
     <span id="opfsbadge" hidden title="This browser has no OPFS sync handle: saves are held in memory">⚠ in-memory saves</span>
     <span id="status">loading engine…</span>
   </div>
-  <div id="strip"></div>
-  <div id="caret"></div>
-  <div id="selrects"></div>
-  <div class="handle" id="h0"></div>
-  <div class="handle" id="h1"></div>
-  <textarea id="sink" autocapitalize="off" autocomplete="off" autocorrect="off"
-            spellcheck="false" aria-hidden="true" tabindex="-1"></textarea>
+  <div id="editor"></div>
+  <div id="imelog">view mode — click ✎ Edit to enable editing</div>
   <div id="warn">
     <div id="warnbox">
       <h3 id="warntitle">Saving without streaming</h3>
@@ -153,7 +143,21 @@
       </div>
     </div>
   </div>
-  <div id="imelog">view mode — click ✎ Edit to enable editing</div>
-  <script type="module" src="main.js?v=537b953"></script>
+  <!-- Reuses #warn's backdrop class so the two host dialogs behave identically. -->
+  <div id="pw" class="">
+    <div id="pwbox">
+      <h3>This PDF is password-protected</h3>
+      <div id="pwname"></div>
+      <!-- type=password + autocomplete off: the browser must not offer to
+           remember a document password the way it would a site login. -->
+      <input id="pwinput" type="password" autocomplete="off" placeholder="Password">
+      <div id="pwerr"></div>
+      <div id="pwbtns">
+        <button id="pwcancel">Cancel</button>
+        <button id="pwok">Open</button>
+      </div>
+    </div>
+  </div>
+  <script type="module" src="demo.js?v=1.7.0-2686ba4"></script>
 </body>
 </html>

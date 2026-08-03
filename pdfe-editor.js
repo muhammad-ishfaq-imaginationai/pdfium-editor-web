@@ -1,0 +1,1504 @@
+// pdfe-editor.js — the EMBEDDABLE editor surface (docs/EDITOR_SDK.md).
+//
+// This is the SDK every host embeds: web pages, the iOS WKWebView shell, and
+// (later) an Android WebView shell. It owns EXACTLY the three shell duties from
+// docs/PLATFORM_SHELLS.md — the render surface, input, and nothing else:
+//
+//   * renders pages (worker-owned OffscreenCanvas, tiled — WEB_VIEWER.md §5)
+//   * draws caret / selection / handles / faint paragraph boxes from CORE
+//     geometry (§6) — never from browser text metrics
+//   * turns taps, long-press, drags, pinch and IME keystrokes into core calls
+//
+// It owns ZERO chrome (user decision 2026-07-28): no toolbar, no file input, no
+// Save button, no dialogs, no status line, no default document, no localStorage.
+// Open/Save/Edit-toggle/zoom-buttons/warnings all belong to the HOST, which
+// drives them through the API below and listens to events. That split is what
+// lets the same editor drop into a website, an iOS app, or an Android app while
+// each keeps its own UI.
+//
+// All editing behavior still lives in the C++ core (libpdfe) behind the worker,
+// so this file cannot make platforms diverge — it has no editing logic to drift.
+
+const PDFE_STYLE_ID = "pdfe-editor-styles";
+
+// Injected once per document. Class-scoped (never ids) so several editors can
+// coexist on one page, and minimal so a host's own CSS reset can't break the
+// geometry the overlays depend on.
+const PDFE_CSS = `
+.pdfe-host { position: relative; overflow: hidden; }
+.pdfe-scroll {
+  position: relative; width: 100%; height: 100%; overflow: auto;
+  background: #9e9e9e; -webkit-overflow-scrolling: touch;
+  /* No native text selection over the pages: on iOS a long-press otherwise
+     raises the callout bar / magnifier on top of OUR word selection, and the
+     drawn round handles are the only selection UI we ship. The sink is exempt —
+     it is a real editable and needs its own (invisible) selection. */
+  -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  /* pan-x pan-y: one finger scrolls natively, but the browser's pinch-zoom and
+     double-tap zoom are suppressed — pinch is reimplemented as APP zoom (I17:
+     native pinch scales the rendered bitmap and blurs the text; app zoom
+     repaints sharp tiles). */
+  touch-action: pan-x pan-y;
+}
+.pdfe-strip {
+  position: relative; padding: 12px 0 24px;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  /* min-width: max-content: when a zoomed canvas grows wider than the viewport
+     a centered flex child overflows BOTH sides and the left half is
+     unreachable by scrolling (I17 follow-up). Sizing the strip to its content
+     makes the scroll range cover everything. */
+  min-width: max-content;
+}
+.pdfe-strip canvas { background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.45); display: block; }
+.pdfe-layer { position: absolute; left: 0; top: 0; }
+/* Edit-mode paragraph boxes. The hairline stays 1px at every zoom (a thicker
+   rule would sit ON the glyphs); visibility comes from ALPHA and a faint fill,
+   not from weight (user decision 2026-07-29). Edit mode draws every box as a
+   GREY DASHED hairline; the selected box switches to a SOLID SKY-BLUE hairline
+   with a blue wash (user decision 2026-07-29), so "which box am I acting on"
+   is unmistakable without the overlay ever growing. */
+.pdfe-parabox { position: absolute; border: 1px dashed #757575cc; background: #7575751f;
+                pointer-events: none; border-radius: 1px; }
+.pdfe-parabox.pdfe-selected { border-style: solid; border-color: #03a9f4; background: #03a9f426; }
+/* The run OPEN for editing: a solid BLUE box (user request 2026-07-29) so "you
+   are typing in here" is visible. Border only — a wash would tint the glyphs
+   being edited and fight the selection highlight. It is its own element (not a
+   .pdfe-parabox) because its geometry is the run's LIVE bounds from the core,
+   refreshed every keystroke, while the grouping bounds go stale on reflow. */
+.pdfe-editbox { position: absolute; border: 1px solid #1976d2; border-radius: 1px;
+                display: none; pointer-events: none; z-index: 1; }
+/* The selected box's action bar: the ONLY chrome the SDK owns, because it is
+   part of the canvas gesture (it must sit ON the box it acts on). It lives in
+   the strip, so it scrolls and zooms with the page for free. */
+.pdfe-actions { position: absolute; z-index: 4; display: none; gap: 2px; padding: 3px;
+                border-radius: 8px; background: #fff; box-shadow: 0 2px 10px #00000059;
+                white-space: nowrap; }
+.pdfe-actions button { font: 600 13px/1 system-ui, -apple-system, sans-serif;
+                       color: #1a237e; background: transparent; border: 0;
+                       border-radius: 6px; padding: 8px 12px; cursor: pointer;
+                       touch-action: manipulation; }
+.pdfe-actions button:hover { background: #3f51b51f; }
+.pdfe-actions .pdfe-act-del { color: #c62828; }
+.pdfe-actions .pdfe-act-del:hover { background: #c628281f; }
+.pdfe-caret { position: absolute; width: 2px; background: #000; z-index: 1;
+              display: none; pointer-events: none; animation: pdfe-blink 1s steps(1) infinite; }
+@keyframes pdfe-blink { 50% { opacity: 0; } }
+.pdfe-selrect { position: absolute; background: #3f51b555; z-index: 1; pointer-events: none; }
+.pdfe-handle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
+               background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
+               z-index: 3; display: none; touch-action: none; cursor: grab; }
+/* The IME sink (WEB_VIEWER.md §7): 1x1, transparent, parked at the caret. NEVER
+   a visible editor — it exists only to summon the keyboard and receive
+   keystrokes/composition. pointer-events:none is LOAD-BEARING (I9): the sink
+   sits exactly where the user taps next (the caret), and with hit-testing on it
+   swallows that tap — the canvas never sees it, so the caret doesn't move and
+   commit-on-tap-outside doesn't fire. Programmatic focus() still works. */
+.pdfe-sink { position: absolute; left: -100px; top: -100px; width: 1px; height: 1px;
+             padding: 0; border: 0; outline: 0; background: transparent; color: transparent;
+             caret-color: transparent; resize: none; overflow: hidden; z-index: 1;
+             pointer-events: none; font-size: 16px; /* prevents iOS focus-zoom */
+             -webkit-user-select: text; user-select: text; }
+`;
+
+function injectStyles(doc) {
+  if (doc.getElementById(PDFE_STYLE_ID)) return;
+  const el = doc.createElement("style");
+  el.id = PDFE_STYLE_ID;
+  el.textContent = PDFE_CSS;
+  doc.head.appendChild(el);
+}
+
+/** Errors the host is expected to branch on (never strings to parse). */
+export class PdfeError extends Error {
+  constructor(code, message, detail = {}) {
+    super(message || code);
+    this.name = "PdfeError";
+    this.code = code;
+    Object.assign(this, detail);
+  }
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return 0;
+  const s = [...arr].sort((a, b) => a - b);
+  return s[Math.min(s.length - 1, Math.ceil((p / 100) * s.length) - 1)];
+}
+
+export class PdfeEditor {
+  /**
+   * @param {object} opts
+   *  container       Element (or selector) the editor fills. The HOST sizes it.
+   *  workerUrl       URL of pdfe-worker.js       (default: next to this module)
+   *  engineUrl       URL of editor.js glue       (default: next to the worker)
+   *  version         cache-buster appended to worker/engine URLs (optional)
+   *  maxPageWidthCss fit-width ceiling in CSS px (default 900; 0 = no cap)
+   *  minZoom/maxZoom zoom clamps (default 0.5 / 3)
+   *  longPressMs     word-select press duration (default 600)
+   *  simulateNoOpfs  dev knob: pretend saves cannot stream (exercises the
+   *                  host's in-memory-consent path on a browser that has OPFS)
+   */
+  constructor(opts = {}) {
+    const container = typeof opts.container === "string"
+      ? document.querySelector(opts.container)
+      : opts.container;
+    if (!container) throw new PdfeError("no-container", "PdfeEditor needs a container element");
+
+    this.container = container;
+    this._doc = container.ownerDocument;
+    this._win = this._doc.defaultView;
+    injectStyles(this._doc);
+
+    this.maxPageWidthCss = opts.maxPageWidthCss ?? 900;
+    this.minZoom = opts.minZoom ?? 0.5;
+    this.maxZoom = opts.maxZoom ?? 3;
+    this.longPressMs = opts.longPressMs ?? 600;
+    this._simulateNoOpfs = !!opts.simulateNoOpfs;
+
+    // ---- document/view state --------------------------------------------------
+    this._pages = [];            // [{w,h}] PDF points
+    this._painted = new Set();   // pages already painted at the current zoom
+    this._livePages = new Set(); // pages whose canvas holds a bitmap (any zoom) —
+                                 // the eviction sweep's working set (7000-page
+                                 // documents cannot keep every visited bitmap)
+    this._zoom = 1;              // user zoom over fit-width
+    this._fitScale = 1;          // CSS px per PDF point at zoom 1
+    this._dpr = Math.min(this._win.devicePixelRatio || 1, 2);
+    this._pageCanvases = [];
+    this._pageOffsets = [];      // [[topInScroller, heightCss]] per page, cached per zoom
+    this._currentPage = 0;       // the page the reader is looking at (drives `page`)
+    this._reportedPage = -1;     // last value handed to the host (dedupe)
+    this._docBytes = 0;
+    this._docName = "";
+    this._dirty = false;
+
+    // ---- edit state -----------------------------------------------------------
+    this._editMode = false;
+    this._editingPage = -1;
+    this._editingParaIndex = -1;
+    // The BLOCK the open paragraph lives in — the box hidden while editing. A
+    // block can hold several paragraphs, so the paragraph index alone cannot say
+    // which box to hide.
+    this._editingBlockIndex = -1;
+    this._editingIsParagraph = false;
+    this._editingLinePreserve = false;
+    this._editingChars = 0;
+    // page -> BLOCKS: [{ index, bounds:[l,b,r,t], paras:[{index, bounds}] }].
+    // Blocks are the boxes; their member paragraphs are the edit units.
+    this._pageGroups = new Map();
+    this._groupsPending = new Set();
+    this._selected = null;            // {page, index, bounds} — the WORKER decides this
+    this._lastCaretGeom = null;
+    this._lastEditBounds = null;      // [l,b,r,t] live bounds of the open run
+    this._lastSelection = [];
+    this._lastHandles = [null, null];
+    this._selRange = null;
+    this._editGeneration = 0;
+    this._composing = false;
+
+    this.latencySamples = [];    // keystroke->blit ms (dev telemetry / gates)
+    this._listeners = new Map();
+    this._pending = new Map();   // one-shot op promises: open / save
+    this._caps = { canStreamSave: !opts.simulateNoOpfs, inHeapMaxMB: 0 };
+    this._destroyed = false;
+
+    this._buildDom();
+    this._startWorker(opts);
+  }
+
+  // ===========================================================================
+  // Public API — everything a host UI needs, and nothing about how it looks.
+  // ===========================================================================
+
+  /** Resolves once the engine is up: {canStreamSave, inHeapMaxMB}. */
+  get ready() { return this._readyPromise; }
+
+  get capabilities() { return { ...this._caps }; }
+  get pageCount() { return this._pages.length; }
+  get pages() { return this._pages.map((p) => ({ ...p })); }
+  /**
+   * The page the reader is looking at, 0-based — the one covering the most of the
+   * visible band (ties go to the lower index, so a page boundary parked exactly
+   * mid-viewport cannot flicker between two numbers). Hosts that show a "Page 3
+   * of 12" label should listen for the `page` event rather than poll this.
+   */
+  get currentPage() { return this._currentPage; }
+  get documentName() { return this._docName; }
+  get documentBytes() { return this._docBytes; }
+  get dirty() { return this._dirty; }
+  get zoom() { return this._zoom; }
+  get editMode() { return this._editMode; }
+  /** Live edit session (null when nothing is open). */
+  get editing() {
+    if (this._editingPage < 0) return null;
+    return {
+      page: this._editingPage,
+      paraIndex: this._editingParaIndex,
+      blockIndex: this._editingBlockIndex,
+      isParagraph: this._editingIsParagraph,
+      linePreserve: this._editingLinePreserve,
+      chars: this._editingChars,
+    };
+  }
+  /** Escape hatch for test harnesses only — hosts must not post to it. */
+  get worker() { return this._worker; }
+
+  /**
+   * Open a document. `source` may be a Blob/File, an ArrayBuffer/Uint8Array, or
+   * a URL string (fetched here, so same-origin/CORS rules are the host's).
+   * Bytes are handed to the worker BY REFERENCE (a Blob structured-clone costs
+   * nothing) — see docs/WEB_IO.md §3 for the two-tier load.
+   *
+   * `opts.password` (default: none) unlocks an encrypted PDF. The SDK shows no
+   * prompt of its own — it REJECTS and lets the host ask, with two distinct
+   * PdfeError codes so the wording can differ:
+   *   'password-required' — the file is encrypted and you passed no password.
+   *   'password-wrong'    — the password you passed was rejected; ask again.
+   * Retry by calling open() again with the same source and a password. The
+   * password is used for that one open, never stored, never logged, and never
+   * included in any event payload.
+   */
+  async open(source, opts = {}) {
+    await this._readyPromise;
+    let blob = source;
+    if (typeof source === "string") {
+      const res = await fetch(source);
+      if (!res.ok) throw new PdfeError("open-failed", `fetch ${source} → ${res.status}`);
+      blob = new File([await res.blob()], opts.name || source.split("/").pop() || "document.pdf");
+    } else if (source instanceof ArrayBuffer || ArrayBuffer.isView(source)) {
+      blob = new File([source], opts.name || "document.pdf", { type: "application/pdf" });
+    }
+    if (!(blob instanceof Blob)) throw new PdfeError("bad-source", "open() needs a Blob, bytes or URL");
+
+    this._docName = opts.name || blob.name || "document.pdf";
+    this._docBytes = blob.size;
+    this._dirty = false;
+    this._painted = new Set();
+    this._selected = null;
+    this._closeEditUiState();
+    const p = this._promiseFor("open");
+    this._post({ type: "open", blob, tier: opts.tier || 0, blockKB: opts.blockKB || 0,
+                 password: opts.password || "" });
+    return p;
+  }
+
+  /**
+   * Save. Commits any live edit first (in the worker, so nothing is lost), then
+   * resolves with `{file, bytes, ms, flat, heapMB, tier, io}` — a File the HOST
+   * delivers however it wants (download, File System Access, a native bridge).
+   *
+   * Rejects with PdfeError codes the host is expected to handle:
+   *   'save-needs-consent' — this browser cannot stream saves (no OPFS sync
+   *      handle, e.g. private browsing), so the whole output would sit in
+   *      memory. Show your own warning, then retry save({allowInMemory:true}).
+   *   'save-too-large'     — no streaming AND the document exceeds the in-heap
+   *      ceiling (detail: sizeMB, limitMB). Refuse in your UI.
+   * The SDK deliberately shows no dialog of its own.
+   */
+  async save(opts = {}) {
+    await this._readyPromise;
+    if (!this._pages.length) throw new PdfeError("no-document", "nothing open to save");
+    const forceInHeap = this._simulateNoOpfs || !!opts.forceInHeap;
+    if (!this._caps.canStreamSave || forceInHeap) {
+      const sizeMB = this._docBytes / (1024 * 1024);
+      const limitMB = this._caps.inHeapMaxMB;
+      if (limitMB && sizeMB > limitMB) {
+        throw new PdfeError("save-too-large",
+          "document too large to save without streaming storage",
+          { sizeMB, limitMB });
+      }
+      if (!opts.allowInMemory) {
+        throw new PdfeError("save-needs-consent",
+          "saves cannot stream in this browser; confirm an in-memory save",
+          { sizeMB, limitMB });
+      }
+    }
+    const p = this._promiseFor("save");
+    this._post({ type: "save", forceInHeap });
+    return p;
+  }
+
+  /**
+   * Tell the SDK the saved File has been fully consumed, so the staged OPFS copy
+   * can be dropped (docs/WEB_IO.md §6). Only call this once your delivery has
+   * finished reading the File — a browser download is still reading it.
+   */
+  releaseSaved() { this._post({ type: "reapStaging" }); }
+
+  /**
+   * Edit mode is the Android FAB analog: OFF = taps only scroll/zoom, nothing
+   * edits; ON = faint paragraph boxes appear, taps open runs, long-press
+   * selects a word. Turning it off commits any open run.
+   */
+  setEditMode(on) {
+    on = !!on;
+    if (this._editMode === on || this._destroyed) return;
+    this._editMode = on;
+    if (on) {
+      this._sweepVisible();
+    } else {
+      if (this._editingPage >= 0) this._post({ type: "commit" });
+      this._post({ type: "deselect" });
+      this._selected = null;
+      this._pageGroups.clear();
+      this._groupsPending.clear();
+      this._renderBoxes();
+    }
+    this._emit("editmode", { editMode: on });
+  }
+  toggleEditMode() { this.setEditMode(!this._editMode); }
+
+  /** Commit the open run (the tap-outside/Done gesture, for host buttons). */
+  commit() { if (this._editingPage >= 0) this._post({ type: "commit" }); }
+
+  /**
+   * The paragraph the user has SELECTED (first tap in edit mode) — the state
+   * between "nothing" and "typing": `{page, index}` or null. The SDK draws the
+   * selected box and its Edit / Delete bar itself; these commands exist so a
+   * host can drive the same two actions from its own chrome.
+   */
+  get selection() {
+    return this._selected ? { page: this._selected.page, index: this._selected.index } : null;
+  }
+  /** Open the selected paragraph for typing (the Edit action). */
+  editSelection() { if (this._selected) this._post({ type: "openSelected" }); }
+  /**
+   * Delete the selected paragraph: its text is removed from the PDF's real text
+   * layer and the page repaints in place — no dialog, no confirmation (the host
+   * owns undo/confirm policy, as it owns save).
+   */
+  deleteSelection() { if (this._selected) this._post({ type: "deleteSelected" }); }
+  /** Drop the selection (the tap-on-empty-space gesture). */
+  clearSelection() { if (this._selected) this._post({ type: "deselect" }); }
+
+  setZoom(z) {
+    const next = Math.min(this.maxZoom, Math.max(this.minZoom, z));
+    if (next === this._zoom) return;
+    this._zoom = next;
+    this._applyZoom();
+    this._repositionOverlays();
+    this._emit("zoom", { zoom: next });
+  }
+  zoomIn(step = 1.25) { this.setZoom(this._zoom * step); }
+  zoomOut(step = 1.25) { this.setZoom(this._zoom / step); }
+  /** Reset to fit-width (zoom 1) and re-measure the container. */
+  fitWidth() { this._zoom = 1; this._refit(); this._emit("zoom", { zoom: 1 }); }
+
+  /**
+   * Per-paragraph line mode (the Android btnLineMode analog): reflow (¶) vs
+   * keep-lines (≡). The core's heuristic already picks one when a run opens;
+   * this flips the open run. Only meaningful while `editing.isParagraph`.
+   */
+  toggleLineMode() { if (this._editingPage >= 0) this._post({ type: "toggleLineMode" }); }
+  setLineMode(preserve) {
+    if (this._editingPage >= 0 && !!preserve !== this._editingLinePreserve) this.toggleLineMode();
+  }
+
+  /**
+   * Jump to a page (0-based): its top edge goes to the top of the view. This is the
+   * "Go to page" a host's page box drives — the host owns the input, this owns the
+   * scroll. Returns `false` for an out-of-range page (nothing moves) so a host can
+   * mark its field invalid; it never throws.
+   *
+   * Out-of-range is rejected rather than clamped: a host that typed 500 into a
+   * 12-page document wants to know, and silently landing on page 12 hides the typo.
+   *
+   * An open paragraph is left open (jumping is not committing — that is the host's
+   * decision, like save). Note that typing afterwards scrolls the caret back into
+   * view, so a host offering "go to page" mid-edit usually wants `commit()` first.
+   */
+  goToPage(page) {
+    const i = Math.trunc(Number(page));
+    if (!Number.isFinite(i) || i < 0 || i >= this._pageCanvases.length) return false;
+    if (!this._pageOffsets.length) this._measurePageOffsets();
+    this.scroller.scrollTop = this._pageOffsets[i][0] - 8;
+    // Announce the new page now instead of waiting for the browser's scroll event,
+    // so a host that shows a page label sees it update in the same task.
+    this._updateCurrentPage();
+    return true;
+  }
+
+  /** @deprecated since 1.2 — use {@link goToPage}. Kept for existing hosts. */
+  scrollToPage(page) { return this.goToPage(page); }
+
+  /**
+   * Scroll the caret into view if it is outside (or nearly outside) the visible
+   * area — the Android scroll-into-view analog. Called automatically when a run
+   * opens and when the caret moves; hosts also call it after their own layout
+   * changes (e.g. an on-screen keyboard shrinking the container on iOS).
+   */
+  scrollCaretIntoView(margin = 48) {
+    if (this._editingPage < 0 || !this._lastCaretGeom || this._pinchActive) return;
+    const g = this._lastCaretGeom;
+    const top = this._pageToCss(g[0], g[1]);
+    const bot = this._pageToCss(g[0], g[2]);
+    if (!top) return;
+    // Strip coords -> scroll coords (the strip is the scroller's only child).
+    // _stripTop comes from the offsets cache — no layout read per keystroke.
+    const y0 = this._stripTop + top.y, y1 = this._stripTop + bot.y;
+    const x = this._stripLeft + top.x;
+    const viewH = this.scroller.clientHeight, viewW = this.scroller.clientWidth;
+    const sTop = this.scroller.scrollTop, sLeft = this.scroller.scrollLeft;
+    if (y0 - margin < sTop) this.scroller.scrollTop = Math.max(0, y0 - margin);
+    else if (y1 + margin > sTop + viewH) this.scroller.scrollTop = y1 + margin - viewH;
+    if (x - margin < sLeft) this.scroller.scrollLeft = Math.max(0, x - margin);
+    else if (x + margin > sLeft + viewW) this.scroller.scrollLeft = x + margin - viewW;
+  }
+
+  /** Latency telemetry for the parity/latency gates (docs/PARITY_TESTING.md). */
+  latencyP95() { return percentile(this.latencySamples, 95); }
+
+  on(type, fn) {
+    if (!this._listeners.has(type)) this._listeners.set(type, new Set());
+    this._listeners.get(type).add(fn);
+    return () => this.off(type, fn);
+  }
+  off(type, fn) { this._listeners.get(type)?.delete(fn); }
+
+  /** Tear everything down: worker, DOM, observers, listeners. */
+  destroy() {
+    if (this._destroyed) return;
+    this._destroyed = true;
+    try { this._io?.disconnect(); } catch (e) { /* already gone */ }
+    try { this._resizeObs?.disconnect(); } catch (e) { /* already gone */ }
+    clearTimeout(this._evictTimer);
+    clearTimeout(this._refitTimer);
+    clearTimeout(this._zoomTimer);
+    for (const [target, type, fn, opt] of this._domListeners) {
+      target.removeEventListener(type, fn, opt);
+    }
+    this._domListeners.length = 0;
+    try { this._worker.terminate(); } catch (e) { /* already gone */ }
+    this.root.remove();
+    this.container.classList.remove("pdfe-host");
+    this._listeners.clear();
+    for (const [, { reject }] of this._pending) {
+      reject(new PdfeError("destroyed", "editor destroyed"));
+    }
+    this._pending.clear();
+  }
+
+  // ===========================================================================
+  // Internals
+  // ===========================================================================
+
+  _emit(type, detail) {
+    for (const fn of this._listeners.get(type) || []) {
+      try { fn(detail); } catch (e) { console.error(`[pdfe] listener for "${type}" threw`, e); }
+    }
+  }
+
+  _promiseFor(key) {
+    const prev = this._pending.get(key);
+    if (prev) prev.reject(new PdfeError("superseded", `${key} superseded by a newer call`));
+    return new Promise((resolve, reject) => this._pending.set(key, { resolve, reject }));
+  }
+  _settle(key, ok, value) {
+    const p = this._pending.get(key);
+    if (!p) return;
+    this._pending.delete(key);
+    ok ? p.resolve(value) : p.reject(value);
+  }
+
+  _post(msg, transfer) {
+    if (this._destroyed) return;
+    this._worker.postMessage(msg, transfer || []);
+  }
+
+  _listen(target, type, fn, opt) {
+    target.addEventListener(type, fn, opt);
+    this._domListeners.push([target, type, fn, opt]);
+  }
+
+  _buildDom() {
+    this._domListeners = [];
+    this.container.classList.add("pdfe-host");
+
+    const mk = (tag, cls) => {
+      const el = this._doc.createElement(tag);
+      el.className = cls;
+      return el;
+    };
+    this.root = mk("div", "pdfe-scroll");
+    this.scroller = this.root;
+    this.strip = mk("div", "pdfe-strip");
+    this.boxesEl = mk("div", "pdfe-layer pdfe-boxes");
+    this.selEl = mk("div", "pdfe-layer pdfe-sel");
+    this.caretEl = mk("div", "pdfe-caret");
+    this.editBoxEl = mk("div", "pdfe-editbox");
+    this.handleEls = [mk("div", "pdfe-handle"), mk("div", "pdfe-handle")];
+    this.actionsEl = mk("div", "pdfe-actions");
+    this.editBtn = mk("button", "pdfe-act-edit");
+    this.deleteBtn = mk("button", "pdfe-act-del");
+    this.editBtn.type = "button";
+    this.deleteBtn.type = "button";
+    this.editBtn.textContent = "✎ Edit";
+    this.deleteBtn.textContent = "🗑 Delete";
+    this.actionsEl.append(this.editBtn, this.deleteBtn);
+    this.sink = mk("textarea", "pdfe-sink");
+    for (const [k, v] of Object.entries({
+      autocapitalize: "off", autocomplete: "off", autocorrect: "off",
+      spellcheck: "false", "aria-hidden": "true", tabindex: "-1",
+    })) this.sink.setAttribute(k, v);
+
+    this.strip.append(this.boxesEl, this.editBoxEl, this.selEl, this.caretEl,
+      ...this.handleEls, this.actionsEl, this.sink);
+    this.root.appendChild(this.strip);
+    this.container.appendChild(this.root);
+
+    this._wireSink();
+    this._wireHandles();
+    this._wireActions();
+    this._wireViewportGestures();
+
+    // Live page number. Safe to do synchronously: the browser already coalesces
+    // scroll events to one per frame per element, and the work reads only CACHED
+    // page offsets (a per-page getBoundingClientRect here would be a forced
+    // layout per page per frame). Passive, so it never blocks scrolling.
+    // The scroll also arms the (throttled) far-page eviction sweep.
+    this._listen(this.scroller, "scroll", () => {
+      this._updateCurrentPage();
+      this._scheduleEvictSweep();
+    }, { passive: true });
+
+    // Lazy paint/group as pages scroll into view — rooted at OUR scroller, not
+    // the window, so the editor works inside any host layout.
+    this._io = new IntersectionObserver((entries) => {
+      for (const en of entries) {
+        if (!en.isIntersecting) continue;
+        const page = Number(en.target.dataset.page);
+        // Groups (edit-mode boxes) are requested AFTER the page's paint lands
+        // (the `painted` message) so text pixels always precede their boxes —
+        // and so pages flung past before painting never get grouped at all.
+        const wasPainted = this._painted.has(page);
+        this._requestPaint(page);
+        if (wasPainted) this._requestGroups(page);   // no-op outside edit mode / cached
+      }
+    }, { root: this.scroller, rootMargin: "300px" });
+
+    // Container resize (host layout change, device rotation, keyboard show):
+    // re-fit so pages never stay at a stale fit width. Debounced — a rotation
+    // fires many times. Overlays follow because their geometry is page points.
+    this._resizeObs = new ResizeObserver(() => {
+      clearTimeout(this._refitTimer);
+      this._refitTimer = setTimeout(() => this._refit(), 120);
+    });
+    this._resizeObs.observe(this.container);
+  }
+
+  _startWorker(opts) {
+    const workerUrl = new URL(opts.workerUrl || "./pdfe-worker.js",
+      opts.workerUrl ? this._doc.baseURI : import.meta.url);
+    const engineUrl = new URL(opts.engineUrl || "./editor.js",
+      opts.engineUrl ? this._doc.baseURI : workerUrl);
+    if (opts.version) {
+      workerUrl.searchParams.set("v", opts.version);
+      engineUrl.searchParams.set("v", opts.version);
+    }
+    // The worker imports the engine glue from ?engine=… (see pdfe-worker.js).
+    workerUrl.searchParams.set("engine", engineUrl.href);
+    this._worker = new Worker(workerUrl.href);   // classic worker (importScripts glue)
+    this._worker.onmessage = (e) => this._onWorkerMessage(e.data);
+    this._worker.onerror = (e) => {
+      const err = new PdfeError("engine-error", e.message || "worker error");
+      this._settle("open", false, err);
+      this._settle("save", false, err);
+      this._emit("error", { code: err.code, detail: err.message });
+    };
+    this._readyPromise = new Promise((resolve) => { this._resolveReady = resolve; });
+  }
+
+  _onWorkerMessage(msg) {
+    if (this._destroyed) return;
+    switch (msg.type) {
+      case "ready": {
+        // The worker probed its save sink before saying ready (WEB_IO.md §7):
+        // no OPFS sync handle means saves cannot stream, which the HOST must
+        // know before it offers one.
+        this._caps = {
+          canStreamSave: !!msg.opfs && !this._simulateNoOpfs,
+          inHeapMaxMB: msg.inHeapMaxMB || 0,
+        };
+        this._resolveReady(this.capabilities);
+        this._emit("ready", this.capabilities);
+        break;
+      }
+      case "opened": {
+        this._pages = msg.pages;
+        this._buildStrip();
+        const info = {
+          pages: msg.pages.length, pageSizes: this.pages, bytes: msg.bytes,
+          tier: msg.tier, openMs: msg.openMs, heapMB: msg.heapMB, io: msg.io,
+          name: this._docName,
+        };
+        this._settle("open", true, info);
+        this._emit("opened", info);
+        break;
+      }
+      case "painted":
+        // Text pixels just landed: NOW the page may grow its faint boxes
+        // (no-op outside edit mode / already cached / already pending).
+        this._requestGroups(msg.page);
+        this._emit("painted", { page: msg.page, baseMs: msg.baseMs, tiles: msg.tiles });
+        break;
+      case "tile":
+        this._emit("tile", { page: msg.page, ms: msg.ms, left: msg.left });
+        break;
+      case "paraSelected":
+        this._selected = { page: msg.page, index: msg.index, bounds: msg.bounds,
+                           blockIndex: msg.blockIndex ?? -1 };
+        this._renderBoxes();
+        this._emit("select", { selection: { page: msg.page, index: msg.index,
+                                           blockIndex: msg.blockIndex ?? -1 } });
+        break;
+      case "paraDeselected":
+        if (!this._selected) break;
+        this._selected = null;
+        this._renderBoxes();
+        this._emit("select", { selection: null });
+        break;
+      case "paraDeleted": {
+        // The paragraph is gone from the text layer and the vacated strip has
+        // already been repainted by the worker — all that is left is to forget
+        // the stale grouping and re-ask for this page's boxes.
+        this._selected = null;
+        this._pageGroups.delete(msg.page);
+        this._groupsPending.delete(msg.page);
+        this._renderBoxes();
+        this._requestGroups(msg.page);
+        if (msg.ok) this._setDirty(true);
+        this._emit("deleted", { page: msg.page, ok: !!msg.ok });
+        break;
+      }
+      case "editOpened": {
+        // Prime the sink with the run's logical text (a programmatic set fires
+        // no 'input', so this cannot echo back as a keystroke).
+        this._selected = null;      // editing supersedes selection
+        this._editingPage = msg.page;
+        this._editingParaIndex = msg.paraIndex ?? -1;
+        this._editingBlockIndex = msg.blockIndex ?? -1;
+        this._editingIsParagraph = !!msg.isParagraph;
+        this._editingLinePreserve = !!msg.linePreserve;
+        this._editingChars = msg.text.length;
+        this._renderBoxes();                 // hide the open run's faint box
+        this.sink.value = msg.text;
+        this.sink.setSelectionRange(msg.caretIndex, msg.caretIndex);
+        this.sink.focus({ preventScroll: true });
+        this._drawEditBox(msg.runBounds);    // the blue "you are typing here" box
+        this._drawCaret(msg.caret);
+        this._drawSelection([]);
+        this._drawHandles(null, null);
+        this.scrollCaretIntoView();
+        this._emit("editopen", this.editing);
+        break;
+      }
+      case "caretMoved":
+        this.sink.setSelectionRange(msg.index, msg.index);
+        // I9 belt-and-braces: the reposition path must refocus too, or any
+        // focus loss preventDefault didn't cover becomes permanent.
+        this.sink.focus({ preventScroll: true });
+        this._drawCaret(msg.caret);
+        this._drawSelection([]);
+        this._drawHandles(null, null);
+        // Only KEYBOARD-driven moves scroll (arrows/Home/End): a caret move that
+        // came from a finger must never scroll under that finger mid-gesture.
+        if (this._wantCaretScroll) { this._wantCaretScroll = false; this.scrollCaretIntoView(); }
+        break;
+      case "selectionChanged":
+        // Mirror the range into the sink (typing/Backspace then replaces it
+        // natively) and draw OUR highlight + knobs from CORE geometry — never
+        // the OS selection.
+        this._selRange = [msg.start, msg.end];
+        // Direction matters: the next Shift+arrow must keep moving the same HEAD.
+        this.sink.setSelectionRange(msg.start, msg.end, msg.headAtStart ? "backward" : "forward");
+        this.sink.focus({ preventScroll: true });
+        this._drawCaret(null);
+        this._drawSelection(msg.rects || []);
+        this._drawHandles(msg.h0, msg.h1);
+        this._emit("selection", { start: msg.start, end: msg.end });
+        break;
+      case "editApplied": {
+        // Keep the blue box on the run as typing reflows/grows it.
+        if (msg.runBounds) this._drawEditBox(msg.runBounds);
+        this._drawCaret(msg.caret);
+        this._drawSelection(msg.selection || []);
+        if (!msg.selection || !msg.selection.length) {
+          this._selRange = null;
+          this._drawHandles(null, null);
+        }
+        this._editingChars = this.sink.value.length;
+        this._setDirty(true);
+        this.scrollCaretIntoView();   // typing must never push the caret off-screen
+        const total = performance.now() - msg.postedAt;   // closed on THIS clock
+        this.latencySamples.push(total);
+        if (this.latencySamples.length > 200) this.latencySamples.shift();
+        this._emit("edit", {
+          generation: msg.generation, engineMs: msg.engineMs, blitMs: msg.blitMs,
+          totalMs: total, p95: this.latencyP95(), samples: this.latencySamples.length,
+        });
+        break;
+      }
+      case "editClosed": {
+        const page = msg.page;
+        this._closeEditUiState();
+        // The commit may have moved/re-split paragraphs: refresh this page.
+        if (this._editMode) {
+          this._pageGroups.delete(page);
+          this._groupsPending.delete(page);
+          this._requestGroups(page);
+        }
+        this._renderBoxes();
+        if (msg.ok) this._setDirty(true);
+        this._emit("editclose", { page, ok: !!msg.ok });
+        break;
+      }
+      case "groups": {
+        this._groupsPending.delete(msg.page);
+        const blocks = msg.blocks || [];
+        this._pageGroups.set(msg.page, blocks);
+        this._renderBoxes();
+        // `count` stays the PARAGRAPH count (what it always meant, and what a
+        // consumer's selection indices are numbered in); `blocks` is additive.
+        let paraCount = 0;
+        for (const b of blocks) paraCount += b.paras.length;
+        this._emit("groups", { page: msg.page, count: paraCount, blocks: blocks.length });
+        break;
+      }
+      case "editEcho":
+        this._emit("echo", { chars: msg.chars, rttMs: performance.now() - msg.postedAt });
+        break;
+      case "saved": {
+        this._closeEditUiState();
+        this._renderBoxes();
+        this._setDirty(false);
+        const info = {
+          file: msg.file, bytes: msg.bytes, ms: msg.ms, flat: !!msg.flat,
+          heapMB: msg.heapMB, tier: msg.tier, io: msg.io,
+          suggestedName: this.suggestedName(),
+        };
+        this._settle("save", true, info);
+        this._emit("saved", info);
+        break;
+      }
+      case "saveRefused": {
+        // The worker's §7 backstop (the API check above normally gets there first).
+        const err = new PdfeError("save-too-large",
+          "document too large to save without streaming storage",
+          { sizeMB: msg.sizeMB, limitMB: msg.limitMB });
+        this._settle("save", false, err);
+        this._emit("error", { code: err.code, detail: err.message, sizeMB: msg.sizeMB, limitMB: msg.limitMB });
+        break;
+      }
+      case "openFailed": {
+        // The engine refused the document, and said why. The worker has already
+        // closed whatever was open, so the strip must go too — otherwise the
+        // host keeps showing pages the engine no longer has (a failed open used
+        // to leave exactly that zombie behind; it became easy to hit once a
+        // protected file could fail on purpose).
+        this._pages = [];
+        this._docBytes = 0;
+        this._buildStrip();
+        const messages = {
+          "password-required": "this document is password-protected",
+          "password-wrong": "the password was not accepted",
+        };
+        const err = new PdfeError(msg.code, messages[msg.code] || "could not open this document",
+          { name: this._docName });
+        this._settle("open", false, err);
+        this._emit("error", { code: err.code, detail: err.message });
+        break;
+      }
+      case "error": {
+        const err = new PdfeError("engine-error", msg.detail);
+        this._settle("open", false, err);
+        this._settle("save", false, err);
+        this._emit("error", { code: err.code, detail: msg.detail });
+        break;
+      }
+    }
+  }
+
+  /** Default file name for a save, derived from the opened document. */
+  suggestedName() {
+    return (this._docName || "document.pdf").replace(/\.pdf$/i, "") + "-edited.pdf";
+  }
+
+  _setDirty(v) {
+    if (this._dirty === v) return;
+    this._dirty = v;
+    this._emit("dirty", { dirty: v });
+  }
+
+  _closeEditUiState() {
+    this._editingPage = -1;
+    this._editingParaIndex = -1;
+    this._editingBlockIndex = -1;
+    this._editingIsParagraph = false;
+    this._editingLinePreserve = false;
+    this._editingChars = 0;
+    this._selRange = null;
+    this.sink.value = "";
+    this._drawEditBox(null);
+    this._drawCaret(null);
+    this._drawSelection([]);
+    this._drawHandles(null, null);
+  }
+
+  // ---- page strip / paint --------------------------------------------------
+
+  _requestPaint(page) {
+    if (this._painted.has(page)) return;
+    const canvas = this._pageCanvases[page];
+    if (!canvas) return;
+    this._painted.add(page);
+    this._livePages.add(page);
+    this._post({
+      type: "paint", page,
+      w: Number(canvas.dataset.w),
+      h: Number(canvas.dataset.h),
+      scale: Number(canvas.dataset.scale),   // device px per PDF point
+    });
+  }
+
+  // ---- far-page eviction (the bitmap/handle LRU's shell half) ---------------
+  // A painted page keeps a full-resolution RGBA canvas alive (megabytes each).
+  // Pages that scroll far outside the keep window hand those megabytes back:
+  // the worker frees the bitmap and closes the page's engine handles; the
+  // canvas keeps its CSS size so the scroll geometry never moves. Throttled —
+  // a fling fires hundreds of scroll events.
+  _scheduleEvictSweep() {
+    if (this._evictTimer) return;
+    this._evictTimer = setTimeout(() => {
+      this._evictTimer = 0;
+      this._evictFarPages();
+    }, 250);
+  }
+
+  _evictFarPages() {
+    if (this._destroyed || !this._pageOffsets.length) return;
+    const keep = Math.max(2400, this.scroller.clientHeight * 3);
+    const top = this.scroller.scrollTop - keep;
+    const bot = this.scroller.scrollTop + this.scroller.clientHeight + keep;
+    let boxesStale = false;
+    for (const page of [...this._livePages]) {
+      if (page === this._editingPage) continue;   // never evict the open run's page
+      const off = this._pageOffsets[page];
+      if (!off) continue;
+      if (off[0] + off[1] > top && off[0] < bot) continue;   // inside the window
+      this._livePages.delete(page);
+      this._painted.delete(page);
+      this._post({ type: "evict", page });
+      if (this._pageGroups.delete(page)) boxesStale = true;
+      this._groupsPending.delete(page);
+    }
+    if (boxesStale) this._renderBoxes();
+  }
+
+  _requestGroups(page) {
+    if (!this._editMode || this._pageGroups.has(page) || this._groupsPending.has(page)) return;
+    this._groupsPending.add(page);
+    this._post({ type: "groups", page });
+  }
+
+  _buildStrip() {
+    // Keep the overlay layers; replace only the canvases.
+    for (const c of this._pageCanvases) c.remove();
+    this._io.disconnect();
+    this._pageCanvases = [];
+    this._pageOffsets = [];
+    this._livePages.clear();     // the worker dropped the old canvases at open
+    this._currentPage = 0;
+    this._reportedPage = -1;     // a new document re-announces its page 1
+    this._pageGroups.clear();
+    this._groupsPending.clear();
+    this._selected = null;
+    this._editingParaIndex = -1;
+    this._editingBlockIndex = -1;
+    this._computeFitScale();
+    this._pages.forEach((p, i) => {
+      const canvas = this._doc.createElement("canvas");
+      canvas.dataset.page = i;
+      // Canvases go BEFORE the overlay layers so overlays paint on top.
+      this.strip.insertBefore(canvas, this.boxesEl);
+      this._pageCanvases[i] = canvas;
+      // One-time ownership transfer; from here the WORKER draws (§2).
+      const off = canvas.transferControlToOffscreen();
+      this._post({ type: "attach", page: i, canvas: off }, [off]);
+      this._io.observe(canvas);
+      this._wireCanvas(canvas);
+    });
+    this._applyZoom();
+    // Explicit first sweep — do NOT wait for the IntersectionObserver: the
+    // canvases are observed while still 0x0 (they are sized in _applyZoom just
+    // above), and Chrome's first delivery for a freshly observed zero-size
+    // element reports "not intersecting" and never fires again without a
+    // scroll. Verified 2026-07-28: re-opening a document while edit mode was ON
+    // left every faint box missing until the user scrolled.
+    this._sweepVisible();
+  }
+
+  // ---- live page number ----------------------------------------------------
+  //
+  // Hosts show "Page 3 of 12", so the SDK has to say which page is being read.
+  // The measurement is cached per zoom because the offsets only move when the
+  // strip is re-laid-out; scrolling then costs one arithmetic pass.
+
+  _measurePageOffsets() {
+    // offsetTop is relative to the strip (the canvases' offsetParent); the strip
+    // itself may sit a few px into the scroller. ONE batched layout pass caching
+    // [topInScroller, height, leftInStrip, width] per page — every overlay
+    // (boxes, caret, edit box, action bar) draws from THIS cache and never reads
+    // canvas.offset* itself. Interleaving those reads with style writes forced a
+    // synchronous relayout of the whole strip per box — ~3-6 ms EACH on a
+    // 7000-page strip, which turned every tap and groups reply into 100-200 ms
+    // of main-thread stall (the "clicking a box lags" symptom on large PDFs).
+    const base = this.strip.offsetTop;
+    this._stripTop = base;
+    this._stripLeft = this.strip.offsetLeft;
+    this._pageOffsets = this._pageCanvases.map(
+      (c) => [base + c.offsetTop, c.offsetHeight, c.offsetLeft, c.offsetWidth]);
+  }
+
+  /** Cached [top, height, left, width] for a page, STRIP-relative top. */
+  _pageRect(page) {
+    if (!this._pageOffsets.length) this._measurePageOffsets();
+    const o = this._pageOffsets[page];
+    if (!o) return null;
+    return { top: o[0] - this._stripTop, height: o[1], left: o[2], width: o[3] };
+  }
+
+  /** Recompute the dominant visible page and emit `page` when it changes. */
+  _updateCurrentPage() {
+    if (this._destroyed) return;
+    if (!this._pageOffsets.length) {
+      // Nothing open (or the strip is not laid out yet): stay at page 0 and arm the
+      // next real measurement to be announced. No event — there is no page to report.
+      this._currentPage = 0;
+      this._reportedPage = -1;
+      return;
+    }
+    const top = this.scroller.scrollTop;
+    const bot = top + this.scroller.clientHeight;
+    let best = 0, bestCover = -1;
+    for (let i = 0; i < this._pageOffsets.length; i++) {
+      const [t, h] = this._pageOffsets[i];
+      if (t > bot) break;                       // offsets ascend: nothing later overlaps
+      const cover = Math.min(t + h, bot) - Math.max(t, top);
+      // Strictly greater keeps ties on the LOWER page (no flicker at a boundary).
+      if (cover > bestCover + 0.5) { bestCover = cover; best = i; }
+    }
+    this._currentPage = best;
+    if (best === this._reportedPage) return;
+    this._reportedPage = best;
+    this._emit("page", { page: best, pageCount: this._pages.length });
+  }
+
+  /** Paint (and, in edit mode, group) every page near the viewport, now.
+   *  Walks the CACHED page offsets — a getBoundingClientRect per canvas costs
+   *  ~12 ms of forced layout on a 7000-page strip, this costs microseconds. */
+  _sweepVisible() {
+    if (!this._pageCanvases.length) return;
+    if (!this._pageOffsets.length) this._measurePageOffsets();
+    const margin = 300;
+    const top = this.scroller.scrollTop - margin;
+    const bot = this.scroller.scrollTop + this.scroller.clientHeight + margin;
+    for (let i = 0; i < this._pageOffsets.length; i++) {
+      const [t, h] = this._pageOffsets[i];
+      if (t > bot) break;                    // offsets ascend
+      if (t + h < top) continue;
+      const wasPainted = this._painted.has(i);
+      this._requestPaint(i);
+      if (wasPainted) this._requestGroups(i);   // fresh paints group on `painted`
+    }
+  }
+
+  _computeFitScale() {
+    if (!this._pages.length) return;
+    const maxWpt = Math.max(...this._pages.map((p) => p.w));
+    let avail = this.scroller.clientWidth - 24;
+    if (avail <= 0) avail = 600;                       // container not laid out yet
+    if (this.maxPageWidthCss) avail = Math.min(avail, this.maxPageWidthCss);
+    this._fitScale = avail / maxWpt;
+  }
+
+  /** Re-measure the container and repaint at the new fit width (keeps zoom). */
+  _refit() {
+    if (this._destroyed || !this._pages.length) return;
+    const before = this._fitScale;
+    this._computeFitScale();
+    if (Math.abs(before - this._fitScale) < 1e-6) {
+      this._measurePageOffsets();  // the container may have re-centered the strip
+      this._repositionOverlays();
+      this._updateCurrentPage();   // the visible band may have shrunk (keyboard)
+      return;
+    }
+    this._applyZoom();
+    this._repositionOverlays();
+  }
+
+  // Zoom (§5): CSS rescales instantly; sharp tiles refill async.
+  _applyZoom() {
+    const scaleCss = this._fitScale * this._zoom;   // CSS px per point
+    const scaleDev = scaleCss * this._dpr;          // device px per point
+    for (const canvas of this._pageCanvases) {
+      const p = this._pages[Number(canvas.dataset.page)];
+      canvas.style.width = Math.round(p.w * scaleCss) + "px";
+      canvas.style.height = Math.round(p.h * scaleCss) + "px";
+      canvas.dataset.w = Math.round(p.w * scaleDev);
+      canvas.dataset.h = Math.round(p.h * scaleDev);
+      canvas.dataset.scale = scaleDev;
+    }
+    // Page geometry just changed: re-cache the offsets the page counter reads and
+    // re-evaluate which page is showing (a zoom can change the answer).
+    this._measurePageOffsets();
+    this._updateCurrentPage();
+    this._renderBoxes();   // faint boxes track the new scale immediately
+    // Old pixels keep showing, CSS-scaled (instant, maybe blurry); repaint at
+    // the new resolution after a short settle.
+    this._painted = new Set();
+    clearTimeout(this._zoomTimer);
+    this._zoomTimer = setTimeout(() => this._sweepVisible(), 180);
+  }
+
+  // Faint paragraph boxes (edit mode) — the Android overlay's analog. They live
+  // inside the strip so they scroll and pinch with the pages for free; the open
+  // run's box is omitted while it is being edited.
+  _renderBoxes() {
+    this.boxesEl.innerHTML = "";
+    this.actionsEl.style.display = "none";
+    if (!this._editMode) return;
+    const scaleCss = this._fitScale * this._zoom;
+    const sel = this._selected;
+    // All geometry comes from the CACHED page rects: zero layout reads in this
+    // loop (a read after each append re-laid-out the whole strip per box).
+    const boxEl = (page, b, cls) => {
+      const rect = this._pageRect(page);
+      if (!rect) return null;
+      const div = this._doc.createElement("div");
+      div.className = cls;
+      div.style.left = `${rect.left + b[0] * scaleCss}px`;
+      div.style.top = `${rect.top + (this._pages[page].h - b[3]) * scaleCss}px`;
+      div.style.width = `${(b[2] - b[0]) * scaleCss}px`;
+      div.style.height = `${(b[3] - b[1]) * scaleCss}px`;
+      this.boxesEl.appendChild(div);
+      return div;
+    };
+    // One faint box per BLOCK (the visual unit). The selection highlight is the
+    // BLOCK too (Android parity: the box is what Edit opens and Delete removes;
+    // the worker posts the block's bounds as the selection).
+    for (const [page, blocks] of this._pageGroups) {
+      if (!this._pageCanvases[page]) continue;
+      for (const block of blocks) {
+        // Editing inside this block hides its whole box — the live blue run box
+        // shows where the caret actually is.
+        if (page === this._editingPage && block.index === this._editingBlockIndex) continue;
+        boxEl(page, block.bounds, "pdfe-parabox");
+      }
+    }
+    // The selected box is drawn from the WORKER's bounds, not from the cached
+    // grouping: a selection is always valid even on a page whose boxes have not
+    // been fetched yet (or were just invalidated by a commit).
+    if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")) {
+      this._placeActions(sel.page, sel.bounds, scaleCss);
+    }
+  }
+
+  /** Park the Edit/Delete bar just above the selected box (below it when the
+   *  box is at the page top), clamped to the page's own width. */
+  _placeActions(page, b, scaleCss) {
+    const rect = this._pageRect(page);
+    if (!rect) return;
+    const bar = this.actionsEl;
+    bar.style.display = "flex";
+    const boxLeft = rect.left + b[0] * scaleCss;
+    const boxTop = rect.top + (this._pages[page].h - b[3]) * scaleCss;
+    const boxBot = rect.top + (this._pages[page].h - b[1]) * scaleCss;
+    // The bar's own size is content-static: measure it once (ONE layout flush),
+    // then reuse — re-reading it after the writes above would flush again.
+    if (!this._actionsSize) this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
+    const [bw, bh] = this._actionsSize;
+    let top = boxTop - bh - 6;
+    if (top < rect.top) top = boxBot + 6;
+    const maxLeft = rect.left + rect.width - bw;
+    bar.style.left = `${Math.max(rect.left, Math.min(boxLeft, maxLeft))}px`;
+    bar.style.top = `${top}px`;
+  }
+
+  // The bar is the one overlay the user can press, so it must swallow its own
+  // pointer events: the scroller's commit-on-tap-outside handler and the canvas
+  // tap router both sit above it in the tree.
+  _wireActions() {
+    const swallow = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
+    this._listen(this.actionsEl, "pointerdown", swallow);
+    this._listen(this.editBtn, "click", (ev) => { swallow(ev); this.editSelection(); });
+    this._listen(this.deleteBtn, "click", (ev) => { swallow(ev); this.deleteSelection(); });
+  }
+
+  // ---- caret / selection overlays (§6): CORE page geometry -> CSS ----------
+  // STRIP-SPACE, not viewport-space (I16, iPhone pinch 2026-07-28): iOS pinch is
+  // a visual-viewport camera move that fires no scroll/resize and slides content
+  // under position:fixed elements — a fixed caret visibly detached from its
+  // text. Absolute coordinates inside the strip move with the content under ANY
+  // camera transform (and under our own scroller), by construction.
+  // Reads the CACHED page rect, never canvas.offset* — this runs per keystroke
+  // (caret + edit box + selection), and a layout read here after the style
+  // writes below re-laid-out the whole strip (expensive at 7000 pages).
+  _pageToCss(xPt, yPt) {
+    if (this._editingPage < 0 || !this._pageCanvases[this._editingPage]) return null;
+    const rect = this._pageRect(this._editingPage);
+    if (!rect) return null;
+    const scaleCss = this._fitScale * this._zoom;
+    return {
+      x: rect.left + xPt * scaleCss,
+      y: rect.top + (this._pages[this._editingPage].h - yPt) * scaleCss,
+    };
+  }
+
+  _drawCaret(geom) {
+    this._lastCaretGeom = geom;
+    if (!geom || this._editingPage < 0) { this.caretEl.style.display = "none"; return; }
+    const top = this._pageToCss(geom[0], geom[1]);
+    const bot = this._pageToCss(geom[0], geom[2]);
+    if (!top) { this.caretEl.style.display = "none"; return; }
+    this.caretEl.style.display = "block";
+    this.caretEl.style.left = `${top.x - 1}px`;
+    this.caretEl.style.top = `${top.y}px`;
+    this.caretEl.style.height = `${Math.max(2, bot.y - top.y)}px`;
+    // Keep the sink under the caret so an IME candidate window follows (§7).
+    this.sink.style.left = `${Math.round(top.x)}px`;
+    this.sink.style.top = `${Math.round(top.y)}px`;
+  }
+
+  /** The blue box around the run being edited. |b| is [l,b,r,t] page points (the
+   *  core's LIVE run bounds); null hides it. Inset outward by 2px so the rule
+   *  sits just OFF the glyphs, matching the Android overlay. */
+  _drawEditBox(b) {
+    this._lastEditBounds = b || null;
+    const el = this.editBoxEl;
+    if (!b || this._editingPage < 0) { el.style.display = "none"; return; }
+    const tl = this._pageToCss(b[0], b[3]);
+    const br = this._pageToCss(b[2], b[1]);
+    if (!tl) { el.style.display = "none"; return; }
+    el.style.display = "block";
+    el.style.left = `${tl.x - 2}px`;
+    el.style.top = `${tl.y - 2}px`;
+    el.style.width = `${Math.max(1, br.x - tl.x + 4)}px`;
+    el.style.height = `${Math.max(1, br.y - tl.y + 4)}px`;
+  }
+
+  _drawSelection(rects) {
+    this._lastSelection = rects;
+    this.selEl.innerHTML = "";
+    if (this._editingPage < 0) return;
+    for (const r of rects) {
+      const tl = this._pageToCss(r[0], r[3]);
+      const br = this._pageToCss(r[2], r[1]);
+      if (!tl) continue;
+      const div = this._doc.createElement("div");
+      div.className = "pdfe-selrect";
+      div.style.left = `${tl.x}px`;
+      div.style.top = `${tl.y}px`;
+      div.style.width = `${br.x - tl.x}px`;
+      div.style.height = `${br.y - tl.y}px`;
+      this.selEl.appendChild(div);
+    }
+  }
+
+  _drawHandles(h0, h1) {
+    this._lastHandles = [h0, h1];
+    [h0, h1].forEach((h, i) => {
+      const el = this.handleEls[i];
+      if (!h || this._editingPage < 0) { el.style.display = "none"; return; }
+      const bot = this._pageToCss(h[0], h[2]);   // knob hangs below the caret bottom
+      if (!bot) { el.style.display = "none"; return; }
+      el.style.display = "block";
+      el.style.left = `${bot.x - 9}px`;
+      el.style.top = `${bot.y}px`;
+    });
+  }
+
+  _repositionOverlays() {
+    this._drawEditBox(this._lastEditBounds);
+    this._drawCaret(this._lastCaretGeom);
+    this._drawSelection(this._lastSelection);
+    this._drawHandles(this._lastHandles[0], this._lastHandles[1]);
+  }
+
+  // ---- selection handles (the Android round-knob analog) -------------------
+  _wireHandles() {
+    this.handleEls.forEach((el, which) => {
+      this._listen(el, "pointerdown", (ev) => {
+        if (!this._selRange || this._editingPage < 0) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        try { el.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic/stale pointer */ }
+        const move = (mv) => {
+          const canvas = this._pageCanvases[this._editingPage];
+          if (!canvas || !this._selRange) return;
+          const rect = canvas.getBoundingClientRect();
+          const scaleCss = this._fitScale * this._zoom;
+          // The finger is on the knob BELOW the line — sample ~a knob height
+          // above it so the boundary lookup lands on the dragged line.
+          const xPt = (mv.clientX - rect.left) / scaleCss;
+          const yPt = this._pages[this._editingPage].h - (mv.clientY - 22 - rect.top) / scaleCss;
+          this._post({
+            type: "dragHandle", which,
+            start: this._selRange[0], end: this._selRange[1], xPt, yPt,
+          });
+        };
+        const up = () => {
+          el.removeEventListener("pointermove", move);
+          this.sink.focus({ preventScroll: true });   // the drag must not kill the keyboard
+        };
+        el.addEventListener("pointermove", move);
+        el.addEventListener("pointerup", up, { once: true });
+        el.addEventListener("pointercancel", up, { once: true });
+      });
+    });
+  }
+
+  // ---- canvas gestures: tap / long-press / drag-select --------------------
+  _wireCanvas(canvas) {
+    this._listen(canvas, "pointerdown", (ev) => {
+      if (!this._editMode) return;
+      // I9: killing the default action stops the browser from moving focus to
+      // <body> after this handler (a mousedown on a non-focusable canvas blurs
+      // the sink). Without it every caret-reposition tap silently disconnected
+      // the keyboard.
+      ev.preventDefault();
+      const page = Number(canvas.dataset.page);
+      const startX = ev.clientX, startY = ev.clientY;
+      const toPt = (cx, cy) => {
+        const rect = canvas.getBoundingClientRect();
+        const scaleCss = this._fitScale * this._zoom;
+        return {
+          xPt: (cx - rect.left) / scaleCss,
+          yPt: this._pages[page].h - (cy - rect.top) / scaleCss,
+        };
+      };
+      let lpFired = false;
+      // Long-press (< 8 px movement) selects the word under the finger, inside
+      // the OPEN run only — same as Android.
+      const lpTimer = setTimeout(() => {
+        if (this._pinchActive) return;   // two held fingers are a pinch
+        lpFired = true;
+        const { xPt, yPt } = toPt(startX, startY);
+        this._post({ type: "selectWord", page, xPt, yPt });
+        this.sink.focus({ preventScroll: true });
+      }, this.longPressMs);
+      let dragging = false;
+      const cleanup = () => {
+        clearTimeout(lpTimer);
+        canvas.removeEventListener("pointermove", move);
+        canvas.removeEventListener("pointerup", up);
+        canvas.removeEventListener("pointercancel", cleanup);
+      };
+      const move = (mv) => {
+        if (this._pinchActive) { cleanup(); return; }   // a pinch owns both fingers (I17)
+        if (!dragging) {
+          if (Math.hypot(mv.clientX - startX, mv.clientY - startY) <= 8) return;
+          clearTimeout(lpTimer);   // moved: no longer a tap or long-press
+          if (this._editingPage !== page) { cleanup(); return; }  // no open run: plain pan
+          dragging = true;
+          try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+        }
+        // Anchor = press point, head = current point; the core clamps both to
+        // the open run (desktop mouse-drag selection).
+        const a = toPt(startX, startY);
+        const c = toPt(mv.clientX, mv.clientY);
+        this._post({ type: "dragSelect", page, ax: a.xPt, ay: a.yPt, xPt: c.xPt, yPt: c.yPt });
+      };
+      const up = (uv) => {
+        cleanup();
+        // A finger lifting off a pinch must not read as a tap (I17).
+        if (this._pinchActive || performance.now() - this._lastPinchEnd < 350) return;
+        if (lpFired) return;
+        if (dragging) { this.sink.focus({ preventScroll: true }); return; }
+        const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
+        this._post({ type: "tap", page, xPt, yPt });
+        // Focus inside the user gesture — browsers only show a keyboard then.
+        this.sink.focus({ preventScroll: true });
+      };
+      canvas.addEventListener("pointermove", move);
+      canvas.addEventListener("pointerup", up);
+      canvas.addEventListener("pointercancel", cleanup);
+    });
+  }
+
+  // ---- viewport gestures: tap-outside commit, pinch zoom, ctrl+wheel ------
+  _wireViewportGestures() {
+    this._pinchActive = false;
+    this._lastPinchEnd = 0;
+    this._pinch = null;
+
+    // I9: taps that miss every canvas (the gray gutter) used to do NOTHING
+    // except let the browser blur the sink — the edit stayed open but the
+    // keyboard was silently dead. Route them as an explicit commit (the Android
+    // tap-outside behavior). Host chrome lives OUTSIDE this element, so its
+    // buttons can never double as a commit gesture; a host that wants
+    // commit-on-its-own-button calls commit().
+    this._listen(this.scroller, "pointerdown", (ev) => {
+      if (this._editingPage < 0) return;
+      if (ev.target.tagName === "CANVAS") return;          // canvas handler owns these
+      if (ev.target.classList.contains("pdfe-handle")) return;
+      ev.preventDefault();                                 // keep the sink focused
+      this._post({ type: "commit" });
+    });
+
+    const touchDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+    const touchMid = (t) => ({ x: (t[0].clientX + t[1].clientX) / 2,
+                               y: (t[0].clientY + t[1].clientY) / 2 });
+
+    // Native mobile pinch is a visual-viewport camera zoom: it STRETCHES the
+    // rendered canvas bitmap and the text goes blurry (I17). So we suppress the
+    // browser's pinch (touch-action above; the cancelable iOS gesture events
+    // below, which Safari honors where touch-action is ignored) and drive the
+    // APP's zoom instead, repainting sharp tiles. The page point between the
+    // fingers is PINNED under the pinch midpoint.
+    this._listen(this.scroller, "touchstart", (ev) => {
+      if (ev.touches.length !== 2 || !this._pages.length) return;
+      ev.preventDefault();
+      const mid = touchMid(ev.touches);
+      this._pinchActive = true;
+      let anchor = this._pagePointAt(mid.x, mid.y);
+      if (!anchor) anchor = this._nearestPagePoint(mid.x, mid.y);
+      this._pinch = { dist0: touchDist(ev.touches), zoom0: this._zoom, anchor };
+    }, { passive: false });
+
+    this._listen(this.scroller, "touchmove", (ev) => {
+      if (!this._pinch || ev.touches.length !== 2) return;
+      ev.preventDefault();
+      const mid = touchMid(ev.touches);
+      this.setZoom(this._pinch.zoom0 * (touchDist(ev.touches) / this._pinch.dist0));
+      if (this._pinch.anchor) this._scrollPagePointTo(this._pinch.anchor, mid.x, mid.y);
+    }, { passive: false });
+
+    const endPinch = (ev) => {
+      if (!this._pinchActive) return;
+      if (ev.touches && ev.touches.length >= 2) return;   // still pinching
+      this._pinchActive = false;
+      this._pinch = null;
+      this._lastPinchEnd = performance.now();
+    };
+    this._listen(this.scroller, "touchend", endPinch);
+    this._listen(this.scroller, "touchcancel", endPinch);
+
+    // iOS Safari/WKWebView ignore touch-action and the viewport meta for their
+    // page zoom, but these proprietary gesture events are cancelable and DO
+    // block it.
+    for (const t of ["gesturestart", "gesturechange", "gestureend"]) {
+      this._listen(this.scroller, t, (ev) => ev.preventDefault(), { passive: false });
+    }
+
+    this._listen(this.scroller, "wheel", (ev) => {
+      if (!ev.ctrlKey) return;                 // trackpad pinch / ctrl+wheel
+      ev.preventDefault();
+      this.setZoom(this._zoom * (ev.deltaY < 0 ? 1.1 : 1 / 1.1));
+    }, { passive: false });
+  }
+
+  /** The page + (top-origin) page point under a client point, if any. */
+  _pagePointAt(clientX, clientY) {
+    const el = this._doc.elementsFromPoint(clientX, clientY)
+      .find((e) => e.tagName === "CANVAS" && this._pageCanvases.includes(e));
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const scaleCss = this._fitScale * this._zoom;
+    return { page: Number(el.dataset.page),
+             xPt: (clientX - r.left) / scaleCss,
+             yPt: (clientY - r.top) / scaleCss };
+  }
+
+  // A pinch midpoint over the gray gutter has no canvas under it; with no
+  // anchor at all the browser keeps a clamped scroll and the view lurches
+  // toward the page end (iPhone report, I17 follow-up) — so anchor on the
+  // NEAREST page instead.
+  _nearestPagePoint(clientX, clientY) {
+    let best = null, bestD = Infinity;
+    for (const canvas of this._pageCanvases) {
+      const r = canvas.getBoundingClientRect();
+      const dx = Math.max(r.left - clientX, 0, clientX - r.right);
+      const dy = Math.max(r.top - clientY, 0, clientY - r.bottom);
+      const d = dx * dx + dy * dy;
+      if (d < bestD) { bestD = d; best = { canvas, r }; }
+    }
+    if (!best) return null;
+    const scaleCss = this._fitScale * this._zoom;
+    return {
+      page: Number(best.canvas.dataset.page),
+      xPt: (Math.min(Math.max(clientX, best.r.left), best.r.right) - best.r.left) / scaleCss,
+      yPt: (Math.min(Math.max(clientY, best.r.top), best.r.bottom) - best.r.top) / scaleCss,
+    };
+  }
+
+  /** Scroll so |pt| (top-origin page point) lands under a client position.
+   *  Cached rects only — this runs per pinch move, right after setZoom's style
+   *  writes, where a canvas.offset* read would relayout the whole strip. */
+  _scrollPagePointTo(pt, clientX, clientY) {
+    const rect = this._pageRect(pt.page);
+    if (!rect) return;
+    const scaleCss = this._fitScale * this._zoom;
+    const v = this.scroller.getBoundingClientRect();
+    this.scroller.scrollLeft =
+      this._stripLeft + rect.left + pt.xPt * scaleCss - (clientX - v.left);
+    this.scroller.scrollTop =
+      this._stripTop + rect.top + pt.yPt * scaleCss - (clientY - v.top);
+  }
+
+  // ---- hidden-input IME sink (§7) -----------------------------------------
+  // The direct analog of Android's InputSinkEditText: an off-screen editable
+  // whose only job is to summon the keyboard, receive keystrokes AND
+  // composition, and mirror the full buffer + caret to the worker. NEVER a
+  // visible editor. WebKit has no EditContext, so this path is permanent.
+  _wireSink() {
+    const push = () => {
+      this._post({
+        type: "edit",
+        fullText: this.sink.value,
+        caretIndex: this.sink.selectionStart,
+        selStart: this.sink.selectionStart,
+        selEnd: this.sink.selectionEnd,
+        generation: ++this._editGeneration,
+        postedAt: performance.now(),
+      });
+    };
+    this._pushEdit = push;
+
+    // Full composition handling from day one (§7): every intermediate buffer
+    // state is mirrored (the worker's newest-wins latch coalesces).
+    this._listen(this.sink, "compositionstart", () => { this._composing = true; });
+    this._listen(this.sink, "compositionupdate", () => push());
+    this._listen(this.sink, "compositionend", () => { this._composing = false; push(); });
+    this._listen(this.sink, "input", () => { if (!this._composing) push(); });
+    this._listen(this.sink, "keydown", (e) => {
+      // Up/Down/Home/End must move by the PDF wrap, not the sink textarea's own
+      // layout — the 1×1 sink wraps at every char, so its native motion
+      // degenerates. Route through the core: caret/head geometry, one line up or
+      // down (or an extreme x for Home/End), boundaryAt picks the char. Shift
+      // extends (the moved end is the HEAD, the anchor stays); unshifted with a
+      // selection collapses to the edge in the travel direction first.
+      if (["ArrowUp", "ArrowDown", "Home", "End"].includes(e.key) && this._editingPage >= 0) {
+        e.preventDefault();
+        const dir = e.key === "ArrowUp" || e.key === "Home" ? -1 : 1;
+        const edge = e.key === "Home" ? -1 : e.key === "End" ? 1 : 0;
+        const s = this.sink.selectionStart, en = this.sink.selectionEnd;
+        this._wantCaretScroll = true;   // keyboard motion may leave the viewport
+        if (e.shiftKey) {
+          const headAtStart = s !== en && this.sink.selectionDirection === "backward";
+          this._post({
+            type: "caretLine", dir, edge, extend: true,
+            index: headAtStart ? s : en,
+            anchor: headAtStart ? en : s,
+          });
+        } else {
+          this._post({ type: "caretLine", dir, edge, index: s !== en ? (dir < 0 ? s : en) : s });
+        }
+        return;
+      }
+      // Left/Right move the caret (or extend with Shift) without firing an
+      // input event — mirror those so the overlays track.
+      if (["ArrowLeft", "ArrowRight"].includes(e.key)) setTimeout(push, 0);
+    });
+  }
+}
+
+export default PdfeEditor;

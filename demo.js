@@ -11,7 +11,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.0-2686ba4";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.1-9876443";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -33,8 +33,15 @@ const params = new URLSearchParams(location.search);
 const forcedTier = Number(params.get("tier")) || 0;
 const blockKB = Number(params.get("block")) || 0;
 const forceInHeap = params.has("noopfs");
-const version = params.get("v") || $("appver").textContent.trim() || undefined;
-if (params.get("v")) $("appver").textContent = params.get("v");
+// In the DEV tree the stamp is the literal "dev" (build_site.sh replaces it for
+// the published site), so the worker/engine cache-buster never changed and a
+// plain reload kept running a PREVIOUS engine build from the browser cache —
+// twice in one day that produced a "bug still happening" report against an
+// engine that no longer existed (2026-08-03). Dev now busts on every load;
+// ?v= still overrides for reproducing a specific stamp.
+const stamped = $("appver").textContent.trim();
+const version = params.get("v") || (stamped === "dev" ? `dev-${Date.now()}` : stamped);
+if (version !== stamped) $("appver").textContent = version;
 
 const editor = new PdfeEditor({
   container: $("editor"),
@@ -101,6 +108,23 @@ async function openDocument(source, opts = {}) {
   }
 }
 window.openDocument = openDocument;  // verification hook (the browser harness drives it)
+
+// WHICH ENGINE IS THIS TAB ACTUALLY RUNNING? Shown in the version badge's
+// tooltip and logged once. A rebuilt editor.wasm keeps its URL, so a browser
+// can serve a cached one and present a fixed bug as unfixed — that happened
+// twice on 2026-08-03 and cost two debugging rounds. The engine's
+// Last-Modified is the one fact that settles it; if it predates your rebuild,
+// the tab is stale, not the code. (The dev server now sends no-store, so this
+// is a check, not a workaround — scripts/dev_server.py.)
+fetch(ENGINE_URL.replace(/\.js$/, ".wasm"), { method: "HEAD" })
+  .then((r) => {
+    const built = r.headers.get("last-modified");
+    if (!built) return;
+    const badge = $("appver");
+    badge.title = `engine built ${built}`;
+    console.log(`[pdfe] engine editor.wasm built ${built} — version stamp "${version}"`);
+  })
+  .catch(() => {});
 
 // ---- engine ready → load the corpus sample ---------------------------------
 editor.on("ready", (caps) => {

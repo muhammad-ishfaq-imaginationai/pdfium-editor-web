@@ -119,6 +119,24 @@ const ready = createPdfe({
   F.blockCount    = m.cwrap("pdfe_block_count", "number", ["number"]);
   F.blockInfo     = m.cwrap("pdfe_block_info", "number",
     ["number", "number", "number", "number", "number"]);
+  F.moveBlock     = m.cwrap("pdfe_move_block", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.blockMoveLimits = m.cwrap("pdfe_block_move_limits", "number",
+    ["number", "number", "number", "number"]);
+  // Undo/redo. The journal lives in the CORE (docs/UNDO_REDO.md) — this shell
+  // only asks which page a step belongs to, calls it, and repaints.
+  F.undoPage      = m.cwrap("pdfe_undo_page", "number", ["number"]);
+  F.redoPage      = m.cwrap("pdfe_redo_page", "number", ["number"]);
+  F.undo          = m.cwrap("pdfe_undo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.redo          = m.cwrap("pdfe_redo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.historyClear  = m.cwrap("pdfe_history_clear", null, ["number"]);
+  F.historyDescribe = m.cwrap("pdfe_history_describe", "number",
+    ["number", "number", "number"]);
+  F.editCaretIndex = m.cwrap("pdfe_edit_caret_index", "number", ["number"]);
+  F.deleteBlock   = m.cwrap("pdfe_delete_block", "number",
+    ["number", "number", "number", "number", "number", "number"]);
   F.editBegin     = m.cwrap("pdfe_edit_begin", "number",
     ["number", "number", "number", "number"]);
   F.editBeginEx   = m.cwrap("pdfe_edit_begin_ex", "number",
@@ -439,6 +457,137 @@ function commitEditor() {
   noteMutation(page);                      // indices/bounds may have shifted
   editor = 0; editPage = -1; editParaBounds = null;
   postMessage({ type: "editClosed", page, ok: ok === 1 });
+  postHistory();
+}
+
+// ---- undo / redo ------------------------------------------------------------
+// THE JOURNAL IS NOT HERE. It lives in the core (core/src/undo.cpp) so web,
+// Android and iOS behave identically from one implementation; this file only
+// executes the ordered shell contract in docs/UNDO_REDO.md §1. Keep the steps
+// below in that order and numbered — the Android port is a transcription of
+// them, and a step silently dropped on one platform is exactly the class of
+// divergence the contract exists to prevent.
+
+let lastHistory = "";   // "canUndo,canRedo" — so the event fires only on change
+
+function historyState() {
+  if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
+  const u = F.undoPage(doc), r = F.redoPage(doc);
+  return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r };
+}
+
+// Re-query and post, but only when the pair actually changed: this is called
+// from every mutator tail, and a typing burst must not spam the shell.
+function postHistory(force) {
+  const h = historyState();
+  const key = `${h.canUndo},${h.canRedo}`;
+  if (!force && key === lastHistory) return;
+  lastHistory = key;
+  postMessage({ type: "history", ...h });
+}
+
+function applyHistory(kind) {
+  const undo = kind === "undo";
+  if (!doc) return;
+
+  // S0. QUIESCE THE KEYSTROKE PIPE. A keystroke can be posted but not yet
+  // applied when Ctrl+Z arrives; running the undo first would let that stale
+  // buffer land on top of it and silently revert it. Drain before asking the
+  // core anything.
+  if (pendingEdit) drainLatch();
+
+  // S1. Which page? This IS canUndo — never cache a separate flag.
+  const page = undo ? F.undoPage(doc) : F.redoPage(doc);
+  if (page < 0) { postHistory(true); return; }
+
+  // S2. A session on ANOTHER page must be committed; one on this page stays
+  // open, which is what makes the in-place fast path (code 2) reachable.
+  if (editor && editPage !== page) commitEditor();
+
+  // S3. Residency, not visibility — undo must work on a scrolled-away page.
+  const pg = acquirePage(page);
+  const tp = textPageOf(page);
+
+  // S5. (S4, scrolling, is the shell's business — the SDK does it on receipt.)
+  const dp = mod._malloc(16);
+  const fp2 = mod._malloc(16);
+  const tpp = mod._malloc(4);
+  const code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp2, tpp);
+  const dirty = readF32(dp, 4);
+  // WHERE the run ended up, as distinct from what to repaint. Selecting on the
+  // dirty rect's centre looks right until a MOVE is undone: that rect spans the
+  // old and new positions and its centre lands in the gap between them.
+  const focus = readF32(fp2, 4);
+  // S6. Adopt the returned text page UNCONDITIONALLY — the core may have
+  // reloaded it, and keeping the stale handle would crash on close.
+  const newTp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+  mod._free(dp);
+  mod._free(fp2);
+  mod._free(tpp);
+  if (newTp) textPages.set(page, newTp);
+
+  // S7. Branch on the result.
+  if (code <= 0) {
+    postMessage({
+      type: "historyApplied", kind, page, ok: false, code,
+      error: code === -3 ? "history-unavailable" : undefined,
+    });
+    postHistory(true);
+    return;
+  }
+
+  const live = code === 2;   // applied INTO the open session
+  let liveState = null;
+  if (live) {
+    // S8. Refresh the IME buffer from the core. editParaBounds only ever GROWS
+    // while typing, and an undo can shrink the run, so re-seed it rather than
+    // union it or the next tap routes against a stale box.
+    const text = readEditorText();
+    const caretIndex = F.editCaretIndex(editor);
+    const bounds = readRunBounds(text.length);
+    if (bounds) editParaBounds = bounds;
+    liveState = { text, caretIndex, caret: readCaret(caretIndex),
+                  runBounds: bounds || editParaBounds };
+    // S9. Still un-flushed: a live apply is a preview, exactly like a keystroke.
+    dirtyPages.add(page);
+  } else {
+    // The core reopened, restored and committed, so the page is flushed and any
+    // session that was open on it is gone.
+    if (editor && editPage === page) { editor = 0; editPage = -1; editParaBounds = null; }
+    dirtyPages.delete(page);
+  }
+
+  // S10. The grouping is stale either way.
+  noteMutation(page);
+  // S11. Repaint. The core's rect already covers the run before AND after plus
+  // the block box at both states, so no widening is needed here.
+  renderDirtyStrip(page, dirty);
+
+  // S12/S13. Re-group, then re-establish the selection BY POSITION — the centre
+  // of what changed. Never by index: a step renumbers blocks.
+  const blocks = groupPage(page);
+  let selection = null;
+  if (!live && focus[2] > focus[0] && focus[3] > focus[1]) {
+    const cx = 0.5 * (focus[0] + focus[2]);
+    const cy = 0.5 * (focus[1] + focus[3]);
+    const hit = hitParagraph(page, cx, cy);
+    if (hit) {
+      selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt: cx, yPt: cy };
+      selection = { index: hit.index, bounds: hit.blockBounds,
+                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy };
+    } else {
+      selectedPara = null;
+    }
+  }
+
+  postMessage({
+    type: "historyApplied", kind, page, ok: true, code, live, blocks, selection,
+    dirty, focus,
+    // Present only on the live path — the shell re-seeds its sink from these.
+    ...(liveState || {}),
+  });
+  // S14/S15 (dirty flag + button state) are the SDK's half.
+  postHistory(true);
 }
 
 // ---- paragraph selection (select-then-act) ---------------------------------
@@ -460,47 +609,122 @@ function clearSelection() {
   postMessage({ type: "paraDeselected" });
 }
 
-// Delete a whole paragraph, atomically. Open a session on it, clear its text
-// (the core's deactivate-on-empty path drops the backing objects), repaint the
-// vacated strip, and commit — all in ONE call, with no editOpened/editClosed
-// traffic, so a delete is a single silent action: no caret flash, no keyboard,
-// no half-erased frame. |xPt,yPt| is the point the selection was made at; the
-// paragraph is re-resolved from a FRESH grouping (which also satisfies the
-// core's fresh-open gate), so a stale index can never delete the wrong text.
+// Delete a whole BLOCK, atomically — one silent action with no
+// editOpened/editClosed traffic: no caret flash, no keyboard, no half-erased
+// frame. |xPt,yPt| is the point the selection was made at; the block is
+// re-resolved from a FRESH grouping (which also satisfies the core's fresh-open
+// gate), so a stale index can never delete the wrong text.
+//
+// The open-code that used to live here (begin_block -> set_text("") -> commit)
+// is now pdfe_delete_block in the core. That is deliberate, not tidying: the
+// core records the payload that makes the deletion UNDOABLE while the objects
+// are still readable, and a shell driving the ladder itself would skip it. Same
+// reasoning as pdfe_move_block owning the identity pin.
 function deleteParagraphAt(page, xPt, yPt) {
   if (editor) commitEditor();
   ensureCoreGroup(page);   // the fresh-open gate; also refreshes stale bounds
   const hit = hitParagraph(page, xPt, yPt);
   if (!hit) { postMessage({ type: "paraDeleted", page, ok: false }); return; }
-  // ANDROID PARITY: Delete removes the selected BOX — the whole block.
-  const ed = F.editBeginBlock(doc, acquirePage(page), textPageOf(page),
-                              hit.blockIndex, -1);
-  if (!ed) { postMessage({ type: "paraDeleted", page, ok: false }); return; }
-  editor = ed;
-  editPage = page;
-  editParaBounds = hit.blockBounds;
+
   const dPtr = mod._malloc(16);
-  withU16("", (tPtr) => F.editSetText(editor, tPtr, 0, 0, dPtr));
+  const tpp = mod._malloc(4);
+  const ok = F.deleteBlock(doc, acquirePage(page), textPageOf(page),
+                           hit.blockIndex, dPtr, tpp);
   const d = readF32(dPtr, 4);
+  const tp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
   mod._free(dPtr);
-  syncEditTextPage();
-  dirtyPages.add(page);
+  mod._free(tpp);
+  if (tp) textPages.set(page, tp);
+  if (!ok) { postMessage({ type: "paraDeleted", page, ok: false }); return; }
+
   noteMutation(page);
-  // Repaint the union of the engine's dirty rect and the paragraph's own box:
-  // whatever the engine reports, the whole vacated area has to be redrawn.
+  dirtyPages.delete(page);   // pdfe_delete_block commits, so the page is flushed
+  // The core's rect already unions the run and the block box, but keep the
+  // shell's own widening: the box is drawn from grouping bounds, which can be a
+  // little wider than the ink, and a few unrepainted pixels read as a ghost.
   const strip = (d[2] > d[0] && d[3] > d[1])
     ? [Math.min(d[0], hit.blockBounds[0]), Math.min(d[1], hit.blockBounds[1]),
        Math.max(d[2], hit.blockBounds[2]), Math.max(d[3], hit.blockBounds[3])]
     : hit.blockBounds;
   renderDirtyStrip(page, strip);
-  const tpp = mod._malloc(4);
-  const ok = F.editCommit(editor, tpp);
-  const tp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
-  mod._free(tpp);
-  if (tp) textPages.set(page, tp);
-  if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
-  editor = 0; editPage = -1; editParaBounds = null;
-  postMessage({ type: "paraDeleted", page, ok: ok === 1 });
+  postMessage({ type: "paraDeleted", page, ok: true });
+  postHistory();
+}
+
+// ---- block move (drag a text box to a new position) -------------------------
+// EXPERIMENTAL, web only (branch feature/web-block-move).
+//
+// The block's TEXT objects are translated by (dx, dy) page points — a pure
+// matrix translation, so glyphs, fonts, colour and rotation are untouched. By
+// design this moves TEXT ONLY: underlines, rule lines, vector bullets, cell
+// borders and background fills are path objects, the grouper never reports
+// them, and they stay where they are.
+//
+// The core call is pdfe_move_block, not pdfe_translate_objects, because it also
+// PINS THE BLOCK'S IDENTITY — without that a dropped box merges with whatever
+// it lands near, and a box must keep its identity (user directive 2026-08-03).
+// Gathering the block's objects here and translating them directly would move
+// the same pixels and silently lose that guarantee, so the shell deliberately
+// does not know how to do it.
+
+// Move the block under (xPt, yPt) by (dx, dy) page points. |xPt,yPt| is the
+// point the drag STARTED from — the block is re-resolved from a FRESH grouping
+// (the same stale-index guard deleteParagraphAt uses), never from an index the
+// shell has been holding.
+//
+// A move changes the page's geometry, so paragraph indices shift even though
+// the BOXES are now stable across it. The selection is therefore re-established
+// by hit-testing the DROP point against the new grouping, never by reusing the
+// old index.
+function moveBlockAt(page, xPt, yPt, dx, dy) {
+  if (editor) commitEditor();
+  ensureCoreGroup(page);
+  const hit = hitParagraph(page, xPt, yPt);
+  if (!hit) { postMessage({ type: "blockMoved", page, ok: false }); return; }
+
+  const dp = mod._malloc(16);
+  const moved = F.moveBlock(doc, acquirePage(page), hit.blockIndex, dx, dy, dp);
+  const d = readF32(dp, 4);
+  mod._free(dp);
+  if (moved <= 0) { postMessage({ type: "blockMoved", page, ok: false }); return; }
+
+  dirtyPages.add(page);
+  noteMutation(page);
+  // The core's dirty rect is the union of the before and after object bounds,
+  // so it already covers the vacated strip. Union the block's own box anyway:
+  // the box is drawn from grouping bounds, which can be slightly wider than the
+  // ink the objects report, and a few unrepainted pixels read as a ghost.
+  const bb = hit.blockBounds;
+  const strip = (d[2] > d[0] && d[3] > d[1])
+    ? [Math.min(d[0], bb[0], bb[0] + dx), Math.min(d[1], bb[1], bb[1] + dy),
+       Math.max(d[2], bb[2], bb[2] + dx), Math.max(d[3], bb[3], bb[3] + dy)]
+    : [Math.min(bb[0], bb[0] + dx), Math.min(bb[1], bb[1] + dy),
+       Math.max(bb[2], bb[2] + dx), Math.max(bb[3], bb[3] + dy)];
+  renderDirtyStrip(page, strip);
+
+  // Re-group and re-select at the DROP point, so the box the user just dragged
+  // stays selected and can be nudged again without re-tapping.
+  const blocks = groupPage(page);   // also restores the fresh-open gate
+  const reHit = hitParagraph(page, xPt + dx, yPt + dy);
+  if (reHit) {
+    selectedPara = { page, index: reHit.index, bounds: reHit.blockBounds,
+                     xPt: xPt + dx, yPt: yPt + dy };
+  } else {
+    selectedPara = null;
+  }
+  postMessage({
+    type: "blockMoved",
+    page,
+    ok: true,
+    moved,
+    blocks,                                   // the fresh boxes, so no extra round trip
+    selection: selectedPara
+      ? { index: reHit.index, bounds: reHit.blockBounds,
+          blockIndex: reHit.blockIndex, blockBounds: reHit.blockBounds,
+          xPt: xPt + dx, yPt: yPt + dy }
+      : null,
+  });
+  postHistory();
 }
 
 // Open the core editor on the paragraph at page point (xPt, yPt). |lineMode|:
@@ -704,6 +928,12 @@ async function saveDocument(forceInHeap) {
     postMessage({ type: "error", detail: "save failed" });
     return;
   }
+  // HISTORY IS CLEARED ON SAVE (user decision 2026-08-03). The core does not do
+  // it inside pdfe_save — that function's semantics are frozen, and it is also
+  // the export path — so every shell must call this here. The parity gate's
+  // required-command list is what keeps a shell from forgetting.
+  F.historyClear(doc);
+  postHistory(true);
   // A Blob/File clones as a reference — delivery (object-URL download /
   // showSaveFilePicker) is the main thread's job (§6).
   postMessage({
@@ -808,6 +1038,10 @@ function drainLatch() {
         blitMs: Math.round(blitMs * 100) / 100,
         postedAt: edit.postedAt,
       });
+      // The core recorded this pass as an undo step (or skipped it, if the
+      // buffer was unchanged — an ArrowLeft/Right re-post does that). Deduped,
+      // so a typing burst produces at most one history event.
+      postHistory();
     } else {
       // No open session: keep the echo so the pipe stays observable.
       postMessage({
@@ -990,6 +1224,10 @@ onmessage = async (e) => {
       io: { ...ioStat },
       heapMB: Math.round((mod.HEAPU8.length / (1024 * 1024)) * 10) / 10,
     });
+    // A new document is a new (empty) history. Forced, because the previous
+    // document may have left the shell's buttons enabled.
+    lastHistory = "";
+    postHistory(true);
     return;
   }
 
@@ -1112,6 +1350,62 @@ onmessage = async (e) => {
 
   if (msg.type === "deselect") {
     clearSelection();
+    return;
+  }
+
+  // Undo/redo take NO arguments: the core knows which page each step belongs
+  // to, and a shell that passed one could pass a stale one.
+  if (msg.type === "undo") { applyHistory("undo"); return; }
+  if (msg.type === "redo") { applyHistory("redo"); return; }
+  if (msg.type === "history") { postHistory(true); return; }
+
+  // DIAGNOSTIC: the whole journal, for a host debug panel. Read straight from
+  // the core (pdfe_history_describe) — never a mirror kept here, because a
+  // mirror shows what THIS FILE believes was recorded, which is exactly the
+  // wrong answer when the two disagree. Pull-only: nothing computes it per
+  // keystroke, so a closed panel costs nothing.
+  if (msg.type === "historyDump") {
+    if (!doc) { postMessage({ type: "historyDump", dump: null }); return; }
+    // Two-call sizing: ask for the length, then read it (the JSON grows with
+    // the stacks, so no fixed buffer can be right).
+    const need = F.historyDescribe(doc, 0, 0);
+    let dump = null;
+    if (need > 0) {
+      const buf = mod._malloc(need + 1);
+      F.historyDescribe(doc, buf, need + 1);
+      const json = new TextDecoder().decode(new Uint8Array(mod.HEAPU8.buffer, buf, need));
+      mod._free(buf);
+      try { dump = JSON.parse(json); } catch (e) { dump = { parseError: String(e) }; }
+    }
+    postMessage({ type: "historyDump", dump });
+    return;
+  }
+
+  // How far the selected box may be dragged and still land on the page, so the
+  // SDK's ghost stops where the drop will. Asked once when a drag is promoted —
+  // it is a pure function of the box and the page, so it cannot change mid-drag,
+  // and the core clamps the real move regardless of what the preview showed.
+  if (msg.type === "moveLimits") {
+    if (!doc || !selectedPara) { postMessage({ type: "moveLimits", limits: null }); return; }
+    const page = selectedPara.page;
+    ensureCoreGroup(page);
+    const hit = hitParagraph(page, selectedPara.xPt, selectedPara.yPt);
+    if (!hit) { postMessage({ type: "moveLimits", limits: null }); return; }
+    const lp = mod._malloc(16);
+    const ok = F.blockMoveLimits(doc, acquirePage(page), hit.blockIndex, lp);
+    const limits = ok ? readF32(lp, 4) : null;
+    mod._free(lp);
+    postMessage({ type: "moveLimits", limits });
+    return;
+  }
+
+  // EXPERIMENTAL (feature/web-block-move): drag the selected box to a new spot.
+  // Driven off the SELECTION, like Edit and Delete, so the worker stays the only
+  // thing that decides which block an action applies to.
+  if (msg.type === "moveSelected") {
+    if (!doc || !selectedPara) return;
+    const { page, xPt, yPt } = selectedPara;
+    moveBlockAt(page, xPt, yPt, Number(msg.dx) || 0, Number(msg.dy) || 0);
     return;
   }
 

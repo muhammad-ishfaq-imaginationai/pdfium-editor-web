@@ -81,6 +81,19 @@ const PDFE_CSS = `
 .pdfe-parabox { position: absolute; border: 1px dashed #757575cc; background: #7575751f;
                 pointer-events: none; border-radius: 1px; }
 .pdfe-parabox.pdfe-selected { border-style: solid; border-color: #03a9f4; background: #03a9f426; }
+/* EXPERIMENTAL (feature/web-block-move): the drag ghost. A box being dragged is
+   previewed as an outline that follows the finger; the real text is translated
+   ONCE on drop, so a drag costs no engine work per frame. Dashed and washed so
+   it reads as "not there yet", and above the faint boxes it slides over. */
+.pdfe-moveghost { position: absolute; border: 2px dashed #03a9f4; background: #03a9f41f;
+                  pointer-events: none; border-radius: 2px; z-index: 3; display: none; }
+/* NOTE: the box overlay deliberately stays pointer-events: none. Making the
+   selected box interactive so it could carry a move cursor would steal the
+   pointerdown from the canvas and break "tap the selected box again to edit" —
+   so the drag is hit-tested in the canvas handler against the selection's
+   bounds instead, and there is no hover cursor affordance yet.
+   (Never write a backtick in this block: PDFE_CSS is a template literal, and a
+   stray one ends the string — it broke the whole SDK once, 2026-08-03.) */
 /* The run OPEN for editing: a solid BLUE box (user request 2026-07-29) so "you
    are typing in here" is visible. Border only — a wash would tint the glyphs
    being edited and fight the selection highlight. It is its own element (not a
@@ -189,8 +202,18 @@ export class PdfeEditor {
     this.maxZoom = opts.maxZoom ?? 3;
     this.initialZoom = opts.initialZoom ?? 0.5;
     this.longPressMs = opts.longPressMs ?? 600;
+    // "auto" (default) binds Ctrl/Cmd+Z and Ctrl+Y / Ctrl+Shift+Z whenever the
+    // editor was the last surface the user touched; "container" is the same but
+    // stricter; "none" leaves the keyboard entirely to the host.
+    this.undoShortcuts = opts.undoShortcuts ?? "auto";
     this._simulateNoOpfs = !!opts.simulateNoOpfs;
     this._backgroundColor = opts.backgroundColor || PDFE_DEFAULT_BG;
+    // BLOCK MOVE (dragging a box to a new position) is EXPERIMENTAL and therefore
+    // OFF unless a host opts in — user decision 2026-08-04, shipping it in 1.7.3.
+    // Off means the gesture is not armed AND moveSelection() is a no-op, so a
+    // product that hits trouble with it can be switched back to the previous
+    // behaviour with one flag and no redeploy of this SDK (docs/BLOCK_MOVE.md).
+    this._blockMove = !!opts.blockMove;
 
     // ---- document/view state --------------------------------------------------
     this._pages = [];            // [{w,h}] PDF points
@@ -225,6 +248,10 @@ export class PdfeEditor {
     this._pageGroups = new Map();
     this._groupsPending = new Set();
     this._selected = null;            // {page, index, bounds} — the WORKER decides this
+    // Mirror of the ENGINE's history state. Never computed here: canUndo is
+    // whatever the core says, so a stale local flag can never grey the wrong
+    // button (docs/UNDO_REDO.md §1 S1).
+    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
     this._lastCaretGeom = null;
     this._lastEditBounds = null;      // [l,b,r,t] live bounds of the open run
     this._lastSelection = [];
@@ -322,6 +349,7 @@ export class PdfeEditor {
     this._dirty = false;
     this._painted = new Set();
     this._selected = null;
+    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
     this._closeEditUiState();
     const p = this._promiseFor("open");
     this._post({ type: "open", blob, tier: opts.tier || 0, blockKB: opts.blockKB || 0,
@@ -412,11 +440,72 @@ export class PdfeEditor {
   /**
    * Delete the selected paragraph: its text is removed from the PDF's real text
    * layer and the page repaints in place — no dialog, no confirmation (the host
-   * owns undo/confirm policy, as it owns save).
+   * owns confirm policy, as it owns save). It IS undoable — see `undo()`.
    */
   deleteSelection() { if (this._selected) this._post({ type: "deleteSelected" }); }
   /** Drop the selection (the tap-on-empty-space gesture). */
   clearSelection() { if (this._selected) this._post({ type: "deselect" }); }
+  /**
+   * Move the selected box by (dx, dy) PDF points — the programmatic sibling of
+   * the drag gesture, for a host that wants nudge buttons or arrow keys.
+   */
+  moveSelection(dx, dy) {
+    if (!this._blockMove) return;          // experimental, off unless opted in
+    if (this._selected) this._post({ type: "moveSelected", dx, dy });
+  }
+
+  /** Is box dragging enabled? EXPERIMENTAL, off unless the host opted in. */
+  get blockMove() { return this._blockMove; }
+
+  /**
+   * Turn box dragging on or off at runtime — the kill switch for an
+   * EXPERIMENTAL feature (`blockMove` in the constructor sets the initial value,
+   * and the default is OFF). Turning it off disarms the gesture and makes
+   * `moveSelection()` a no-op; it does not undo a move already applied.
+   */
+  setBlockMove(on) {
+    this._blockMove = !!on;
+    if (!this._blockMove) this._hideMoveGhost();   // a drag in flight stops here
+    return this._blockMove;
+  }
+
+  // ---- undo / redo --------------------------------------------------------
+  // The history lives in the ENGINE, not here (docs/UNDO_REDO.md): every
+  // mutating core call records its own inverse, so nothing the SDK does can
+  // leave a step unrecorded. This surface is just the two verbs plus the state
+  // a host greys its buttons on.
+
+  /** Undo the last change (typing, a box drag, a delete). No-op when empty. */
+  undo() { this._post({ type: "undo" }); }
+  /** Redo the last undone change. No-op when empty. */
+  redo() { this._post({ type: "redo" }); }
+  /** True when there is something to undo — drives an Undo button's enabled state. */
+  get canUndo() { return this._history.canUndo; }
+  /** True when there is something to redo. */
+  get canRedo() { return this._history.canRedo; }
+  /** 0-based page the next undo would affect, or -1. Lets a host label the button. */
+  get undoPage() { return this._history.undoPage; }
+  /** 0-based page the next redo would affect, or -1. */
+  get redoPage() { return this._history.redoPage; }
+
+  /**
+   * DIAGNOSTIC: the engine's whole journal, for a debug panel or a bug report.
+   * Resolves to the object `pdfe_history_describe` produced (null with no
+   * document): `{undo:[…], redo:[…], undoCount, redoCount, bytes, maxEntries,
+   * maxBytes, previewChars, suspended, liveAnchor, stagedDelete}`, each stack
+   * OLDEST FIRST so the last element is the step the next undo will apply.
+   *
+   * It comes from the CORE, not from anything this file remembers — a
+   * shell-side mirror would show what the SDK believes was recorded, which is
+   * useless precisely when the belief is wrong. **The shape is diagnostic and
+   * may gain fields at any time: display it, never branch on it.**
+   */
+  async historyDump() {
+    await this._readyPromise;
+    const p = this._promiseFor("historyDump");
+    this._post({ type: "historyDump" });
+    return p;
+  }
 
   setZoom(z) {
     const next = Math.min(this.maxZoom, Math.max(this.minZoom, z));
@@ -507,6 +596,71 @@ export class PdfeEditor {
     else if (x + margin > sLeft + viewW) this.scroller.scrollLeft = x + margin - viewW;
   }
 
+  // ---- undo/redo keyboard --------------------------------------------------
+  //
+  // TWO listeners, one handler, because the sink only holds focus while a run is
+  // open — and Ctrl+Z must also work with nothing selected, to undo a delete or
+  // a box drag.
+  //
+  // The preventDefault() below is LOAD-BEARING, not tidiness. Without it the
+  // textarea's OWN native undo fires, reverts the sink's value, and that fires
+  // `input` — which posts a full-buffer edit to the core. The user's undo would
+  // silently become an edit. That is corruption, not a cosmetic bug.
+  //
+  /** @returns true when the key was consumed. */
+  _handleHistoryKey(e) {
+    if (this._composing || e.isComposing || e.keyCode === 229) return false;
+    if (!(e.ctrlKey || e.metaKey) || e.altKey) return false;
+    const k = (e.key || "").toLowerCase();
+    // Cmd+Y is a browser binding on macOS; only bind Ctrl+Y.
+    const isRedo = (k === "y" && !e.metaKey) || (k === "z" && e.shiftKey);
+    const isUndo = k === "z" && !e.shiftKey;
+    if (!isUndo && !isRedo) return false;
+    e.preventDefault();
+    e.stopPropagation();
+    if (isRedo) this.redo(); else this.undo();
+    return true;
+  }
+
+  _wireHistoryKeys() {
+    if (this.undoShortcuts === "none") return;
+    // Which surface the user last touched. Without this the SDK would steal
+    // Ctrl+Z from a host that has its own binding elsewhere on the page.
+    this._ownsKeyboard = false;
+    this._listen(this._doc, "pointerdown", (e) => {
+      this._ownsKeyboard = this.container.contains(e.target);
+    }, true);
+    this._listen(this._doc, "keydown", (e) => {
+      if (e.defaultPrevented) return;                  // the sink listener got it
+      if (this.undoShortcuts === "container" && !this._ownsKeyboard) return;
+      if (!this._ownsKeyboard) return;
+      // Never steal from a real input the host owns outside our container.
+      const t = e.target;
+      if (t && t !== this.sink && !this.container.contains(t) &&
+          (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
+      this._handleHistoryKey(e);
+    });
+  }
+
+  /**
+   * Bring a page rect into view ONLY if it is currently off-screen. Used after
+   * an undo: an undo you cannot see reads as a no-op and users hammer the
+   * button, but scrolling on every undo of a keystroke is jarring — so scroll
+   * only when there is actually nothing to see. |rect| is [l,b,r,t] page points.
+   */
+  _scrollRectIntoViewIfOffscreen(page, rect, margin = 48) {
+    if (!rect || !(rect[2] > rect[0] && rect[3] > rect[1]) || this._pinchActive) return;
+    const topLeft = this._pageToCss(rect[0], rect[3], page);
+    const botRight = this._pageToCss(rect[2], rect[1], page);
+    if (!topLeft || !botRight) return;
+    const y0 = this._stripTop + topLeft.y, y1 = this._stripTop + botRight.y;
+    const viewH = this.scroller.clientHeight;
+    const sTop = this.scroller.scrollTop;
+    const visible = y1 > sTop && y0 < sTop + viewH;
+    if (visible) return;
+    this.scroller.scrollTop = Math.max(0, y0 - margin);
+  }
+
   /** Latency telemetry for the parity/latency gates (docs/PARITY_TESTING.md). */
   latencyP95() { return percentile(this.latencySamples, 95); }
 
@@ -593,6 +747,7 @@ export class PdfeEditor {
     this.selEl = mk("div", "pdfe-layer pdfe-sel");
     this.caretEl = mk("div", "pdfe-caret");
     this.editBoxEl = mk("div", "pdfe-editbox");
+    this.moveGhostEl = mk("div", "pdfe-moveghost");   // block-drag preview
     this.handleEls = [mk("div", "pdfe-handle"), mk("div", "pdfe-handle")];
     this.caretHandleEl = mk("div", "pdfe-carethandle");
     this.actionsEl = mk("div", "pdfe-actions");
@@ -609,8 +764,8 @@ export class PdfeEditor {
       spellcheck: "false", "aria-hidden": "true", tabindex: "-1",
     })) this.sink.setAttribute(k, v);
 
-    this.strip.append(this.boxesEl, this.editBoxEl, this.selEl, this.caretEl,
-      ...this.handleEls, this.caretHandleEl, this.actionsEl, this.sink);
+    this.strip.append(this.boxesEl, this.editBoxEl, this.moveGhostEl, this.selEl,
+      this.caretEl, ...this.handleEls, this.caretHandleEl, this.actionsEl, this.sink);
     this.root.appendChild(this.strip);
     this.container.appendChild(this.root);
 
@@ -619,6 +774,7 @@ export class PdfeEditor {
     this._wireCaretHandle();
     this._wireActions();
     this._wireViewportGestures();
+    this._wireHistoryKeys();
 
     // Live page number. Safe to do synchronously: the browser already coalesces
     // scroll events to one per frame per element, and the work reads only CACHED
@@ -737,6 +893,100 @@ export class PdfeEditor {
         this._requestGroups(msg.page);
         if (msg.ok) this._setDirty(true);
         this._emit("deleted", { page: msg.page, ok: !!msg.ok });
+        break;
+      }
+      case "history":
+        this._history = {
+          canUndo: !!msg.canUndo, canRedo: !!msg.canRedo,
+          undoPage: msg.undoPage ?? -1, redoPage: msg.redoPage ?? -1,
+        };
+        this._emit("history", { ...this._history });
+        break;
+      case "historyDump":
+        // Diagnostic pull (historyDump()); resolves whatever the core said.
+        this._settle("historyDump", true, msg.dump ?? null);
+        break;
+      case "historyApplied": {
+        if (!msg.ok) {
+          this._emit("error", new PdfeError(
+            msg.error || "history-unavailable",
+            msg.code === -3
+              ? "That change can no longer be undone — the text it belongs to has moved on."
+              : "Undo failed."));
+          this._emit(msg.kind, { page: msg.page, ok: false, live: false });
+          break;
+        }
+        // The worker already applied it and repainted the strip; the main
+        // thread's half is the overlays, the selection and the flags
+        // (docs/UNDO_REDO.md §1 S8/S12/S14).
+        if (msg.blocks) {
+          this._pageGroups.set(msg.page, msg.blocks);
+          this._groupsPending.delete(msg.page);
+        }
+        if (msg.live) {
+          // Applied INTO the open run: re-seed the sink from the ENGINE. A
+          // programmatic `.value =` fires no `input`, so this cannot echo back
+          // as a keystroke — the same no-echo path editOpened uses.
+          this._editingChars = msg.text.length;
+          this.sink.value = msg.text;
+          const ci = Math.max(0, Math.min(msg.caretIndex ?? msg.text.length, msg.text.length));
+          this.sink.setSelectionRange(ci, ci);
+          this.sink.focus({ preventScroll: true });
+          if (msg.runBounds) this._drawEditBox(msg.runBounds);
+          if (msg.caret) this._drawCaret(msg.caret);
+          this._drawSelection([]);
+          this._drawHandles(null, null);
+          this.scrollCaretIntoView();
+        } else {
+          // The run was reopened and committed inside the core, so any session
+          // the shell thought it had on that page is gone.
+          if (this._editingPage === msg.page) this._closeEditUiState();
+          this._selected = msg.selection
+            ? { page: msg.page, index: msg.selection.index,
+                bounds: msg.selection.bounds,
+                blockIndex: msg.selection.blockIndex ?? -1 }
+            : null;
+          // Bring the change into view if it happened off-screen — but only
+          // then: jumping the page on every undo of a keystroke is jarring.
+          this._scrollRectIntoViewIfOffscreen(msg.page, msg.focus || msg.dirty);
+        }
+        this._renderBoxes();
+        if (!msg.blocks) this._requestGroups(msg.page);
+        this._setDirty(true);
+        this._emit(msg.kind, { page: msg.page, ok: true, live: !!msg.live });
+        break;
+      }
+      case "moveLimits":
+        // The clamp range for the drag in flight. A null answer (no selection, or
+        // the block could not be re-found) simply leaves the ghost unclamped.
+        this._moveLimits = Array.isArray(msg.limits) && msg.limits.length === 4
+          ? msg.limits : null;
+        break;
+      case "blockMoved": {
+        // EXPERIMENTAL (feature/web-block-move). The worker already translated
+        // the objects and repainted the strip covering BOTH the vacated area and
+        // the destination, and it sends the fresh boxes with the result — a move
+        // re-partitions the grouping (it is purely geometric), so the old block
+        // indices are meaningless and must be replaced wholesale.
+        this._hideMoveGhost();
+        if (msg.blocks) {
+          this._pageGroups.set(msg.page, msg.blocks);
+          this._groupsPending.delete(msg.page);
+        } else {
+          this._pageGroups.delete(msg.page);
+          this._groupsPending.delete(msg.page);
+        }
+        // The worker re-selected the block at the DROP point (by position, never
+        // by index), so it stays selected and can be nudged again.
+        this._selected = msg.selection
+          ? { page: msg.page, index: msg.selection.index,
+              bounds: msg.selection.bounds,
+              blockIndex: msg.selection.blockIndex ?? -1 }
+          : null;
+        this._renderBoxes();
+        if (!msg.blocks) this._requestGroups(msg.page);
+        if (msg.ok) this._setDirty(true);
+        this._emit("moved", { page: msg.page, ok: !!msg.ok });
         break;
       }
       case "editOpened": {
@@ -1172,6 +1422,43 @@ export class PdfeEditor {
     }
   }
 
+  // ---- block move preview (EXPERIMENTAL, feature/web-block-move) -----------
+
+  /** Is page point |pt| inside PDF-point bounds [l, b, r, t]? */
+  _inBounds(b, pt) {
+    return !!b && pt.xPt >= b[0] && pt.xPt <= b[2] && pt.yPt >= b[1] && pt.yPt <= b[3];
+  }
+
+  /** Draw the drag outline at |bounds| shifted by (dx, dy) PDF points. Only the
+   *  ghost moves during a drag — the text is translated once, on drop. */
+  _showMoveGhost(page, bounds, dx, dy) {
+    const rect = this._pageRect(page);
+    if (!rect) return;
+    const scaleCss = this._fitScale * this._zoom;
+    // Clamp to what the DROP will actually do. The core keeps a moved box on the
+    // page, so an unclamped ghost would promise a position the move then refuses —
+    // the outline has to tell the truth. |_moveLimits| arrives async from the
+    // engine; until it does the ghost is unclamped, and the drop clamps anyway.
+    const lim = this._moveLimits;
+    if (lim) {
+      dx = Math.min(Math.max(dx, lim[0]), lim[2]);
+      dy = Math.min(Math.max(dy, lim[1]), lim[3]);
+    }
+    this._ghostDelta = [dx, dy];
+    const el = this.moveGhostEl;
+    el.style.display = "block";
+    el.style.left = `${rect.left + (bounds[0] + dx) * scaleCss}px`;
+    el.style.top = `${rect.top + (this._pages[page].h - (bounds[3] + dy)) * scaleCss}px`;
+    el.style.width = `${(bounds[2] - bounds[0]) * scaleCss}px`;
+    el.style.height = `${(bounds[3] - bounds[1]) * scaleCss}px`;
+  }
+
+  _hideMoveGhost() {
+    this.moveGhostEl.style.display = "none";
+    this._moveLimits = null;
+    this._ghostDelta = null;
+  }
+
   /** Park the Edit/Delete bar just above the selected box (below it when the
    *  box is at the page top), clamped to the page's own width. */
   _placeActions(page, b, scaleCss) {
@@ -1212,14 +1499,17 @@ export class PdfeEditor {
   // Reads the CACHED page rect, never canvas.offset* — this runs per keystroke
   // (caret + edit box + selection), and a layout read here after the style
   // writes below re-laid-out the whole strip (expensive at 7000 pages).
-  _pageToCss(xPt, yPt) {
-    if (this._editingPage < 0 || !this._pageCanvases[this._editingPage]) return null;
-    const rect = this._pageRect(this._editingPage);
+  // |page| defaults to the run being edited (every caret/selection overlay
+  // wants that); undo passes an explicit page, because the change it is
+  // scrolling to need not be the one under the caret.
+  _pageToCss(xPt, yPt, page = this._editingPage) {
+    if (page < 0 || !this._pageCanvases[page] || !this._pages[page]) return null;
+    const rect = this._pageRect(page);
     if (!rect) return null;
     const scaleCss = this._fitScale * this._zoom;
     return {
       x: rect.left + xPt * scaleCss,
-      y: rect.top + (this._pages[this._editingPage].h - yPt) * scaleCss,
+      y: rect.top + (this._pages[page].h - yPt) * scaleCss,
     };
   }
 
@@ -1408,10 +1698,24 @@ export class PdfeEditor {
           yPt: this._pages[page].h - (cy - rect.top) / scaleCss,
         };
       };
+      // EXPERIMENTAL (feature/web-block-move): a drag that STARTS inside the
+      // already-selected box moves it. Decided here, on DOWN, because it
+      // changes what the subsequent moves mean — a pan, a text drag-select, or
+      // a box move. Gated on there being no open run on this page: inside an
+      // open run a drag is still a text selection.
+      const down = toPt(startX, startY);
+      // `_blockMove` first: the feature is EXPERIMENTAL and off by default, and a
+      // disabled feature must not even arm the gesture — otherwise a drag would
+      // still swallow the pan it is standing in front of.
+      const movable = this._blockMove &&
+        !!this._selected && this._selected.page === page &&
+        this._editingPage !== page && this._inBounds(this._selected.bounds, down);
       let lpFired = false;
       // Long-press (< 8 px movement) selects the word under the finger, inside
-      // the OPEN run only — same as Android.
-      const lpTimer = setTimeout(() => {
+      // the OPEN run only — same as Android. A press on a movable box must not
+      // fire it: the box is not open, so there is no word to select, and the
+      // press is the start of a possible drag.
+      const lpTimer = movable ? 0 : setTimeout(() => {
         if (this._pinchActive) return;   // two held fingers are a pinch
         lpFired = true;
         const { xPt, yPt } = toPt(startX, startY);
@@ -1419,8 +1723,10 @@ export class PdfeEditor {
         this.sink.focus({ preventScroll: true });
       }, this.longPressMs);
       let dragging = false;
+      let movingBox = false;
       const cleanup = () => {
         clearTimeout(lpTimer);
+        if (movingBox) this._hideMoveGhost();
         canvas.removeEventListener("pointermove", move);
         canvas.removeEventListener("pointerup", up);
         canvas.removeEventListener("pointercancel", cleanup);
@@ -1430,9 +1736,28 @@ export class PdfeEditor {
         if (!dragging) {
           if (Math.hypot(mv.clientX - startX, mv.clientY - startY) <= 8) return;
           clearTimeout(lpTimer);   // moved: no longer a tap or long-press
-          if (this._editingPage !== page) { cleanup(); return; }  // no open run: plain pan
-          dragging = true;
-          try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+          // Past the slop on a movable box: this is a MOVE, not a pan. Nothing
+          // is translated yet — only a ghost outline follows the pointer, so a
+          // drag costs no engine work per frame.
+          if (movable) {
+            movingBox = true;
+            dragging = true;
+            // One request per drag: the clamp range cannot change while a finger
+            // is down, and the ghost is redrawn per pointermove.
+            this._moveLimits = null;
+            this._post({ type: "moveLimits" });
+            try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+          } else {
+            if (this._editingPage !== page) { cleanup(); return; }  // no open run: plain pan
+            dragging = true;
+            try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+          }
+        }
+        if (movingBox) {
+          const c = toPt(mv.clientX, mv.clientY);
+          this._showMoveGhost(page, this._selected.bounds,
+                              c.xPt - down.xPt, c.yPt - down.yPt);
+          return;
         }
         // Anchor = press point, head = current point; the core clamps both to
         // the open run (desktop mouse-drag selection).
@@ -1441,9 +1766,23 @@ export class PdfeEditor {
         this._post({ type: "dragSelect", page, ax: a.xPt, ay: a.yPt, xPt: c.xPt, yPt: c.yPt });
       };
       const up = (uv) => {
+        const wasMoving = movingBox;
+        const drop = wasMoving ? toPt(uv.clientX, uv.clientY) : null;
         cleanup();
         // A finger lifting off a pinch must not read as a tap (I17).
         if (this._pinchActive || performance.now() - this._lastPinchEnd < 350) return;
+        // Drop: translate for real, ONCE. The worker re-resolves the block from
+        // a fresh grouping, so it can never act on a stale index.
+        if (wasMoving) {
+          // Send the CLAMPED delta the ghost was showing, so the box lands exactly
+          // where the outline was. Falls back to the raw delta if no ghost frame
+          // ever ran (a drop within one frame of promotion).
+          const raw = [drop.xPt - down.xPt, drop.yPt - down.yPt];
+          const [dx, dy] = this._ghostDelta || raw;
+          this._hideMoveGhost();          // clears the limits for the next drag
+          if (dx || dy) this._post({ type: "moveSelected", dx, dy });
+          return;
+        }
         if (lpFired) return;
         if (dragging) { this.sink.focus({ preventScroll: true }); return; }
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
@@ -1623,6 +1962,9 @@ export class PdfeEditor {
     this._listen(this.sink, "compositionend", () => { this._composing = false; push(); });
     this._listen(this.sink, "input", () => { if (!this._composing) push(); });
     this._listen(this.sink, "keydown", (e) => {
+      // Undo/redo FIRST — before every other binding. See _handleHistoryKey for
+      // why its preventDefault is load-bearing.
+      if (this._handleHistoryKey(e)) return;
       // Ctrl/Cmd+A selects the whole open run. The sink's own select-all would
       // "work" invisibly — the range lands in the textarea, but nothing posts it
       // to the worker, so no highlight and no handles ever appear (and the next

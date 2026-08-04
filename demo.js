@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.2-e89453c";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.3-74860d5";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -65,11 +65,18 @@ const stamped = $("appver").textContent.trim();
 const version = params.get("v") || (stamped === "dev" ? `dev-${Date.now()}` : stamped);
 if (version !== stamped) $("appver").textContent = version;
 
+// Box dragging is EXPERIMENTAL and ships OFF (docs/BLOCK_MOVE.md). This page is the
+// tester site, so it must default to what a consumer gets — but a tester has to be
+// able to exercise the feature, hence the ⋯ menu switch (remembered per browser).
+const BLOCKMOVE_PREF = "pdfe.blockMove";
+const blockMoveOn = localStorage.getItem(BLOCKMOVE_PREF) === "1";
+
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
+  blockMove: blockMoveOn,
 });
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
@@ -246,6 +253,19 @@ moreBtn.addEventListener("click", (ev) => {
 document.addEventListener("click", (ev) => { if (!menu.contains(ev.target)) closeMenu(); });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 
+// The experimental box-drag switch. Takes effect immediately (setBlockMove is the
+// SDK's runtime kill switch), and is remembered so a tester does not re-tick it
+// after every reload.
+const bmConf = $("bmtoggleconf");
+bmConf.checked = blockMoveOn;
+bmConf.addEventListener("change", () => {
+  localStorage.setItem(BLOCKMOVE_PREF, bmConf.checked ? "1" : "0");
+  editor.setBlockMove(bmConf.checked);
+  setStatus(bmConf.checked
+    ? "box dragging ON (experimental) — drag a selected box; this cannot be undone"
+    : "box dragging off");
+});
+
 // ---- edit mode + line mode -------------------------------------------------
 const editBtn = $("editmode");
 editBtn.addEventListener("click", () => editor.toggleEditMode());
@@ -345,6 +365,193 @@ pageNum.addEventListener("input", () => pageNum.classList.remove("bad"));
 $("zin").addEventListener("click", () => editor.zoomIn());
 $("zout").addEventListener("click", () => editor.zoomOut());
 editor.on("zoom", ({ zoom }) => { $("zoomlabel").textContent = Math.round(zoom * 100) + "%"; });
+
+// ---- undo / redo -----------------------------------------------------------
+// UNDO IS OFF IN THIS BUILD. The engine's history is opt-in
+// (pdfe_history_set_enabled) and this host never opts in, so nothing is
+// recorded — see UNDO_REDO.md §6 for the text-undo work that has to land first.
+// ONE FLAG so this file stays otherwise identical to the undo branch and merges
+// back cleanly: flip it to true when the SDK enables history again.
+//
+// The SDK's Ctrl+Z interception deliberately stays wired even here. It is not
+// about undo: without it the hidden textarea's OWN native undo fires, reverts
+// the sink and emits `input`, which posts a full-buffer edit to the core — a
+// silent corruption. Suppressing that is a fix this build carries regardless.
+const UNDO_UI = false;
+
+if (UNDO_UI) {
+  // Host chrome driven entirely by the `history` event: the ENGINE owns the
+  // stack, so there is nothing to track here.
+  $("undo").addEventListener("click", () => editor.undo());
+  $("redo").addEventListener("click", () => editor.redo());
+  editor.on("history", (h) => {
+    $("historyseg").hidden = false;
+    $("undo").disabled = !h.canUndo;
+    $("redo").disabled = !h.canRedo;
+    $("undo").title = h.canUndo
+      ? `Undo (Ctrl+Z) — page ${h.undoPage + 1}` : "Nothing to undo";
+    $("redo").title = h.canRedo
+      ? `Redo (Ctrl+Y) — page ${h.redoPage + 1}` : "Nothing to redo";
+  });
+  // A one-line status note, so a tester can see undo fire even when the change
+  // is off-screen. `live` = it patched the run being typed in without closing it.
+  for (const kind of ["undo", "redo"]) {
+    editor.on(kind, ({ page, ok, live }) => {
+      setStatus(ok
+        ? `${kind === "undo" ? "Undid" : "Redid"} a change on page ${page + 1}${live ? " (while typing)" : ""}`
+        : `Nothing to ${kind}`);
+    });
+  }
+} else {
+  // Leave no dead chrome: the buttons stay hidden and the debug panel's menu row
+  // goes away, rather than offering controls that can never do anything.
+  $("historyseg").hidden = true;
+  $("dbgconfig").hidden = true;
+}
+
+// ---- history debug panel (DEV ONLY) ----------------------------------------
+// A window onto the ENGINE's journal via editor.historyDump() — which reads
+// pdfe_history_describe, so what you see is what the core will actually apply,
+// not what this page believes it recorded. That distinction is the whole point:
+// a shell-side mirror agrees with the core right up until the moment a bug makes
+// them differ.
+//
+// Off by default and remembered per browser, because web/index.html IS the
+// published tester site — a tester must never meet a debug panel by accident.
+// Pull-only: nothing is computed while the panel is closed.
+const dbgEl = $("dbg"), dbgConf = $("dbgtoggleconf");
+const DBG_PREF = "pdfe.historyPanel";
+let lastDump = null;
+
+const shortNum = (n) => (n >= 1024 * 1024
+  ? `${(n / (1024 * 1024)).toFixed(1)} MB`
+  : n >= 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`);
+
+// Text previews are already capped by the core (previewChars); this only keeps a
+// long one from dominating the row.
+const clip = (s, n = 34) => (s.length > n ? `${s.slice(0, n)}…` : s);
+// Whitespace has to be VISIBLE here: a trailing space is exactly the kind of
+// thing an undo bug turns on (S27), and it is invisible in a plain span.
+const showWs = (s) => s.replace(/\n/g, "⏎").replace(/\t/g, "⇥").replace(/ /g, "·");
+const esc = (s) => s.replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+// |cut| = the core windowed the preview (previewFrom > 0), so mark the missing
+// left side — otherwise the row reads as if the run started mid-word.
+const txt = (s, cut) => `<span class="txt">${cut ? "…" : ""}${esc(showWs(clip(s)))}</span>`;
+
+// One journal entry. |isNext| = the step the next undo/redo will apply.
+function entryRow(e, isNext) {
+  const delta = e.afterLen - e.beforeLen;
+  const deltaStr = e.kind === "text" || e.kind === "delete"
+    ? (delta === 0 ? "±0" : delta > 0 ? `+${delta}` : String(delta)) + " ch"
+    : "";
+  // The anchor is what re-finds this run after the page was re-grouped. When
+  // both identities are -1 the ONLY route left is geometry, which is the
+  // fragile shape S25/S26/S27 all came from — so it is flagged, not hidden.
+  const anchor = e.bk >= 0 ? `<span class="chip">bk ${e.bk}</span>`
+    : e.paraId >= 0 ? `<span class="chip">¶ ${e.paraId}</span>`
+    : `<span class="chip geom" title="no block/paragraph identity — this step can only be re-found by geometry">geom</span>`;
+  const extra = e.kind === "move"
+    ? `<span class="chip">Δ ${e.dx.toFixed(1)},${e.dy.toFixed(1)}</span><span class="chip">${e.objs} obj</span>`
+    : e.kind === "delete" ? `<span class="chip">${e.objs} obj</span>`
+    : e.kind === "style" ? `<span class="chip">${e.runs} run</span>` : "";
+  const cut = e.previewFrom > 0;
+  const body = e.kind === "text"
+    ? `<div class="r2"><span class="del">${txt(e.before, cut)}</span> → <span class="add">${txt(e.after, cut)}</span></div>`
+    : e.kind === "delete"
+      ? `<div class="r2"><span class="del">${txt(e.before, cut)}</span> → <em>gone</em></div>`
+      : e.beforeLen ? `<div class="r2">${txt(e.before, cut)}</div>` : "";
+  return `<div class="dbge${isNext ? " next" : ""}">
+    <div class="r1">
+      ${isNext ? '<span class="chip next">next</span>' : ""}
+      <span class="chip kind ${e.kind}">${e.kind}</span>
+      <span>p${e.page + 1}</span>${anchor}${extra}
+      <span style="margin-left:auto">${deltaStr}</span>
+    </div>
+    ${body}
+    <div class="r3">
+      <span>#${e.i}</span>
+      <span>len ${e.beforeLen}→${e.afterLen}</span>
+      <span>caret ${e.caretBefore}→${e.caretAfter}</span>
+      <span>${shortNum(e.bytes)}</span>
+    </div>
+  </div>`;
+}
+
+// NEWEST FIRST on screen (the dump is oldest-first): "what will undo do next?"
+// is the question this panel exists to answer, so that step goes on top.
+function stackHtml(list, label) {
+  if (!list.length) return `<div class="dbgsec">${label} — empty</div>`;
+  const rows = list.map((e, i) => entryRow(e, i === list.length - 1)).reverse().join("");
+  return `<div class="dbgsec">${label} — ${list.length}</div>${rows}`;
+}
+
+function renderDump(d) {
+  lastDump = d;
+  const totals = $("dbgtotals"), body = $("dbgbody");
+  if (!d) {
+    totals.textContent = "no document";
+    body.innerHTML = "";
+    return;
+  }
+  const flags = [
+    d.suspended ? '<span class="chip">suspended</span>' : "",
+    d.liveAnchor ? '<span class="chip">live session</span>' : "",
+    d.stagedDelete ? '<span class="chip">staged delete</span>' : "",
+  ].join("");
+  totals.innerHTML =
+    `<span>${d.undoCount} undo / ${d.redoCount} redo</span>` +
+    `<span>${shortNum(d.bytes)} of ${shortNum(d.maxBytes)}</span>` +
+    `<span>cap ${d.maxEntries}</span>${flags}`;
+  body.innerHTML = stackHtml(d.undo, "undo") + stackHtml(d.redo, "redo");
+}
+
+async function refreshDump() {
+  if (!UNDO_UI || !dbgConf.checked) return;   // off/closed: cost nothing
+  try { renderDump(await editor.historyDump()); }
+  catch (e) { $("dbgtotals").textContent = `dump failed: ${e.message || e}`; }
+}
+// COALESCED, because `edit` fires per keystroke and each dump is a worker round
+// trip carrying the whole journal — one per burst is all a human can read, and
+// the panel must never compete with typing for the message pipe.
+let dumpTimer = 0;
+function queueDump() {
+  if (!UNDO_UI || !dbgConf.checked || dumpTimer) return;
+  dumpTimer = setTimeout(() => { dumpTimer = 0; refreshDump(); }, 120);
+}
+window.refreshDump = refreshDump;        // verification hook
+window.historyDump = () => lastDump;     // verification hook
+
+dbgConf.checked = UNDO_UI && localStorage.getItem(DBG_PREF) === "1";
+const applyDbgPref = () => {
+  // With recording off the panel could only ever show two empty stacks, and a
+  // stale localStorage pref must not resurrect it.
+  stage.classList.toggle("dbg", UNDO_UI && dbgConf.checked);
+  if (UNDO_UI && dbgConf.checked) refreshDump();
+};
+dbgConf.addEventListener("change", () => {
+  localStorage.setItem(DBG_PREF, dbgConf.checked ? "1" : "0");
+  applyDbgPref();
+});
+applyDbgPref();
+
+$("dbgrefresh").addEventListener("click", refreshDump);
+$("dbgcopy").addEventListener("click", async () => {
+  if (!lastDump) return;
+  try {
+    await navigator.clipboard.writeText(JSON.stringify(lastDump, null, 2));
+    setStatus("history JSON copied to the clipboard");
+  } catch (e) {
+    setStatus(`copy failed: ${e.message || e}`);
+  }
+});
+
+// Every event that can change the journal refreshes it. `history` covers the
+// ordinary cases; the rest catch changes that leave canUndo/canRedo untouched
+// (a second keystroke, a save clearing the stacks) and so are deduped away.
+for (const ev of ["history", "undo", "redo", "edit", "editclose",
+                  "deleted", "moved", "opened", "saved"]) {
+  editor.on(ev, queueDump);
+}
 
 // ---- saving: warning gate, destination, delivery (docs/WEB_IO.md §6–§7) ----
 // All of this is HOST work. The SDK only reports whether saves can stream

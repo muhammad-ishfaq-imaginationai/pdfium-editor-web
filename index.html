@@ -246,6 +246,89 @@
     }
     #editor *::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
     #editor *::-webkit-scrollbar-track { background: transparent; }
+
+    /* ---- history debug panel (DEV ONLY, off by default) ------------------
+       A window onto the ENGINE's undo/redo journal (pdfe_history_describe via
+       editor.historyDump()), so an undo report can be diagnosed from the page
+       instead of a rebuild. It is behind the ⋯ menu and remembered in
+       localStorage, because this same file IS the tester site — a tester must
+       never meet it by accident. It insets the editor rather than floating over
+       it, so the document is never hidden by the thing inspecting it. */
+    #stage { --dbg-w: 300px; }
+    #stage.dbg #editor { right: var(--dbg-w); }
+    #dbg {
+      position: absolute; top: 0; right: 0; bottom: 0; width: var(--dbg-w);
+      z-index: 4; display: none; flex-direction: column;
+      background: var(--surface); border-left: 1px solid var(--line);
+      font-family: var(--mono); font-size: 11px; line-height: 1.5;
+    }
+    #stage.dbg #dbg { display: flex; }
+    #dbghead {
+      flex: none; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+      padding: 7px 9px; border-bottom: 1px solid var(--line); background: var(--surface-2);
+    }
+    #dbghead .t {
+      font-family: var(--ui); font-size: 11.5px; font-weight: 650;
+      letter-spacing: .3px; text-transform: uppercase; color: var(--text-2);
+      margin-right: auto;
+    }
+    #dbghead button {
+      font: 500 10.5px var(--ui); color: var(--text-2); cursor: pointer;
+      background: var(--surface); border: 1px solid var(--line);
+      border-radius: 6px; padding: 2px 7px;
+    }
+    #dbghead button:hover { color: var(--text); border-color: var(--line-strong); }
+    #dbgtotals {
+      flex: none; padding: 5px 9px; border-bottom: 1px solid var(--line);
+      color: var(--text-2); display: flex; gap: 6px; flex-wrap: wrap; align-items: center;
+    }
+    /* Separators between the plain totals (not the flag chips), or the line
+       reads as one run-on number. */
+    #dbgtotals > span:not(.chip):not(:last-child)::after { content: " ·"; color: var(--text-3); }
+    #dbgbody { flex: 1; min-height: 0; overflow: auto; padding: 6px 0 12px; }
+    .dbgsec {
+      position: sticky; top: 0; z-index: 1; padding: 4px 9px;
+      font-family: var(--ui); font-size: 10.5px; font-weight: 650; letter-spacing: .4px;
+      text-transform: uppercase; color: var(--text-3);
+      background: var(--surface); border-bottom: 1px solid var(--line);
+    }
+    .dbgempty { padding: 7px 9px; color: var(--text-3); font-style: italic; }
+    /* One journal entry. The left rule marks the step that the next undo/redo
+       will actually apply — the single most-asked question when debugging. */
+    .dbge {
+      padding: 6px 9px; border-bottom: 1px solid var(--line);
+      border-left: 3px solid transparent; word-break: break-word;
+    }
+    .dbge.next { border-left-color: var(--accent); background: var(--accent-soft); }
+    .dbge .r1 { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+    .dbge .r2 { color: var(--text-2); margin-top: 2px; }
+    .dbge .r3 {
+      display: flex; gap: 6px; flex-wrap: wrap; margin-top: 3px; color: var(--text-3);
+      font-size: 10.5px;
+    }
+    .chip {
+      border-radius: 999px; padding: 0 6px; font-size: 10px; font-weight: 600;
+      border: 1px solid var(--line-strong); color: var(--text-2); white-space: nowrap;
+    }
+    .chip.kind { color: #fff; border-color: transparent; background: var(--text-2); }
+    .chip.kind.text { background: var(--accent); }
+    .chip.kind.move { background: #0b7285; }
+    .chip.kind.delete { background: var(--danger); color: #fff; }
+    .chip.kind.style { background: #7048e8; }
+    /* AMBER = this step can only be re-found by GEOMETRY (no bk, no paraId).
+       That is the fragile shape behind S25/S26/S27, so it is called out. */
+    .chip.geom { background: var(--amber-bg); color: var(--amber-fg); border-color: transparent; }
+    .chip.next { background: var(--accent); color: #fff; border-color: transparent; }
+    .dbge .txt { color: var(--text); }
+    .dbge .del { color: var(--danger); }
+    .dbge .add { color: #0b7285; }
+    @media (prefers-color-scheme: dark) { .dbge .add { color: #63e6be; } }
+    /* Phones: a bottom sheet instead of a column, so the page keeps its width. */
+    @media (max-width: 720px) {
+      #stage.dbg #editor { right: 0; bottom: 45%; }
+      #dbg { top: auto; left: 0; width: auto; height: 45%; border-left: 0; border-top: 1px solid var(--line); }
+    }
+
     #drop {
       position: absolute; inset: 0; z-index: 2; display: grid; place-items: center;
       padding: 24px; background: var(--canvas); overflow: auto;
@@ -387,7 +470,7 @@
         </svg>
       </span>
       <span class="name">pdfium<span>-editor</span></span>
-      <span id="appver" title="deployed version">1.7.2-e89453c</span>
+      <span id="appver" title="deployed version">1.7.3-74860d5</span>
     </div>
 
     <div class="rule"></div>
@@ -428,6 +511,25 @@
       <span id="zoomlabel">50%</span>
       <button id="zin" title="zoom in" aria-label="zoom in">+</button>
     </span>
+
+    <!-- Undo / redo. HOST chrome, like every other button here: the SDK ships
+         no toolbar. Enabled straight from the `history` event, which reports
+         what the ENGINE knows. Deliberately NOT gated on edit mode — the change
+         being undone belongs to the document, not to the mode. -->
+    <span class="seg" id="historyseg" hidden>
+      <button id="undo" title="Undo (Ctrl+Z)" aria-label="undo" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M9 14 4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>
+        </svg>
+      </button>
+      <button id="redo" title="Redo (Ctrl+Y)" aria-label="redo" disabled>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+             stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="m15 14 5-5-5-5"/><path d="M20 9H10a6 6 0 0 0 0 12h3"/>
+        </svg>
+      </button>
+    </span>
     </div>
 
     <!-- Per-paragraph line mode (Android btnLineMode parity): visible only
@@ -465,6 +567,15 @@
         <label class="mrow" id="lmconfig" title="config: show the line-mode toggle while editing">
           <input type="checkbox" id="lmtoggleconf">
           Show paragraph mode button
+        </label>
+        <label class="mrow" id="dbgconfig" title="dev: show the engine's undo/redo journal">
+          <input type="checkbox" id="dbgtoggleconf">
+          Show undo history panel
+        </label>
+        <label class="mrow" id="bmconfig"
+               title="EXPERIMENTAL: drag a selected box to move it. Ships OFF; a move cannot be undone.">
+          <input type="checkbox" id="bmtoggleconf">
+          Box dragging (experimental)
         </label>
         <div class="mnote" id="enginenote">engine — checking…</div>
       </div>
@@ -509,6 +620,20 @@
         <p>Release the PDF here.</p>
       </div>
     </div>
+
+    <!-- The engine's undo/redo journal, straight from pdfe_history_describe.
+         DEV ONLY: hidden unless the ⋯ menu's checkbox is on (this file is also
+         the tester site). Rendered newest-first, with the step the next
+         undo/redo will apply marked — the JSON itself is oldest-first. -->
+    <aside id="dbg" aria-label="undo history (debug)">
+      <div id="dbghead">
+        <span class="t">History</span>
+        <button type="button" id="dbgcopy" title="copy the raw JSON (for a bug report)">copy</button>
+        <button type="button" id="dbgrefresh" title="re-read the journal from the engine">↻</button>
+      </div>
+      <div id="dbgtotals"></div>
+      <div id="dbgbody"></div>
+    </aside>
   </div>
 
   <footer id="statusbar">
@@ -545,6 +670,6 @@
     </div>
   </div>
 
-  <script type="module" src="demo.js?v=1.7.2-e89453c"></script>
+  <script type="module" src="demo.js?v=1.7.3-74860d5"></script>
 </body>
 </html>

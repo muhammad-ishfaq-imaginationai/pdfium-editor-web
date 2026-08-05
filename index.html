@@ -470,7 +470,7 @@
         </svg>
       </span>
       <span class="name">pdfium<span>-editor</span></span>
-      <span id="appver" title="deployed version">1.7.3-74860d5</span>
+      <span id="appver" title="deployed version">1.7.4-af9a20e</span>
     </div>
 
     <div class="rule"></div>
@@ -532,12 +532,6 @@
     </span>
     </div>
 
-    <!-- Per-paragraph line mode (Android btnLineMode parity): visible only
-         while a multi-line paragraph is open AND the config checkbox is on
-         (production stays heuristic-only). -->
-    <button class="btn" id="linemode" hidden
-            title="toggle reflow / keep-lines for this paragraph">¶ Reflow</button>
-
     <button class="btn" id="editmode" title="toggle edit mode">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
            stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -564,18 +558,14 @@
         </svg>
       </button>
       <div id="menu" role="menu">
-        <label class="mrow" id="lmconfig" title="config: show the line-mode toggle while editing">
-          <input type="checkbox" id="lmtoggleconf">
-          Show paragraph mode button
-        </label>
         <label class="mrow" id="dbgconfig" title="dev: show the engine's undo/redo journal">
           <input type="checkbox" id="dbgtoggleconf">
           Show undo history panel
         </label>
         <label class="mrow" id="bmconfig"
-               title="EXPERIMENTAL: drag a selected box to move it. Ships OFF; a move cannot be undone.">
+               title="EXPERIMENTAL: drag a selected box to move it. Ships OFF and is NOT remembered — a reload turns it back off. A move cannot be undone.">
           <input type="checkbox" id="bmtoggleconf">
-          Box dragging (experimental)
+          Box dragging (experimental, this session)
         </label>
         <div class="mnote" id="enginenote">engine — checking…</div>
       </div>
@@ -670,6 +660,6 @@
     </div>
   </div>
 
-  <script type="module" src="demo.js?v=1.7.3-74860d5"></script>
+  <script type="module" src="demo.js?v=1.7.4-af9a20e"></script>
 </body>
 </html>

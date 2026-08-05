@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.3-74860d5";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.4-af9a20e";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -65,18 +65,29 @@ const stamped = $("appver").textContent.trim();
 const version = params.get("v") || (stamped === "dev" ? `dev-${Date.now()}` : stamped);
 if (version !== stamped) $("appver").textContent = version;
 
+// ---- configuration ---------------------------------------------------------
 // Box dragging is EXPERIMENTAL and ships OFF (docs/BLOCK_MOVE.md). This page is the
-// tester site, so it must default to what a consumer gets — but a tester has to be
-// able to exercise the feature, hence the ⋯ menu switch (remembered per browser).
-const BLOCKMOVE_PREF = "pdfe.blockMove";
-const blockMoveOn = localStorage.getItem(BLOCKMOVE_PREF) === "1";
+// tester site, so it must open as what a consumer gets: FALSE.
+//
+// This used to be remembered per browser in localStorage, and that was a mistake
+// (user directive 2026-08-04: "do not keep the box moving as local pref, instead
+// keep this a configuration boolean in default as false"). Hidden per-browser state
+// makes the page behave differently in two browsers with the same URL and the same
+// build — which is exactly how it was hit: dragging worked in one browser and looked
+// broken in Chrome, and nothing on screen explained why.
+//
+// So the default is this constant, and it is the whole truth at load time. The ⋯ menu
+// switch is still there for a tester, but it only toggles the LIVE session through
+// the SDK's runtime kill switch — it persists nothing, so every reload is a clean,
+// predictable "off".
+const BLOCK_MOVE_DEFAULT = false;
 
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
-  blockMove: blockMoveOn,
+  blockMove: BLOCK_MOVE_DEFAULT,
 });
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
@@ -253,16 +264,17 @@ moreBtn.addEventListener("click", (ev) => {
 document.addEventListener("click", (ev) => { if (!menu.contains(ev.target)) closeMenu(); });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 
-// The experimental box-drag switch. Takes effect immediately (setBlockMove is the
-// SDK's runtime kill switch), and is remembered so a tester does not re-tick it
-// after every reload.
+// The experimental box-drag switch — a LIVE-SESSION toggle only. It takes effect
+// immediately through setBlockMove (the SDK's runtime kill switch) and deliberately
+// persists NOTHING: the page always opens at BLOCK_MOVE_DEFAULT, so what a tester
+// sees on load is what a consumer gets. Reloading is the way back to off.
 const bmConf = $("bmtoggleconf");
-bmConf.checked = blockMoveOn;
+bmConf.checked = BLOCK_MOVE_DEFAULT;
 bmConf.addEventListener("change", () => {
-  localStorage.setItem(BLOCKMOVE_PREF, bmConf.checked ? "1" : "0");
   editor.setBlockMove(bmConf.checked);
   setStatus(bmConf.checked
-    ? "box dragging ON (experimental) — drag a selected box; this cannot be undone"
+    ? "box dragging ON for this session only (experimental) — drag a selected box; " +
+      "this cannot be undone, and a reload turns it back off"
     : "box dragging off");
 });
 
@@ -289,31 +301,21 @@ editor.on("deleted", ({ page, ok }) => {
   setHint("Edit", `Deleted a paragraph on p${page + 1} (${ok ? "ok" : "FAILED"})`);
 });
 
-const lineModeBtn = $("linemode");
-const lmConf = $("lmtoggleconf");
-const LM_PREF = "pdfe.lineModeToggle";
-lmConf.checked = localStorage.getItem(LM_PREF) === "1";
-lmConf.addEventListener("change", () => {
-  localStorage.setItem(LM_PREF, lmConf.checked ? "1" : "0");
-  updateLineModeButton();
-});
-lineModeBtn.addEventListener("click", () => editor.toggleLineMode());
-
-function updateLineModeButton() {
-  const ed = editor.editing;
-  lineModeBtn.hidden = !(lmConf.checked && ed && ed.isParagraph);
-  lineModeBtn.textContent = ed && ed.linePreserve ? "≡ Lines" : "¶ Reflow";
-}
+// The ¶/≡ line-mode toggle was REMOVED from this page 2026-08-05 (user
+// decision: "we should remove toggles if visually appearing"). Since a block
+// whose lines are all hard breaks now grows sideways instead of reflowing into
+// its own width, the mode the toggle exposed is no longer something a tester
+// needs to reach for. The SDK still HAS the control -- editor.toggleLineMode()
+// and setLineMode(), plus both bridge commands -- because consumers ship
+// against it; only this page's button is gone.
 
 editor.on("editopen", (ed) => {
-  updateLineModeButton();
   setHint("Typing",
     `Editing p${ed.page + 1} (${ed.isParagraph
-      ? (ed.linePreserve ? "paragraph ≡ lines" : "paragraph ¶ reflow")
+      ? (ed.linePreserve ? "paragraph, lines kept" : "paragraph, reflow")
       : "line"}, ${ed.chars} chars) — type; tap outside to commit`);
 });
 editor.on("editclose", ({ page, ok }) => {
-  updateLineModeButton();
   setHint("Edit", `Committed p${page + 1} (${ok ? "ok" : "REJECTED"})`);
 });
 editor.on("edit", (m) => {

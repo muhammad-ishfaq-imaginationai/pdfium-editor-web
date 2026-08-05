@@ -264,6 +264,11 @@ export class PdfeEditor {
     // whether it is drawn.
     this._lastPointerType = "mouse";
     this._draggingCaret = false;
+    // A box drag is in flight. The Edit/Delete bar is parked for its duration:
+    // the bar is positioned on the box's OLD rect, so leaving it up shows the
+    // actions detached from the ghost the user is watching. Android does the
+    // same thing (`onBoxDragStateChanged` -> GONE); this is the web/iOS half.
+    this._draggingBox = false;
     // Double-tap/double-click word select: the last tap's time, point and page.
     this._lastTapAt = 0;
     this._lastTapX = 0;
@@ -465,7 +470,14 @@ export class PdfeEditor {
    */
   setBlockMove(on) {
     this._blockMove = !!on;
-    if (!this._blockMove) this._hideMoveGhost();   // a drag in flight stops here
+    if (!this._blockMove && this._draggingBox) {
+      // A drag in flight stops here — and the bar it parked has to come back,
+      // or switching the feature off mid-gesture strands the selection with no
+      // actions until the next re-render.
+      this._draggingBox = false;
+      this._renderBoxes();
+    }
+    if (!this._blockMove) this._hideMoveGhost();
     return this._blockMove;
   }
 
@@ -1417,7 +1429,10 @@ export class PdfeEditor {
     // The selected box is drawn from the WORKER's bounds, not from the cached
     // grouping: a selection is always valid even on a page whose boxes have not
     // been fetched yet (or were just invalidated by a commit).
-    if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")) {
+    // ...but NOT its action bar while the box is being dragged: any re-render
+    // during a drag (a scroll, a zoom) would otherwise put it back on the old rect.
+    if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")
+        && !this._draggingBox) {
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
   }
@@ -1726,13 +1741,17 @@ export class PdfeEditor {
       let movingBox = false;
       const cleanup = () => {
         clearTimeout(lpTimer);
-        if (movingBox) this._hideMoveGhost();
+        if (movingBox) { this._draggingBox = false; this._hideMoveGhost(); }
         canvas.removeEventListener("pointermove", move);
         canvas.removeEventListener("pointerup", up);
-        canvas.removeEventListener("pointercancel", cleanup);
+        canvas.removeEventListener("pointercancel", abort);
       };
+      // A drag that dies without moving anything (pointercancel, a pinch taking
+      // over) has to put the bar back itself. A real DROP deliberately does not:
+      // `blockMoved` re-renders it on the NEW rect, so it never flashes on the old.
+      const abort = () => { const was = movingBox; cleanup(); if (was) this._renderBoxes(); };
       const move = (mv) => {
-        if (this._pinchActive) { cleanup(); return; }   // a pinch owns both fingers (I17)
+        if (this._pinchActive) { abort(); return; }   // a pinch owns both fingers (I17)
         if (!dragging) {
           if (Math.hypot(mv.clientX - startX, mv.clientY - startY) <= 8) return;
           clearTimeout(lpTimer);   // moved: no longer a tap or long-press
@@ -1742,6 +1761,11 @@ export class PdfeEditor {
           if (movable) {
             movingBox = true;
             dragging = true;
+            // Park the Edit/Delete bar for the drag (Android parity, see the
+            // `_draggingBox` note in the constructor). Hidden directly rather
+            // than through a re-render: this runs inside a pointermove.
+            this._draggingBox = true;
+            this.actionsEl.style.display = "none";
             // One request per drag: the clamp range cannot change while a finger
             // is down, and the ghost is redrawn per pointermove.
             this._moveLimits = null;
@@ -1781,6 +1805,7 @@ export class PdfeEditor {
           const [dx, dy] = this._ghostDelta || raw;
           this._hideMoveGhost();          // clears the limits for the next drag
           if (dx || dy) this._post({ type: "moveSelected", dx, dy });
+          else this._renderBoxes();       // nothing moved: nothing will restore the bar
           return;
         }
         if (lpFired) return;
@@ -1809,7 +1834,7 @@ export class PdfeEditor {
       };
       canvas.addEventListener("pointermove", move);
       canvas.addEventListener("pointerup", up);
-      canvas.addEventListener("pointercancel", cleanup);
+      canvas.addEventListener("pointercancel", abort);
     });
   }
 

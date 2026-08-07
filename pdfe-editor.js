@@ -440,8 +440,21 @@ export class PdfeEditor {
   get selection() {
     return this._selected ? { page: this._selected.page, index: this._selected.index } : null;
   }
-  /** Open the selected paragraph for typing (the Edit action). */
-  editSelection() { if (this._selected) this._post({ type: "openSelected" }); }
+  /**
+   * Open the selected paragraph for typing (the Edit action).
+   *
+   * THIS is the gesture that asks for a keyboard. Focus here, synchronously,
+   * because iOS raises the keyboard only inside a user gesture and the worker's
+   * "opened" reply lands long after the host's click handler has returned — so
+   * focusing on the reply would open the run with no keyboard (S39). Hosts call
+   * this from a real click; if one ever calls it programmatically the focus is
+   * harmless, it simply will not raise a keyboard.
+   */
+  editSelection() {
+    if (!this._selected) return;
+    this._post({ type: "openSelected" });
+    this._setSinkFocus(true);
+  }
   /**
    * Delete the selected paragraph: its text is removed from the PDF's real text
    * layer and the page repaints in place — no dialog, no confirmation (the host
@@ -1056,6 +1069,16 @@ export class PdfeEditor {
         if (!msg.selection || !msg.selection.length) {
           this._selRange = null;
           this._drawHandles(null, null);
+        } else {
+          // A KEYBOARD-EXTENDED selection arrives here, not through
+          // selectionChanged: Shift+arrow moves the sink's own range and we
+          // mirror it as a plain edit. So the knobs must be redrawn on this
+          // path too — otherwise the highlight grows and they stay behind at
+          // the double-tap's boundaries (QA 2026-08-07). _selRange is re-armed
+          // with it so grabbing a knob afterwards drags from the range the user
+          // can actually see.
+          this._selRange = [msg.selStart, msg.selEnd];
+          this._drawHandles(msg.h0, msg.h1);
         }
         this._editingChars = this.sink.value.length;
         this._setDirty(true);
@@ -1444,6 +1467,41 @@ export class PdfeEditor {
     return !!b && pt.xPt >= b[0] && pt.xPt <= b[2] && pt.yPt >= b[1] && pt.yPt <= b[3];
   }
 
+  /**
+   * Does this tap OPEN or CONTINUE an edit — and therefore legitimately want a
+   * keyboard?
+   *
+   * WHY THE SHELL HAS TO DECIDE THIS, duplicating a rule the worker owns: iOS
+   * raises the keyboard ONLY for a focus() that happens synchronously inside the
+   * user gesture, and the worker's routing reply arrives long after the gesture
+   * is over. So the choice must be made here, before the message is posted.
+   * Keep this in step with the worker's tap routing (`msg.type === "tap"`).
+   *
+   * Editing already: only a tap INSIDE the open run continues it (the worker
+   * moves the caret); anywhere else commits, which ends the edit.
+   * Not editing: the FIRST tap only SELECTS a paragraph — no keyboard — and the
+   * SECOND tap on that same selected paragraph is the shortcut into editing.
+   */
+  _tapWantsKeyboard(page, pt) {
+    if (this._editingPage >= 0)
+      return this._editingPage === page && this._inBounds(this._lastEditBounds, pt);
+    return !!this._selected && this._selected.page === page &&
+           this._inBounds(this._selected.bounds, pt);
+  }
+
+  /**
+   * Raise or dismiss the soft keyboard, by focusing or blurring the sink. MUST be
+   * called synchronously inside a user gesture to raise it on iOS.
+   *
+   * Blurring is the half desktop never needed: there, focus is invisible, so the
+   * SDK simply focused on every tap. On iOS "focused" and "keyboard visible" are
+   * the same thing, which made a plain select-tap pop the keyboard (S39).
+   */
+  _setSinkFocus(on) {
+    if (on) this.sink.focus({ preventScroll: true });
+    else if (document.activeElement === this.sink) this.sink.blur();
+  }
+
   /** Draw the drag outline at |bounds| shifted by (dx, dy) PDF points. Only the
    *  ghost moves during a drag — the text is translated once, on drop. */
   _showMoveGhost(page, bounds, dx, dy) {
@@ -1735,7 +1793,11 @@ export class PdfeEditor {
         lpFired = true;
         const { xPt, yPt } = toPt(startX, startY);
         this._post({ type: "selectWord", page, xPt, yPt });
-        this.sink.focus({ preventScroll: true });
+        // Only while a run is open: a long-press then means "select this word to
+        // work on it", which wants a keyboard (and brings it back if the user
+        // hid it — the S37 behaviour, now on iOS too). With nothing open there
+        // is no word to select and no reason to raise it (S39).
+        this._setSinkFocus(this._editingPage === page);
       }, this.longPressMs);
       let dragging = false;
       let movingBox = false;
@@ -1809,7 +1871,9 @@ export class PdfeEditor {
           return;
         }
         if (lpFired) return;
-        if (dragging) { this.sink.focus({ preventScroll: true }); return; }
+        // A drag that ended: keep the keyboard only if a run is actually open
+        // (a pan with nothing open must not raise one on iOS — S39).
+        if (dragging) { this._setSinkFocus(this._editingPage >= 0); return; }
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
         // Double-tap / double-click selects the word — the mouse-and-touch
         // sibling of long-press, reusing the SAME `selectWord` message so the
@@ -1829,8 +1893,12 @@ export class PdfeEditor {
         this._lastTapPage = page;
         this._post(dbl ? { type: "selectWord", page, xPt, yPt }
                        : { type: "tap", page, xPt, yPt });
-        // Focus inside the user gesture — browsers only show a keyboard then.
-        this.sink.focus({ preventScroll: true });
+        // Focus inside the user gesture — browsers only show a keyboard then —
+        // but ONLY when this tap opens or continues an edit. Focusing on every
+        // tap made a plain select-tap raise the keyboard on iOS, where focus and
+        // keyboard are the same thing (S39). A double tap is a word-select and
+        // only fires inside an open run, so it always wants one.
+        this._setSinkFocus(dbl || this._tapWantsKeyboard(page, { xPt, yPt }));
       };
       canvas.addEventListener("pointermove", move);
       canvas.addEventListener("pointerup", up);
@@ -1857,8 +1925,15 @@ export class PdfeEditor {
       // The caret thumb lives in the strip too — without this, grabbing it would
       // COMMIT the run instead of dragging the caret.
       if (ev.target.classList.contains("pdfe-carethandle")) return;
-      ev.preventDefault();                                 // keep the sink focused
+      // preventDefault so WE decide what happens to focus, not the browser (I9:
+      // an uncontrolled blur left the edit open with a silently dead keyboard).
+      ev.preventDefault();
       this._post({ type: "commit" });
+      // Tapping outside ENDS the edit, so the keyboard must go with it. On iOS
+      // that needs an explicit blur inside this gesture; on desktop it is
+      // invisible either way (S39). The buffer is already mirrored to the worker
+      // on every keystroke, so dropping focus here cannot lose text.
+      this._setSinkFocus(false);
     });
 
     const touchDist = (t) => Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);

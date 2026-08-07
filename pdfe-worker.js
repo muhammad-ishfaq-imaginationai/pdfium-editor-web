@@ -1024,14 +1024,26 @@ function drainLatch() {
       }
       syncEditTextPage();
       const blitMs = renderDirtyStrip(editPage, dirty);
-      const sel = edit.selEnd > edit.selStart
-        ? readSelectionRects(edit.selStart, edit.selEnd) : [];
+      const hasSel = edit.selEnd > edit.selStart;
+      const sel = hasSel ? readSelectionRects(edit.selStart, edit.selEnd) : [];
       postMessage({
         type: "editApplied",
         generation: edit.generation,
         page: editPage,
         caret: readCaret(-1),
         selection: sel,
+        // THE KNOBS' GEOMETRY, and it has to travel with an ordinary edit too.
+        // Shift+arrow does NOT go through selectRange/selectWord — the sink's
+        // own selection moves and the shell mirrors it as a plain "edit" — so
+        // this was the only reply that could carry the new handle positions.
+        // Without them the highlight grew while the knobs stayed where the
+        // double-tap had left them (QA 2026-08-07, web only).
+        // The range is echoed back because the shell must re-arm _selRange for a
+        // subsequent knob DRAG, which resolves against it.
+        h0: hasSel ? readCaret(edit.selStart) : null,
+        h1: hasSel ? readCaret(edit.selEnd) : null,
+        selStart: edit.selStart,
+        selEnd: edit.selEnd,
         runBounds: readRunBounds(edit.fullText.length),   // the blue editing box
 
         engineMs: Math.round(engineMs * 100) / 100,

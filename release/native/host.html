@@ -1,0 +1,75 @@
+<!doctype html>
+<!-- host.html — the page a NATIVE shell loads (iOS WKWebView today, Android
+     WebView later). It is deliberately empty of UI: the editor fills the whole
+     web view and every button lives in Swift/Kotlin, talking to the page over
+     window.PdfeNative (see pdfe-native-host.js and docs/EDITOR_SDK.md §5).
+
+     Load it from a custom scheme, never file:// — Workers and OPFS need a real
+     origin. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <!-- maximum-scale=1/user-scalable=no: kill the browser's own pinch, which only
+       stretches the rendered bitmap (blurry text — I17). The SDK reimplements
+       pinch as APP zoom and repaints sharp tiles. viewport-fit=cover +
+       safe-area insets keep the pages clear of the notch/home indicator. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <title>pdfe editor</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #f8f9fb; overflow: hidden;
+                 font-family: -apple-system, system-ui, sans-serif;
+                 overscroll-behavior: none; /* no rubber-band / pull-to-refresh */ }
+    /* The editor is the whole window, minus the on-screen keyboard's height.
+       The native side reports that height (PdfeNative.setKeyboardInset) because
+       it knows it sooner and more precisely than visualViewport does; the
+       fallback below covers hosts that don't. */
+    #editor { position: absolute; inset: 0; box-sizing: border-box;
+              padding-bottom: var(--pdfe-keyboard-inset, 0px);
+              padding-left: env(safe-area-inset-left);
+              padding-right: env(safe-area-inset-right); }
+  </style>
+</head>
+<body>
+  <div id="editor"></div>
+  <script type="module">
+    import { PdfeEditor } from "./pdfe-editor.js";
+    import { attachNativeHost } from "./pdfe-native-host.js";
+
+    const params = new URLSearchParams(location.search);
+    const editor = new PdfeEditor({
+      container: document.getElementById("editor"),
+      // Flat bundle layout: pdfe-worker.js / editor.js / editor.wasm sit next to
+      // this file. A host may override with ?engine=<url>.
+      engineUrl: params.get("engine") || undefined,
+      version: params.get("v") || undefined,
+      // Phones are narrow: never cap the fit width the way the desktop demo does.
+      maxPageWidthCss: 0,
+      // ...and for the same reason they open at FIT-WIDTH, not at the SDK's 50%
+      // default: half the width of a phone screen is unreadable. A native host
+      // that wants otherwise sends setZoom.
+      initialZoom: 1,
+    });
+    window.pdfe = editor;                       // debugging / Safari Web Inspector
+    attachNativeHost(editor, { telemetry: params.has("telemetry") });
+
+    // Fallback keyboard inset for hosts that don't report one. Skipped as soon
+    // as the native side takes over (__pdfeNativeInset).
+    const vv = window.visualViewport;
+    if (vv) {
+      const sync = () => {
+        if (window.__pdfeNativeInset) return;
+        const inset = Math.max(0, window.innerHeight - vv.height - vv.offsetTop);
+        document.documentElement.style.setProperty("--pdfe-keyboard-inset", `${inset}px`);
+        requestAnimationFrame(() => editor.scrollCaretIntoView());
+      };
+      vv.addEventListener("resize", sync);
+      vv.addEventListener("scroll", sync);
+    }
+
+    // A document may be preloaded by URL (?doc=…) so the shell can open the
+    // editor and the file in one shot instead of a round trip after load.
+    const doc = params.get("doc");
+    if (doc) editor.ready.then(() => editor.open(doc, { name: params.get("name") || undefined }));
+  </script>
+</body>
+</html>

@@ -1,0 +1,1618 @@
+// worker.js — the ONE dedicated worker that owns editor.wasm (docs/WEB_VIEWER.md §2).
+// The main thread never calls into wasm; this worker owns the module, the heap,
+// every pdfe_* call, and (after a one-time transferControlToOffscreen) draws
+// pages directly onto the transferred OffscreenCanvases.
+//
+// Step 7 scope (docs/WEB_VIEWER.md §5, §9): tiled page painting — an instant
+// low-res base layer plus async 768px sharp tiles (2.5px seam overlap) filled
+// through the single-flight latch — and the latch itself (newest-wins edit
+// slot + tile queue). The engine edit pass is STUBBED until the edit-session
+// ABI lands (core Steps 3–4); the keystroke pipe and its coalescing are real.
+
+// SDK packaging (docs/EDITOR_SDK.md): the engine's location is NOT hardcoded any
+// more — a host may put editor.js/editor.wasm anywhere (an app bundle, a CDN, the
+// repo's wasm/dist during development). PdfeEditor passes it as `?engine=<url>`
+// on the worker URL, which is readable synchronously here, before importScripts.
+// Default = next to this worker (the flat dist-sdk layout).
+const ENGINE_URL = new URL(
+  new URLSearchParams(self.location.search).get("engine") || "./editor.js",
+  self.location.href
+).href;
+importScripts(ENGINE_URL); // classic worker: defines createPdfe
+
+const PDFE_RENDER_RGBA = 0x1;
+
+const TILE = 768;      // §5: square tiles, 768 device px
+const TILE_OVERLAP = 3; // §5: ~2.5px seam overlap, rounded up to whole pixels
+const BASE_MAX = 384;  // base layer: longest page side in device px (cheap + instant)
+
+let mod = null;
+const F = {};
+let doc = 0;
+const pages = [];              // [{w, h}] PDF points
+const pageHandles = new Map(); // pageIndex -> PDFE_PAGE (LRU: insertion order == age)
+const textPages = new Map();   // pageIndex -> PDFE_TEXTPAGE (grouping + edit begin)
+const canvases = new Map();    // pageIndex -> OffscreenCanvas
+const paintGen = new Map();    // pageIndex -> generation (stale tile jobs drop)
+const pageScale = new Map();   // pageIndex -> device px per PDF point (last paint)
+
+// Page/text-page LRU (the PdfSession.openPages MAX_OPEN=8 analog — 7000-page
+// documents made the "no LRU yet" skeleton a real leak: every page ever
+// scrolled past kept its parsed object graph in the wasm heap forever). The
+// edit page and DIRTY pages are never evicted: closing a page with un-flushed
+// preview edits (pdfe_generate_content not run yet) would drop those edits.
+const MAX_OPEN_PAGES = 16;
+
+// ---- the live edit session (pdfe_edit_*; core Step 4) -------------------------
+// One live session per document. The worker owns it outright — this queue IS
+// the serializer (docs/CORE_API.md §6). The session adopts the page's text
+// page; we re-sync our handle after every mutating call.
+let editor = 0;
+let editPage = -1;
+let editParaBounds = null;     // [l,b,r,t] page pts of the open paragraph (tap routing)
+// SELECT-THEN-ACT (user decision 2026-07-29). A tap in edit mode no longer drops
+// straight into typing: it SELECTS the paragraph and the shell offers Edit /
+// Delete. Only the Edit action (or a second tap on the same box) opens the
+// editor. The selection lives HERE, next to the rest of the tap routing, so the
+// shell stays a renderer of state it is told about — and so Android and web can
+// behave identically without duplicating the decision logic.
+let selectedPara = null;       // {page, index, bounds, xPt, yPt} | null
+// Pages with in-memory edits not yet flushed into their content stream —
+// pdfe_save does NOT flush; we run pdfe_generate_content on these first
+// (the PdfSession.dirtyPages analog). Commit flushes its page in the core.
+const dirtyPages = new Set();
+
+// ---- the per-page grouping cache (the PdfSession.fetchGroups analog) ----------
+// pdfe.h is explicit: the core caches ONE page's grouping at a time and "the
+// host's per-page cache stays the real cache". Android has one; the worker did
+// not — so every tap/deselect/delete re-ran a full pdfe_group_page (~150-230 ms
+// on dense pages), which is exactly the click delay large documents showed.
+// Bounds in this cache stay valid until THAT page's objects mutate, so
+// hit-tests (select / deselect) are pure JS lookups. The fresh-open gate
+// (groupGen == mutGen && same page, see core/src/internal.h) is tracked with
+// coreGroupedPage/coreGroupFresh: pdfe_edit_begin_ex only needs a re-group when
+// the core's single-slot cache holds another page or a mutation intervened.
+// Entries are BLOCKS (the boxes the user sees and taps), each carrying its member
+// PARAGRAPHS (the edit units, with the core paragraph index the editor takes):
+//   pageIndex -> [{ index, bounds:[l,b,r,t], paras:[{index, bounds}] }]
+const groupCache = new Map();
+const MAX_GROUP_CACHE = 300;      // bounds are tiny; this only caps pathology
+let coreGroupedPage = -1;         // page the CORE's one-slot grouping holds
+let coreGroupFresh = false;       // no object mutation since that grouping
+// Pooled render buffer per docs/WEB_VIEWER.md §10 (FPDFBitmap_CreateEx external
+// buffers are caller-owned; pooling also avoids per-render heap growth).
+let pool = { ptr: 0, size: 0 };
+
+// locateFile: the Emscripten glue resolves editor.wasm relative to the WORKER's
+// URL, not the glue's — point it back at whatever directory the glue came from
+// (ENGINE_URL above), so editor.wasm is always fetched next to editor.js.
+// Any ?v= cache-buster on the glue URL is carried over to the wasm URL too.
+const ready = createPdfe({
+  locateFile: (f) => {
+    const u = new URL(f, ENGINE_URL);
+    u.search = new URL(ENGINE_URL).search;
+    return u.href;
+  },
+}).then((m) => {
+  mod = m;
+  F.init         = m.cwrap("pdfe_init", "number", ["number"]);
+  F.openMem      = m.cwrap("pdfe_open_mem", "number", ["number", "number", "number"]);
+  F.openMemOwned = m.cwrap("pdfe_open_mem_owned", "number", ["number", "number", "number"]);
+  F.openCustom   = m.cwrap("pdfe_wasm_open_custom", "number", ["number", "number"]);
+  F.lastOpenError = m.cwrap("pdfe_last_open_error", "number", []);
+  F.closeDoc     = m.cwrap("pdfe_close_doc", null, ["number"]);
+  F.pageCount    = m.cwrap("pdfe_page_count", "number", ["number"]);
+  F.loadPage     = m.cwrap("pdfe_load_page", "number", ["number", "number"]);
+  F.closePage    = m.cwrap("pdfe_close_page", null, ["number"]);
+  F.pageSize     = m.cwrap("pdfe_page_size", "number", ["number", "number", "number"]);
+  F.pageSizeAt   = m.cwrap("pdfe_page_size_at", "number",
+    ["number", "number", "number", "number"]);
+  F.render       = m.cwrap("pdfe_render", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.renderRegion = m.cwrap("pdfe_render_region", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.loadTextPage  = m.cwrap("pdfe_load_text_page", "number", ["number"]);
+  F.closeTextPage = m.cwrap("pdfe_close_text_page", null, ["number"]);
+  F.group         = m.cwrap("pdfe_group_page", "number", ["number", "number", "number"]);
+  F.paraInfo      = m.cwrap("pdfe_para_info", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.blockCount    = m.cwrap("pdfe_block_count", "number", ["number"]);
+  F.blockInfo     = m.cwrap("pdfe_block_info", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.moveBlock     = m.cwrap("pdfe_move_block", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.blockMoveLimits = m.cwrap("pdfe_block_move_limits", "number",
+    ["number", "number", "number", "number"]);
+  // Undo/redo. The journal lives in the CORE (docs/UNDO_REDO.md) — this shell
+  // only asks which page a step belongs to, calls it, and repaints.
+  F.undoPage      = m.cwrap("pdfe_undo_page", "number", ["number"]);
+  F.redoPage      = m.cwrap("pdfe_redo_page", "number", ["number"]);
+  F.undo          = m.cwrap("pdfe_undo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.redo          = m.cwrap("pdfe_redo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.historyClear  = m.cwrap("pdfe_history_clear", null, ["number"]);
+  F.historyDescribe = m.cwrap("pdfe_history_describe", "number",
+    ["number", "number", "number"]);
+  F.editCaretIndex = m.cwrap("pdfe_edit_caret_index", "number", ["number"]);
+  F.deleteBlock   = m.cwrap("pdfe_delete_block", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.editBegin     = m.cwrap("pdfe_edit_begin", "number",
+    ["number", "number", "number", "number"]);
+  F.editBeginEx   = m.cwrap("pdfe_edit_begin_ex", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editBeginBlock = m.cwrap("pdfe_edit_begin_block", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editLineMode  = m.cwrap("pdfe_edit_line_mode", "number", ["number"]);
+  F.editTextPage  = m.cwrap("pdfe_edit_text_page", "number", ["number"]);
+  F.editIsPara    = m.cwrap("pdfe_edit_is_paragraph", "number", ["number"]);
+  F.editText      = m.cwrap("pdfe_edit_text", "number", ["number", "number", "number"]);
+  F.editSetText   = m.cwrap("pdfe_edit_set_text", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editCaret     = m.cwrap("pdfe_edit_caret", "number", ["number", "number", "number"]);
+  F.editBoundary  = m.cwrap("pdfe_edit_boundary_at", "number", ["number", "number", "number"]);
+  F.editSelRects  = m.cwrap("pdfe_edit_selection_rects", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editCommit    = m.cwrap("pdfe_edit_commit", "number", ["number", "number"]);
+  F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
+  F.generateContent = m.cwrap("pdfe_generate_content", "number", ["number"]);
+  F.wasmSave      = m.cwrap("pdfe_wasm_save", "number", ["number"]);
+  F.init(0);
+  // Probe the save sink BEFORE announcing readiness: the shell must know up
+  // front whether saves will stream (OPFS) or fall back to in-heap, because
+  // that changes what it is allowed to offer the user (§7).
+  probeOpfs().then((ok) => {
+    opfsOk = ok;
+    postMessage({ type: "ready", opfs: ok, inHeapMaxMB: IN_HEAP_MAX / (1024 * 1024) });
+  });
+});
+
+// Close a page's handles in the required order: text page first, then page.
+function closePageHandles(i) {
+  const tp = textPages.get(i);
+  if (tp) { F.closeTextPage(tp); textPages.delete(i); }
+  const p = pageHandles.get(i);
+  if (p) { F.closePage(p); pageHandles.delete(i); }
+}
+
+function acquirePage(i) {
+  let p = pageHandles.get(i);
+  if (p) { pageHandles.delete(i); pageHandles.set(i, p); return p; } // LRU touch
+  p = F.loadPage(doc, i);
+  pageHandles.set(i, p);
+  // LRU backstop: evict the oldest evictable handle. Queued tile/paint jobs
+  // for an evicted page just re-acquire it — a reload cost, never a bug.
+  if (pageHandles.size > MAX_OPEN_PAGES) {
+    for (const k of pageHandles.keys()) {
+      if (k === i || k === editPage || dirtyPages.has(k)) continue;
+      closePageHandles(k);
+      break;
+    }
+  }
+  return p;
+}
+
+function poolBuf(bytes) {
+  if (pool.size < bytes) {
+    if (pool.ptr) mod._free(pool.ptr);
+    pool = { ptr: mod._malloc(bytes), size: bytes };
+  }
+  return pool.ptr;
+}
+
+// Render a device-pixel region of |page| and put it onto |ctx| at (dx, dy).
+// Heap view is re-derived AFTER the wasm call — views detach on heap growth
+// (docs/WEB_VIEWER.md §10); zero-copy ImageData is legal because the build is
+// single-threaded (plain ArrayBuffer heap).
+function blitRegion(ctx, pageHandle, scale, x, y, w, h) {
+  const ptr = poolBuf(w * h * 4);
+  F.renderRegion(pageHandle, ptr, w, h, w * 4, scale, x, y, PDFE_RENDER_RGBA);
+  const view = new Uint8ClampedArray(mod.HEAPU8.buffer, ptr, w * h * 4);
+  ctx.putImageData(new ImageData(view, w, h), x, y);
+}
+
+// ---- edit-session helpers ------------------------------------------------------
+
+function textPageOf(i) {
+  let tp = textPages.get(i);
+  if (!tp) { tp = F.loadTextPage(acquirePage(i)); textPages.set(i, tp); }
+  return tp;
+}
+
+// The session adopts (and may internally reload) the text page — re-sync ours.
+function syncEditTextPage() {
+  if (!editor) return;
+  const tp = F.editTextPage(editor);
+  if (tp) textPages.set(editPage, tp);
+}
+
+function readF32(ptr, n) {
+  return Array.from(new Float32Array(mod.HEAPU8.buffer, ptr, n));
+}
+
+function withU16(str, fn) {
+  const ptr = mod._malloc((str.length + 1) * 2);
+  const v = new Uint16Array(mod.HEAPU8.buffer, ptr, str.length + 1);
+  for (let i = 0; i < str.length; i++) v[i] = str.charCodeAt(i);
+  v[str.length] = 0;
+  const r = fn(ptr);
+  mod._free(ptr);
+  return r;
+}
+
+// The password seam: pdfe.h specifies UTF-8 for names/passwords (UTF-16 is for
+// document text only), and a null pointer means "no password" — the default. The
+// bytes are freed the moment the open returns; a password is never retained in
+// the heap, and the worker keeps no copy of it either.
+function withUtf8(str, fn) {
+  if (str === null || str === undefined || str === "") return fn(0);
+  const bytes = new TextEncoder().encode(str);
+  const ptr = mod._malloc(bytes.length + 1);
+  mod.HEAPU8.set(bytes, ptr);
+  mod.HEAPU8[ptr + bytes.length] = 0;
+  try { return fn(ptr); }
+  finally { mod.HEAPU8.fill(0, ptr, ptr + bytes.length); mod._free(ptr); }
+}
+
+// PDFE_OPEN_* (pdfe.h) → the SDK error codes the host switches on. The core
+// already made the required-vs-wrong call, so this is a pure rename.
+function openErrorCode(err) {
+  if (err === 100) return "password-required";  // PDFE_OPEN_ERR_PASSWORD_REQUIRED
+  if (err === 4) return "password-wrong";       // PDFE_OPEN_ERR_PASSWORD
+  return "open-failed";
+}
+
+function readEditorText() {
+  const n = F.editText(editor, 0, 0);
+  if (n <= 0) return "";
+  const ptr = mod._malloc(n * 2);
+  F.editText(editor, ptr, n);
+  const v = new Uint16Array(mod.HEAPU8.buffer, ptr, n); // re-derived post-call (§10)
+  const s = String.fromCharCode(...v);
+  mod._free(ptr);
+  return s;
+}
+
+function readCaret(index) {
+  const ptr = mod._malloc(12);
+  const ok = F.editCaret(editor, index, ptr);
+  const v = ok ? readF32(ptr, 3) : null;
+  mod._free(ptr);
+  return v; // [x, topPt, botPt] page points
+}
+
+function readSelectionRects(s, e) {
+  const n = F.editSelRects(editor, s, e, 0, 0);
+  if (n <= 0) return [];
+  const ptr = mod._malloc(n * 16);
+  F.editSelRects(editor, s, e, ptr, n);
+  const flat = readF32(ptr, n * 4);
+  mod._free(ptr);
+  const rects = [];
+  for (let i = 0; i + 3 < flat.length; i += 4) rects.push(flat.slice(i, i + 4));
+  return rects;
+}
+
+// Union [l,b,r,t] of the open run's line rects — the LIVE geometry of the run
+// being edited, which is what the shell draws its blue editing box from. The
+// grouping bounds (and editParaBounds, which only ever grows) go stale as soon
+// as the text reflows. null when there is no session / nothing to measure.
+function readRunBounds(len) {
+  if (!editor || len <= 0) return null;
+  const rects = readSelectionRects(0, len);
+  if (!rects.length) return null;
+  let b = [rects[0][0], rects[0][1], rects[0][2], rects[0][3]];
+  for (const r of rects) {
+    b = [Math.min(b[0], r[0]), Math.min(b[1], r[1]),
+         Math.max(b[2], r[2]), Math.max(b[3], r[3])];
+  }
+  // The caret can sit on a line no selection rect covers (a just-typed
+  // Enter's new line has no glyphs yet): union the caret's line so the blue
+  // "you are typing here" box always contains the caret (user request
+  // 2026-07-31). Same rule in the Android shell's runBoundsPt — keep in step.
+  const c = readCaret(-1);           // [x, topPt, botPt]
+  if (c) {
+    b = [Math.min(b[0], c[0]), Math.min(b[1], c[2]),
+         Math.max(b[2], c[0]), Math.max(b[3], c[1])];
+  }
+  return b;
+}
+
+// Run pdfe_group_page on |page| and refresh both caches (the core's one-slot
+// grouping and our per-page bounds). THE only place the core group call lives.
+function groupPage(page) {
+  const n = F.group(doc, acquirePage(page), textPageOf(page));
+  coreGroupedPage = page;
+  coreGroupFresh = true;
+  const paraBounds = [];
+  const blockList = [];
+  if (n > 0) {
+    const bp = mod._malloc(16);
+    for (let i = 0; i < n; i++) {
+      paraBounds.push(F.paraInfo(doc, i, bp, 0, 0, 0) ? readF32(bp, 4) : null);
+    }
+    // Blocks own a CONTIGUOUS paragraph range (pdfe.h "grouping"), so two ints
+    // describe the membership.
+    const ip = mod._malloc(8);
+    const nb = F.blockCount(doc);
+    for (let b = 0; b < nb; b++) {
+      if (!F.blockInfo(doc, b, bp, ip, ip + 4)) continue;
+      const bounds = readF32(bp, 4);
+      const first = mod.HEAP32[ip >> 2];
+      const count = mod.HEAP32[(ip + 4) >> 2];
+      const paras = [];
+      for (let p = first; p < first + count; p++) {
+        if (paraBounds[p]) paras.push({ index: p, bounds: paraBounds[p] });
+      }
+      if (paras.length) blockList.push({ index: b, bounds, paras });
+    }
+    mod._free(ip);
+    mod._free(bp);
+    // A core that reported no blocks (should not happen) still gets boxes.
+    if (!blockList.length) {
+      for (let i = 0; i < n; i++) {
+        if (paraBounds[i]) {
+          blockList.push({ index: blockList.length, bounds: paraBounds[i],
+                           paras: [{ index: i, bounds: paraBounds[i] }] });
+        }
+      }
+    }
+  }
+  groupCache.delete(page);
+  groupCache.set(page, blockList);   // Map order == age
+  if (groupCache.size > MAX_GROUP_CACHE) {
+    groupCache.delete(groupCache.keys().next().value);
+  }
+  return blockList;
+}
+
+function cachedGroups(page) {
+  const hit = groupCache.get(page);
+  if (hit) { groupCache.delete(page); groupCache.set(page, hit); return hit; }
+  return groupPage(page);
+}
+
+// Any object mutation breaks the core's fresh-open gate globally (mutGen is
+// doc-wide) and stales the mutated PAGE's cached bounds. Other pages' bounds
+// stay valid — their objects did not move.
+function noteMutation(page) {
+  coreGroupFresh = false;
+  groupCache.delete(page);
+}
+
+// Satisfy the fresh-open gate: pdfe_edit_begin_ex needs the core's one-slot
+// grouping to be for THIS page with no mutation since. Re-group only then.
+function ensureCoreGroup(page) {
+  if (coreGroupedPage !== page || !coreGroupFresh) groupPage(page);
+}
+
+// Hit-test in TWO levels from the per-page cache: the smallest BLOCK box
+// containing the point, then the member PARAGRAPH inside it (containing, else
+// nearest — a tap in a block's inter-paragraph gap belongs to the closest
+// paragraph; the gap itself is not editable).
+//
+// Returns { index, bounds, blockIndex, blockBounds } where index/bounds are the
+// PARAGRAPH's (what the editor opens), or null. Pure JS over cached bounds —
+// this is what makes select/deselect taps instant on already-fetched pages.
+// The same rule runs in the Android shell (PdfPageView.resolveAt) — keep in step.
+function hitParagraph(page, xPt, yPt) {
+  let block = null;
+  for (const b of cachedGroups(page)) {
+    const r = b.bounds;
+    if (xPt < r[0] || xPt > r[2] || yPt < r[1] || yPt > r[3]) continue;
+    const area = (r[2] - r[0]) * (r[3] - r[1]);
+    if (!block || area < block.area) block = { b, area };
+  }
+  if (!block) return null;
+  let best = null, nearest = null, nearestDist = Infinity;
+  for (const para of block.b.paras) {
+    const r = para.bounds;
+    if (xPt >= r[0] && xPt <= r[2] && yPt >= r[1] && yPt <= r[3]) {
+      const area = (r[2] - r[0]) * (r[3] - r[1]);
+      if (!best || area < best.area) best = { para, area };
+      continue;
+    }
+    const dx = xPt < r[0] ? r[0] - xPt : (xPt > r[2] ? xPt - r[2] : 0);
+    const dy = yPt < r[1] ? r[1] - yPt : (yPt > r[3] ? yPt - r[3] : 0);
+    const d = dx * dx + dy * dy;
+    if (d < nearestDist) { nearestDist = d; nearest = para; }
+  }
+  const hit = best ? best.para : nearest;
+  if (!hit) return null;
+  return { index: hit.index, bounds: hit.bounds,
+           blockIndex: block.b.index, blockBounds: block.b.bounds };
+}
+
+// Re-render ONLY the dirty page-point rect as a strip (§4): offset baked into
+// the matrix inside pdfe_render_region. Returns the blit duration in ms.
+function renderDirtyStrip(page, dirty) {
+  const canvas = canvases.get(page);
+  const scale = pageScale.get(page);
+  if (!canvas || !scale || dirty[2] <= dirty[0] || dirty[3] <= dirty[1]) return 0;
+  const ph = pages[page].h;
+  let x = Math.floor(dirty[0] * scale);
+  let y = Math.floor((ph - dirty[3]) * scale);
+  let w = Math.ceil((dirty[2] - dirty[0]) * scale) + 1;
+  let h = Math.ceil((dirty[3] - dirty[1]) * scale) + 1;
+  x = Math.max(0, x); y = Math.max(0, y);
+  w = Math.min(canvas.width - x, w); h = Math.min(canvas.height - y, h);
+  if (w <= 0 || h <= 0) return 0;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const t0 = performance.now();
+  blitRegion(ctx, acquirePage(page), scale, x, y, w, h);
+  return performance.now() - t0;
+}
+
+// Commit the live session (the core runs the whole commit ladder) and adopt
+// the final text page back. Posts editClosed so the shell hides the overlays.
+function commitEditor() {
+  if (!editor) return;
+  const tpp = mod._malloc(4);
+  const ok = F.editCommit(editor, tpp);
+  const tp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+  mod._free(tpp);
+  if (tp) textPages.set(editPage, tp);
+  const page = editPage;
+  if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
+  noteMutation(page);                      // indices/bounds may have shifted
+  editor = 0; editPage = -1; editParaBounds = null;
+  postMessage({ type: "editClosed", page, ok: ok === 1 });
+  postHistory();
+}
+
+// ---- undo / redo ------------------------------------------------------------
+// THE JOURNAL IS NOT HERE. It lives in the core (core/src/undo.cpp) so web,
+// Android and iOS behave identically from one implementation; this file only
+// executes the ordered shell contract in docs/UNDO_REDO.md §1. Keep the steps
+// below in that order and numbered — the Android port is a transcription of
+// them, and a step silently dropped on one platform is exactly the class of
+// divergence the contract exists to prevent.
+
+let lastHistory = "";   // "canUndo,canRedo" — so the event fires only on change
+
+function historyState() {
+  if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
+  const u = F.undoPage(doc), r = F.redoPage(doc);
+  return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r };
+}
+
+// Re-query and post, but only when the pair actually changed: this is called
+// from every mutator tail, and a typing burst must not spam the shell.
+function postHistory(force) {
+  const h = historyState();
+  const key = `${h.canUndo},${h.canRedo}`;
+  if (!force && key === lastHistory) return;
+  lastHistory = key;
+  postMessage({ type: "history", ...h });
+}
+
+function applyHistory(kind) {
+  const undo = kind === "undo";
+  if (!doc) return;
+
+  // S0. QUIESCE THE KEYSTROKE PIPE. A keystroke can be posted but not yet
+  // applied when Ctrl+Z arrives; running the undo first would let that stale
+  // buffer land on top of it and silently revert it. Drain before asking the
+  // core anything.
+  if (pendingEdit) drainLatch();
+
+  // S1. Which page? This IS canUndo — never cache a separate flag.
+  const page = undo ? F.undoPage(doc) : F.redoPage(doc);
+  if (page < 0) { postHistory(true); return; }
+
+  // S2. A session on ANOTHER page must be committed; one on this page stays
+  // open, which is what makes the in-place fast path (code 2) reachable.
+  if (editor && editPage !== page) commitEditor();
+
+  // S3. Residency, not visibility — undo must work on a scrolled-away page.
+  const pg = acquirePage(page);
+  const tp = textPageOf(page);
+
+  // S5. (S4, scrolling, is the shell's business — the SDK does it on receipt.)
+  const dp = mod._malloc(16);
+  const fp2 = mod._malloc(16);
+  const tpp = mod._malloc(4);
+  const code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp2, tpp);
+  const dirty = readF32(dp, 4);
+  // WHERE the run ended up, as distinct from what to repaint. Selecting on the
+  // dirty rect's centre looks right until a MOVE is undone: that rect spans the
+  // old and new positions and its centre lands in the gap between them.
+  const focus = readF32(fp2, 4);
+  // S6. Adopt the returned text page UNCONDITIONALLY — the core may have
+  // reloaded it, and keeping the stale handle would crash on close.
+  const newTp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+  mod._free(dp);
+  mod._free(fp2);
+  mod._free(tpp);
+  if (newTp) textPages.set(page, newTp);
+
+  // S7. Branch on the result.
+  if (code <= 0) {
+    postMessage({
+      type: "historyApplied", kind, page, ok: false, code,
+      error: code === -3 ? "history-unavailable" : undefined,
+    });
+    postHistory(true);
+    return;
+  }
+
+  const live = code === 2;   // applied INTO the open session
+  let liveState = null;
+  if (live) {
+    // S8. Refresh the IME buffer from the core. editParaBounds only ever GROWS
+    // while typing, and an undo can shrink the run, so re-seed it rather than
+    // union it or the next tap routes against a stale box.
+    const text = readEditorText();
+    const caretIndex = F.editCaretIndex(editor);
+    const bounds = readRunBounds(text.length);
+    if (bounds) editParaBounds = bounds;
+    liveState = { text, caretIndex, caret: readCaret(caretIndex),
+                  runBounds: bounds || editParaBounds };
+    // S9. Still un-flushed: a live apply is a preview, exactly like a keystroke.
+    dirtyPages.add(page);
+  } else {
+    // The core reopened, restored and committed, so the page is flushed and any
+    // session that was open on it is gone.
+    if (editor && editPage === page) { editor = 0; editPage = -1; editParaBounds = null; }
+    dirtyPages.delete(page);
+  }
+
+  // S10. The grouping is stale either way.
+  noteMutation(page);
+  // S11. Repaint. The core's rect already covers the run before AND after plus
+  // the block box at both states, so no widening is needed here.
+  renderDirtyStrip(page, dirty);
+
+  // S12/S13. Re-group, then re-establish the selection BY POSITION — the centre
+  // of what changed. Never by index: a step renumbers blocks.
+  const blocks = groupPage(page);
+  let selection = null;
+  if (!live && focus[2] > focus[0] && focus[3] > focus[1]) {
+    const cx = 0.5 * (focus[0] + focus[2]);
+    const cy = 0.5 * (focus[1] + focus[3]);
+    const hit = hitParagraph(page, cx, cy);
+    if (hit) {
+      selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt: cx, yPt: cy };
+      selection = { index: hit.index, bounds: hit.blockBounds,
+                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy };
+    } else {
+      selectedPara = null;
+    }
+  }
+
+  postMessage({
+    type: "historyApplied", kind, page, ok: true, code, live, blocks, selection,
+    dirty, focus,
+    // Present only on the live path — the shell re-seeds its sink from these.
+    ...(liveState || {}),
+  });
+  // S14/S15 (dirty flag + button state) are the SDK's half.
+  postHistory(true);
+}
+
+// ---- paragraph selection (select-then-act) ---------------------------------
+// The shell mirrors these two messages into its box overlay + action bar; it
+// never decides on its own what is selected.
+
+function selectPara(page, hit, xPt, yPt) {
+  // ANDROID PARITY: what the user SELECTS is the box (the block) — the same
+  // unit Edit opens and Delete removes.
+  selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt, yPt };
+  postMessage({ type: "paraSelected", page, index: hit.index,
+                bounds: hit.blockBounds,
+                blockIndex: hit.blockIndex, blockBounds: hit.blockBounds });
+}
+
+function clearSelection() {
+  if (!selectedPara) return;
+  selectedPara = null;
+  postMessage({ type: "paraDeselected" });
+}
+
+// Delete a whole BLOCK, atomically — one silent action with no
+// editOpened/editClosed traffic: no caret flash, no keyboard, no half-erased
+// frame. |xPt,yPt| is the point the selection was made at; the block is
+// re-resolved from a FRESH grouping (which also satisfies the core's fresh-open
+// gate), so a stale index can never delete the wrong text.
+//
+// The open-code that used to live here (begin_block -> set_text("") -> commit)
+// is now pdfe_delete_block in the core. That is deliberate, not tidying: the
+// core records the payload that makes the deletion UNDOABLE while the objects
+// are still readable, and a shell driving the ladder itself would skip it. Same
+// reasoning as pdfe_move_block owning the identity pin.
+function deleteParagraphAt(page, xPt, yPt) {
+  if (editor) commitEditor();
+  ensureCoreGroup(page);   // the fresh-open gate; also refreshes stale bounds
+  const hit = hitParagraph(page, xPt, yPt);
+  if (!hit) { postMessage({ type: "paraDeleted", page, ok: false }); return; }
+
+  const dPtr = mod._malloc(16);
+  const tpp = mod._malloc(4);
+  const ok = F.deleteBlock(doc, acquirePage(page), textPageOf(page),
+                           hit.blockIndex, dPtr, tpp);
+  const d = readF32(dPtr, 4);
+  const tp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+  mod._free(dPtr);
+  mod._free(tpp);
+  if (tp) textPages.set(page, tp);
+  if (!ok) { postMessage({ type: "paraDeleted", page, ok: false }); return; }
+
+  noteMutation(page);
+  dirtyPages.delete(page);   // pdfe_delete_block commits, so the page is flushed
+  // The core's rect already unions the run and the block box, but keep the
+  // shell's own widening: the box is drawn from grouping bounds, which can be a
+  // little wider than the ink, and a few unrepainted pixels read as a ghost.
+  const strip = (d[2] > d[0] && d[3] > d[1])
+    ? [Math.min(d[0], hit.blockBounds[0]), Math.min(d[1], hit.blockBounds[1]),
+       Math.max(d[2], hit.blockBounds[2]), Math.max(d[3], hit.blockBounds[3])]
+    : hit.blockBounds;
+  renderDirtyStrip(page, strip);
+  postMessage({ type: "paraDeleted", page, ok: true });
+  postHistory();
+}
+
+// ---- block move (drag a text box to a new position) -------------------------
+// EXPERIMENTAL, web only (branch feature/web-block-move).
+//
+// The block's TEXT objects are translated by (dx, dy) page points — a pure
+// matrix translation, so glyphs, fonts, colour and rotation are untouched. By
+// design this moves TEXT ONLY: underlines, rule lines, vector bullets, cell
+// borders and background fills are path objects, the grouper never reports
+// them, and they stay where they are.
+//
+// The core call is pdfe_move_block, not pdfe_translate_objects, because it also
+// PINS THE BLOCK'S IDENTITY — without that a dropped box merges with whatever
+// it lands near, and a box must keep its identity (user directive 2026-08-03).
+// Gathering the block's objects here and translating them directly would move
+// the same pixels and silently lose that guarantee, so the shell deliberately
+// does not know how to do it.
+
+// Move the block under (xPt, yPt) by (dx, dy) page points. |xPt,yPt| is the
+// point the drag STARTED from — the block is re-resolved from a FRESH grouping
+// (the same stale-index guard deleteParagraphAt uses), never from an index the
+// shell has been holding.
+//
+// A move changes the page's geometry, so paragraph indices shift even though
+// the BOXES are now stable across it. The selection is therefore re-established
+// by hit-testing the DROP point against the new grouping, never by reusing the
+// old index.
+function moveBlockAt(page, xPt, yPt, dx, dy) {
+  if (editor) commitEditor();
+  ensureCoreGroup(page);
+  const hit = hitParagraph(page, xPt, yPt);
+  if (!hit) { postMessage({ type: "blockMoved", page, ok: false }); return; }
+
+  const dp = mod._malloc(16);
+  const moved = F.moveBlock(doc, acquirePage(page), hit.blockIndex, dx, dy, dp);
+  const d = readF32(dp, 4);
+  mod._free(dp);
+  if (moved <= 0) { postMessage({ type: "blockMoved", page, ok: false }); return; }
+
+  dirtyPages.add(page);
+  noteMutation(page);
+  // The core's dirty rect is the union of the before and after object bounds,
+  // so it already covers the vacated strip. Union the block's own box anyway:
+  // the box is drawn from grouping bounds, which can be slightly wider than the
+  // ink the objects report, and a few unrepainted pixels read as a ghost.
+  const bb = hit.blockBounds;
+  const strip = (d[2] > d[0] && d[3] > d[1])
+    ? [Math.min(d[0], bb[0], bb[0] + dx), Math.min(d[1], bb[1], bb[1] + dy),
+       Math.max(d[2], bb[2], bb[2] + dx), Math.max(d[3], bb[3], bb[3] + dy)]
+    : [Math.min(bb[0], bb[0] + dx), Math.min(bb[1], bb[1] + dy),
+       Math.max(bb[2], bb[2] + dx), Math.max(bb[3], bb[3] + dy)];
+  renderDirtyStrip(page, strip);
+
+  // Re-group and re-select at the DROP point, so the box the user just dragged
+  // stays selected and can be nudged again without re-tapping.
+  const blocks = groupPage(page);   // also restores the fresh-open gate
+  const reHit = hitParagraph(page, xPt + dx, yPt + dy);
+  if (reHit) {
+    selectedPara = { page, index: reHit.index, bounds: reHit.blockBounds,
+                     xPt: xPt + dx, yPt: yPt + dy };
+  } else {
+    selectedPara = null;
+  }
+  postMessage({
+    type: "blockMoved",
+    page,
+    ok: true,
+    moved,
+    blocks,                                   // the fresh boxes, so no extra round trip
+    selection: selectedPara
+      ? { index: reHit.index, bounds: reHit.blockBounds,
+          blockIndex: reHit.blockIndex, blockBounds: reHit.blockBounds,
+          xPt: xPt + dx, yPt: yPt + dy }
+      : null,
+  });
+  postHistory();
+}
+
+// Open the core editor on the paragraph at page point (xPt, yPt). |lineMode|:
+// -1 auto (the core heuristic classifies list-like paragraphs as
+// line-preserving), 0 force reflow, 1 force line-preserving. Re-groups only
+// when the fresh-open gate demands it, then hit-tests the refreshed cache so
+// the index it opens always matches the core's own grouping slot.
+function openEditorAt(page, xPt, yPt, lineMode) {
+  ensureCoreGroup(page);
+  const hit = hitParagraph(page, xPt, yPt);
+  if (!hit) return;
+  // ANDROID PARITY (user directive 2026-07-31, block model): the BOX is the
+  // edit unit — open the whole BLOCK as one buffer ('\n' separates its
+  // paragraphs; the core rewraps only the paragraph the caret is in). The
+  // caret still lands on the tapped glyph via editBoundary over the block
+  // buffer. This was the last per-paragraph opener; the boxes, selection and
+  // identity-hide were already block-scoped.
+  const ed = F.editBeginBlock(doc, acquirePage(page), textPageOf(page),
+                              hit.blockIndex, lineMode);
+  if (!ed) return;
+  editor = ed;
+  editPage = page;
+  editParaBounds = hit.blockBounds;
+  const text = readEditorText();
+  const caretIdx = F.editBoundary(editor, xPt, yPt);
+  postMessage({
+    type: "editOpened",
+    page,
+    paraIndex: hit.index,        // the paragraph being edited
+    blockIndex: hit.blockIndex,  // the shell hides THIS block's faint box
+    text,
+    caretIndex: caretIdx,
+    caret: readCaret(caretIdx),
+    runBounds: readRunBounds(text.length) || hit.blockBounds, // the blue editing box
+    isParagraph: F.editIsPara(editor) === 1,
+    linePreserve: F.editLineMode(editor) === 1,
+  });
+}
+
+// ---- tier-2 lazy load (docs/WEB_IO.md §3) --------------------------------------
+// Large files never enter the heap wholesale: pdfe_open_custom makes PDFium
+// pull byte ranges through the io_shim trampoline into globalThis.pdfeReadBlock,
+// which serves them from an ALIGNED LRU BLOCK CACHE over the source Blob.
+// FileReaderSync is the only synchronous way to read a user's file in a
+// browser, and (like the OPFS save handle) exists only in dedicated workers.
+// The cache is mandatory, not an optimization: PDFium issues many small reads
+// while parsing and per-call slice+read overhead is brutal (§9).
+const TIER2_MIN = 50 * 1024 * 1024;   // ≥ 50 MB loads lazily (§3 threshold)
+const CACHE_BYTES = 32 * 1024 * 1024; // block-cache ceiling (block count follows)
+// 256 KB blocks, MEASURED (§3 table, 110 MB/125-page fixture in Chrome): a
+// PDF's objects are scattered, so big blocks fetch mostly bytes nobody asked
+// for — 2 MB blocks pulled 332 MB off the Blob where 256 KB pulled 140 MB,
+// and were slower at every stage. The CACHE is what's mandatory, not big blocks.
+let BLOCK = 256 * 1024;
+let MAX_BLOCKS = CACHE_BYTES / BLOCK; // LRU depth (128 blocks)
+
+let sourceBlob = null;   // MUST outlive the doc: FPDF_SaveAsCopy re-reads it
+let sourceSize = 0;
+let loadTier = 0;
+let reader = null;                    // FileReaderSync (worker-only)
+const blocks = new Map();             // blockIndex -> Uint8Array; Map order == LRU
+const ioStat = { calls: 0, bytes: 0, reads: 0, readBytes: 0, evictions: 0 };
+
+function sourceBlock(i) {
+  const hit = blocks.get(i);
+  if (hit) { blocks.delete(i); blocks.set(i, hit); return hit; }   // LRU touch
+  const start = i * BLOCK;
+  const len = Math.min(BLOCK, sourceSize - start);
+  const buf = new Uint8Array(reader.readAsArrayBuffer(sourceBlob.slice(start, start + len)));
+  ioStat.reads++; ioStat.readBytes += len;
+  blocks.set(i, buf);
+  if (blocks.size > MAX_BLOCKS) { blocks.delete(blocks.keys().next().value); ioStat.evictions++; }
+  return buf;
+}
+
+// THE read trampoline (wasm/io_shim.cpp calls this by global name). Returns 1
+// only when ALL |len| bytes landed in the heap at |ptr|.
+globalThis.pdfeReadBlock = (offset, ptr, len) => {
+  if (!sourceBlob || offset < 0 || offset + len > sourceSize) return 0;
+  ioStat.calls++; ioStat.bytes += len;
+  let done = 0;
+  while (done < len) {
+    const pos = offset + done;
+    const bi = Math.floor(pos / BLOCK);
+    const within = pos - bi * BLOCK;
+    const blk = sourceBlock(bi);
+    const n = Math.min(len - done, blk.length - within);
+    if (n <= 0) return 0;
+    // Re-derive the heap view for EVERY chunk: a growing heap detaches views
+    // (docs/WASM_BUILD.md) — the same rule as the save trampoline.
+    mod.HEAPU8.set(blk.subarray(within, within + n), ptr + done);
+    done += n;
+  }
+  return 1;
+};
+
+// ---- streaming save (docs/WEB_IO.md §5–§7) -------------------------------------
+// pdfe_save emits sequential ~32 KB chunks SYNCHRONOUSLY through the io_shim
+// trampoline into globalThis.pdfeSaveWrite. Primary sink: an OPFS
+// FileSystemSyncAccessHandle (the only synchronous write target browsers have;
+// dedicated-worker-only) — memory stays chunk-flat like Android's SAF fd.
+// Fallback (Safari private mode: no OPFS): accumulate chunks in JS memory.
+let saveHandle = null;   // live OPFS sync handle during a save
+let savePos = 0;
+let saveChunks = null;   // fallback accumulation
+let opfsOk = false;      // probed once at startup; drives the shell's warning UI
+
+const SAVE_STAGING = "save-staging.pdf";
+const SAVE_PROBE = "opfs-probe.tmp";
+// Hard ceiling for the in-heap fallback (§7): without OPFS the whole output
+// accumulates in JS memory ON TOP of PDFium's parsed objects — the ~3x
+// residency of §2. Past this we refuse rather than crash the tab mid-save.
+const IN_HEAP_MAX = 250 * 1024 * 1024;
+
+// Can this browser stream a save? Also reaps an orphaned staging file (a tab
+// killed mid-save leaves one, and OPFS counts against origin quota — §9).
+// Safari private browsing has no OPFS at all, so this is the §7 fallback
+// trigger — detected UP FRONT, not by failing halfway through a save.
+async function probeOpfs() {
+  try {
+    const root = await navigator.storage.getDirectory();
+    await root.removeEntry(SAVE_STAGING).catch(() => {});
+    const probe = await root.getFileHandle(SAVE_PROBE, { create: true });
+    const h = await probe.createSyncAccessHandle();   // the capability that matters
+    h.close();
+    await root.removeEntry(SAVE_PROBE).catch(() => {});
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+globalThis.pdfeSaveWrite = (ptr, size) => {
+  // Re-derive the heap view EVERY chunk: PDFium may allocate (and grow the
+  // heap, detaching views) between WriteBlock calls (§9).
+  const view = new Uint8Array(mod.HEAPU8.buffer, ptr, size);
+  if (saveHandle) {
+    let off = 0;
+    while (off < size) {  // short-write loop; success only when ALL bytes land
+      const n = saveHandle.write(off ? view.subarray(off) : view, { at: savePos + off });
+      if (!n) return 0;
+      off += n;
+    }
+    savePos += size;
+    return 1;
+  }
+  if (saveChunks) { saveChunks.push(view.slice()); return 1; }
+  return 0;
+};
+
+async function saveDocument(forceInHeap) {
+  if (!doc) { postMessage({ type: "error", detail: "no document" }); return; }
+  // Backstop for §7's "large-file saving is simply not offered" rule: the
+  // shell warns, but the worker is what actually refuses — a shell bug must
+  // not be able to OOM the tab.
+  if ((!opfsOk || forceInHeap) && sourceSize > IN_HEAP_MAX) {
+    postMessage({
+      type: "saveRefused", reason: "in-heap-too-large",
+      sizeMB: Math.round(sourceSize / (1024 * 1024)),
+      limitMB: IN_HEAP_MAX / (1024 * 1024),
+    });
+    return;
+  }
+  // Finalize any live edit first (the Android startSave analog), then flush
+  // every page with un-flushed preview edits (pdfe_save does not flush).
+  if (editor) commitEditor();
+  for (const p of dirtyPages) F.generateContent(acquirePage(p));
+  dirtyPages.clear();
+
+  const t0 = performance.now();
+  let fileHandle = null;
+  let flat = false;
+  try {
+    if (forceInHeap) throw new Error("forced in-heap (dev knob)");
+    const root = await navigator.storage.getDirectory();
+    fileHandle = await root.getFileHandle(SAVE_STAGING, { create: true });
+    saveHandle = await fileHandle.createSyncAccessHandle();
+    saveHandle.truncate(0);
+    savePos = 0;
+    flat = true;
+  } catch (e) {
+    // No OPFS sync handle (Safari private mode / old browser): in-heap
+    // fallback with a UI warning (§7). Flat memory is lost in this mode only.
+    saveHandle = null;
+    saveChunks = [];
+  }
+
+  const written = F.wasmSave(doc);
+  let file = null;
+  if (flat) {
+    saveHandle.flush();   // the fsync analog — durable before we report success
+    saveHandle.close();
+    saveHandle = null;
+    if (written >= 0) file = await fileHandle.getFile();   // OPFS-backed File: streams from disk
+  } else {
+    if (written >= 0) file = new File(saveChunks, "edited.pdf", { type: "application/pdf" });
+    saveChunks = null;
+  }
+  const ms = Math.round(performance.now() - t0);
+  if (written < 0 || !file) {
+    postMessage({ type: "error", detail: "save failed" });
+    return;
+  }
+  // HISTORY IS CLEARED ON SAVE (user decision 2026-08-03). The core does not do
+  // it inside pdfe_save — that function's semantics are frozen, and it is also
+  // the export path — so every shell must call this here. The parity gate's
+  // required-command list is what keeps a shell from forgetting.
+  F.historyClear(doc);
+  postHistory(true);
+  // A Blob/File clones as a reference — delivery (object-URL download /
+  // showSaveFilePicker) is the main thread's job (§6).
+  postMessage({
+    type: "saved", bytes: written, ms, file, flat,
+    tier: loadTier,
+    io: { ...ioStat },   // tier 2: the source re-reads SaveAsCopy did
+    heapMB: Math.round((mod.HEAPU8.length / (1024 * 1024)) * 10) / 10,
+  });
+}
+
+// ---- single-flight, newest-wins latch (docs/WEB_VIEWER.md §9) ----------------
+// One drain tick per animation frame. Priorities inside a drain:
+//   1. the newest pending edit (keystrokes preempt everything)
+//   2. base-page paints, NEWEST-first (the page under the viewport right now)
+//   3. sharp tiles (budgeted slice)
+//   4. at most ONE grouping job (they cost 100-250 ms on dense pages)
+// Paints and groups became latch jobs for 7000-page documents: both used to
+// run synchronously in the message handler, so a fast scroll queued seconds of
+// work in front of every tap — and grouping ahead of later pages' paints is
+// exactly why faint boxes could appear before the text they box.
+let pendingEdit = null;   // newest {fullText, caretIndex, generation, postedAt}
+const paintQueue = [];    // LIFO of {page, gen, w, h, scale} — newest wins
+const tileQueue = [];     // FIFO of {page, gen, scale, x, y, w, h}
+const groupQueue = [];    // FIFO of pageIndex
+const groupQueued = new Set();
+let latchScheduled = false;
+let lastEditPass = -1e9;  // when the last engine pass ran (worker clock)
+
+// Enqueue a grouping job (deduped). Cache hits reply immediately instead.
+function requestGroupJob(page) {
+  if (groupQueued.has(page)) return;
+  groupQueued.add(page);
+  groupQueue.push(page);
+  scheduleLatch();
+}
+
+function scheduleLatch() {
+  if (latchScheduled) return;
+  latchScheduled = true;
+  // Prefer the frame tick (one engine pass per frame, §9) — but worker rAF
+  // STALLS whenever the canvases aren't compositing (hidden/undisplayed tab),
+  // which would freeze tile fills and edit echoes. The timeout backstop keeps
+  // the latch draining regardless; the `fired` guard makes them race safely.
+  let fired = false;
+  const run = () => { if (fired) return; fired = true; drainLatch(); };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+  // Edits get a frame-length backstop so keystroke latency never depends on
+  // compositing; idle tile fills can wait the long backstop.
+  setTimeout(run, pendingEdit ? 16 : 100);
+}
+
+function drainLatch() {
+  latchScheduled = false;
+  // 1) Newest pending edit first (preempts tile work).
+  if (pendingEdit) {
+    const edit = pendingEdit;
+    pendingEdit = null;
+    if (editor) {
+      lastEditPass = performance.now();
+      dirtyPages.add(editPage);   // in-memory mutation; flushed at commit/save
+      noteMutation(editPage);     // grouping gate broken; this page's boxes stale
+      // THE engine pass: one waist crossing (pdfe_edit_set_text with the
+      // dirty-rect out-param), then re-render ONLY the dirty strip, then the
+      // caret (and selection) geometry back to the main thread.
+      // postedAt is echoed VERBATIM: performance.now() origins differ between
+      // worker and main thread — the main thread closes the loop on ONE clock.
+      const dPtr = mod._malloc(16);
+      const t0 = performance.now();
+      withU16(edit.fullText, (tPtr) =>
+        F.editSetText(editor, tPtr, edit.fullText.length, edit.caretIndex, dPtr));
+      const engineMs = performance.now() - t0;
+      const dirty = readF32(dPtr, 4);
+      mod._free(dPtr);
+      // I9 hardening: editParaBounds is captured at OPEN, but an edit can grow
+      // the paragraph past it (reflow adding a line, text extending a line).
+      // A reposition tap just past the stale edge would then take the
+      // commit-then-reopen path mid-typing. Union in each edit's dirty rect so
+      // the tap routing tracks the live extent. (Shrink is left alone: a tap
+      // in the vacated area still routes to a caret move, which the core
+      // clamps to the nearest boundary — harmless.)
+      if (editParaBounds && dirty[2] > dirty[0] && dirty[3] > dirty[1]) {
+        editParaBounds = [
+          Math.min(editParaBounds[0], dirty[0]),
+          Math.min(editParaBounds[1], dirty[1]),
+          Math.max(editParaBounds[2], dirty[2]),
+          Math.max(editParaBounds[3], dirty[3]),
+        ];
+      }
+      syncEditTextPage();
+      const blitMs = renderDirtyStrip(editPage, dirty);
+      const hasSel = edit.selEnd > edit.selStart;
+      const sel = hasSel ? readSelectionRects(edit.selStart, edit.selEnd) : [];
+      postMessage({
+        type: "editApplied",
+        generation: edit.generation,
+        page: editPage,
+        caret: readCaret(-1),
+        selection: sel,
+        // THE KNOBS' GEOMETRY, and it has to travel with an ordinary edit too.
+        // Shift+arrow does NOT go through selectRange/selectWord — the sink's
+        // own selection moves and the shell mirrors it as a plain "edit" — so
+        // this was the only reply that could carry the new handle positions.
+        // Without them the highlight grew while the knobs stayed where the
+        // double-tap had left them (QA 2026-08-07, web only).
+        // The range is echoed back because the shell must re-arm _selRange for a
+        // subsequent knob DRAG, which resolves against it.
+        h0: hasSel ? readCaret(edit.selStart) : null,
+        h1: hasSel ? readCaret(edit.selEnd) : null,
+        selStart: edit.selStart,
+        selEnd: edit.selEnd,
+        runBounds: readRunBounds(edit.fullText.length),   // the blue editing box
+
+        engineMs: Math.round(engineMs * 100) / 100,
+        blitMs: Math.round(blitMs * 100) / 100,
+        postedAt: edit.postedAt,
+      });
+      // The core recorded this pass as an undo step (or skipped it, if the
+      // buffer was unchanged — an ArrowLeft/Right re-post does that). Deduped,
+      // so a typing burst produces at most one history event.
+      postHistory();
+    } else {
+      // No open session: keep the echo so the pipe stays observable.
+      postMessage({
+        type: "editEcho",
+        generation: edit.generation,
+        chars: edit.fullText.length,
+        caretIndex: edit.caretIndex,
+        postedAt: edit.postedAt,
+      });
+    }
+  }
+  // 2) Base-page paints, newest-first: during a fast scroll the page under the
+  // viewport RIGHT NOW paints before pages already flung past (whose queued
+  // jobs an evict or a newer paint invalidated via the generation bump).
+  const paintEnd = performance.now() + 12;
+  while (paintQueue.length && performance.now() < paintEnd) {
+    const job = paintQueue.pop();
+    if (paintGen.get(job.page) !== job.gen) continue; // superseded or evicted
+    paintPage(job);
+  }
+  // 3) Then a budgeted slice of tile fills (skip jobs a newer paint outdated).
+  const budgetEnd = performance.now() + 8; // ~half a frame; stay responsive
+  while (tileQueue.length && performance.now() < budgetEnd) {
+    const job = tileQueue.shift();
+    if (paintGen.get(job.page) !== job.gen) continue; // stale: a newer paint won
+    const canvas = canvases.get(job.page);
+    if (!canvas || !doc) continue;
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
+    const t0 = performance.now();
+    blitRegion(ctx, acquirePage(job.page), job.scale, job.x, job.y, job.w, job.h);
+    postMessage({
+      type: "tile",
+      page: job.page,
+      ms: Math.round((performance.now() - t0) * 10) / 10,
+      left: tileQueue.length,
+    });
+  }
+  // 4) At most ONE grouping job per drain — they are the most expensive unit
+  // of work here (a dense page groups in 100-250 ms) and boxes are the least
+  // urgent pixels: text always lands first now, never after the boxes.
+  if (!pendingEdit && !paintQueue.length && !tileQueue.length && groupQueue.length) {
+    const page = groupQueue.shift();
+    groupQueued.delete(page);
+    if (doc && canvases.has(page)) {
+      postMessage({ type: "groups", page, blocks: cachedGroups(page) });
+    }
+  }
+  if (tileQueue.length || paintQueue.length || groupQueue.length || pendingEdit) {
+    scheduleLatch();
+  }
+}
+
+// ---- tiled page paint (docs/WEB_VIEWER.md §5) ---------------------------------
+// Base layer first (instant, blurry), then 768px sharp tiles through the latch.
+// Runs from the latch drain — |job| carries the generation stamped when the
+// paint was REQUESTED, so an evict or a newer request silently retires it.
+function paintPage(job) {
+  const { page, w, h, scale } = job;
+  const canvas = canvases.get(page);
+  if (!canvas || !doc) return;
+  const gen = job.gen;
+  pageScale.set(page, scale);   // dirty-strip renders reuse the paint scale
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  const handle = acquirePage(page);
+
+  // Base layer: one cheap low-res full-page render, scaled up by the canvas.
+  const t0 = performance.now();
+  const baseF = Math.min(1, BASE_MAX / Math.max(w, h));
+  const bw = Math.max(1, Math.round(w * baseF));
+  const bh = Math.max(1, Math.round(h * baseF));
+  const ptr = poolBuf(bw * bh * 4);
+  F.render(handle, ptr, bw, bh, bw * 4, PDFE_RENDER_RGBA);
+  const view = new Uint8ClampedArray(mod.HEAPU8.buffer, ptr, bw * bh * 4);
+  const staging = new OffscreenCanvas(bw, bh);
+  staging.getContext("2d").putImageData(new ImageData(view, bw, bh), 0, 0);
+  ctx.imageSmoothingEnabled = true;
+  ctx.drawImage(staging, 0, 0, bw, bh, 0, 0, w, h);
+  const baseMs = Math.round((performance.now() - t0) * 10) / 10;
+
+  // Sharp tiles: enqueue with seam overlap; the latch fills them async.
+  let tiles = 0;
+  for (let ty = 0; ty < h; ty += TILE) {
+    for (let tx = 0; tx < w; tx += TILE) {
+      const x = Math.max(0, tx - TILE_OVERLAP);
+      const y = Math.max(0, ty - TILE_OVERLAP);
+      const tw = Math.min(w, tx + TILE + TILE_OVERLAP) - x;
+      const th = Math.min(h, ty + TILE + TILE_OVERLAP) - y;
+      tileQueue.push({ page, gen, scale, x, y, w: tw, h: th });
+      tiles++;
+    }
+  }
+  postMessage({ type: "painted", page, baseMs, tiles });
+  scheduleLatch();
+}
+
+onmessage = async (e) => {
+  await ready;
+  const msg = e.data;
+
+  if (msg.type === "open") {
+    selectedPara = null;   // the shell resets its own overlay state in open()
+    if (doc) { // abandon any edit + close text pages/pages first, then the doc
+      if (editor) {
+        const tp = F.editCancel(editor);
+        if (tp) textPages.set(editPage, tp);
+        editor = 0; editPage = -1; editParaBounds = null;
+      }
+      for (const tp of textPages.values()) F.closeTextPage(tp);
+      textPages.clear();
+      for (const p of pageHandles.values()) F.closePage(p);
+      pageHandles.clear(); canvases.clear(); paintGen.clear(); pageScale.clear();
+      tileQueue.length = 0; paintQueue.length = 0; pendingEdit = null;
+      groupQueue.length = 0; groupQueued.clear(); groupCache.clear();
+      coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
+      F.closeDoc(doc); doc = 0; pages.length = 0;
+      // Only now may the old source go: the doc read from it until this point.
+      sourceBlob = null; sourceSize = 0; blocks.clear();
+    }
+    // The document always arrives as a Blob/File. Tier is chosen by SIZE (§3);
+    // msg.tier forces one for testing. The Blob is kept for the whole session
+    // either way — tier 2 REQUIRES it (save re-reads the source through it).
+    sourceBlob = msg.blob;
+    sourceSize = sourceBlob.size;
+    blocks.clear();
+    for (const k of Object.keys(ioStat)) ioStat[k] = 0;
+    loadTier = msg.tier || (sourceSize >= TIER2_MIN ? 2 : 1);
+    if (msg.blockKB) {   // dev knob (?block=): re-measure the §3 tradeoff
+      BLOCK = msg.blockKB * 1024;
+      MAX_BLOCKS = Math.max(4, Math.floor(CACHE_BYTES / BLOCK));
+    }
+    const tOpen = performance.now();
+    // msg.password is undefined for the overwhelming majority of documents; both
+    // tiers take it because encryption is a property of the FILE, not its size.
+    if (loadTier === 2) {
+      // Lazy: nothing but PDFium's parsed structures + the block cache in heap.
+      reader = reader || new FileReaderSync();
+      doc = withUtf8(msg.password, (pw) => F.openCustom(sourceSize, pw));
+    } else {
+      // Eager: ONE full copy into the heap, pinned until pdfe_close_doc (the
+      // FPDF_LoadMemDocument rule, owned inside the core). Hand it over with
+      // the ADOPTING entry point — pdfe_open_mem would copy it a second time,
+      // doubling peak heap for nothing (this is what Android's JNI does too).
+      const bytes = new Uint8Array(await sourceBlob.arrayBuffer());
+      const ptr = mod._malloc(bytes.length);
+      mod.HEAPU8.set(bytes, ptr);
+      // core frees it, incl. on failure — so a wrong password does NOT leak the
+      // document, and the retry with the right one starts from a clean heap.
+      doc = withUtf8(msg.password, (pw) => F.openMemOwned(ptr, bytes.length, pw));
+    }
+    const openMs = Math.round(performance.now() - tOpen);
+    if (!doc) {
+      // Say WHY, so the shell can raise a password prompt instead of a dead end.
+      // The source Blob is dropped: nothing was opened from it, and holding a
+      // File the host may replace on the retry only invites a stale save.
+      const err = F.lastOpenError();
+      sourceBlob = null; sourceSize = 0; blocks.clear();
+      postMessage({ type: "openFailed", code: openErrorCode(err), err });
+      return;
+    }
+    const n = F.pageCount(doc);
+    const dims = mod._malloc(8);
+    // Measure WITHOUT loading pages: FPDF_LoadPage makes the document retain
+    // that page's parsed objects (its images included) forever, so laying out
+    // an image-heavy 110 MB file this way cost 104 MB of heap — measured
+    // 2026-07-27, and it defeated the whole point of the lazy tier.
+    for (let i = 0; i < n; i++) {
+      F.pageSizeAt(doc, i, dims, dims + 4);
+      const v = new Float32Array(mod.HEAPU8.buffer, dims, 2);
+      pages.push({ w: v[0], h: v[1] });
+    }
+    mod._free(dims);
+    postMessage({
+      type: "opened",
+      pages: pages.slice(),
+      tier: loadTier,
+      bytes: sourceSize,
+      openMs,
+      io: { ...ioStat },
+      heapMB: Math.round((mod.HEAPU8.length / (1024 * 1024)) * 10) / 10,
+    });
+    // A new document is a new (empty) history. Forced, because the previous
+    // document may have left the shell's buttons enabled.
+    lastHistory = "";
+    postHistory(true);
+    return;
+  }
+
+  if (msg.type === "attach") {
+    canvases.set(msg.page, msg.canvas);
+    return;
+  }
+
+  if (msg.type === "paint") {
+    // scale = device pixels per PDF point, decided by the main thread. Just
+    // enqueue: the render itself runs through the latch, so a burst of paint
+    // requests from a fast scroll can never wall off taps and edits.
+    const gen = (paintGen.get(msg.page) || 0) + 1;
+    paintGen.set(msg.page, gen);
+    paintQueue.push({ page: msg.page, gen, w: msg.w, h: msg.h, scale: msg.scale });
+    scheduleLatch();
+    return;
+  }
+
+  if (msg.type === "evict") {
+    // The shell noticed this page left the keep window: retire its queued
+    // work, free its canvas bitmap (a full-page RGBA canvas is megabytes —
+    // 7000-page documents CANNOT keep every visited page's pixels), and close
+    // its handles. The edit page and dirty pages keep everything (see the LRU
+    // note at the top); the canvas keeps its CSS size, so layout never moves.
+    const page = msg.page;
+    if (page === editPage || dirtyPages.has(page)) return;
+    paintGen.set(page, (paintGen.get(page) || 0) + 1);   // retire queued jobs
+    pageScale.delete(page);
+    const canvas = canvases.get(page);
+    if (canvas && canvas.width > 1) { canvas.width = 1; canvas.height = 1; }
+    closePageHandles(page);
+    return;
+  }
+
+  if (msg.type === "stats") {
+    // Dev/harness telemetry (the large-document tests read this).
+    postMessage({
+      type: "stats",
+      openPages: pageHandles.size, textPages: textPages.size,
+      groupsCached: groupCache.size, dirtyPages: dirtyPages.size,
+      groupKeys: [...groupCache.keys()].slice(0, 20),
+      coreGroupedPage, coreGroupFresh,
+      paintQueue: paintQueue.length, tileQueue: tileQueue.length,
+      groupQueue: groupQueue.length,
+      heapMB: Math.round((mod.HEAPU8.length / (1024 * 1024)) * 10) / 10,
+    });
+    return;
+  }
+
+  if (msg.type === "edit") {
+    // Newest-wins: overwrite any not-yet-drained edit (§9).
+    pendingEdit = {
+      fullText: msg.fullText,
+      caretIndex: msg.caretIndex,
+      selStart: msg.selStart ?? msg.caretIndex,
+      selEnd: msg.selEnd ?? msg.caretIndex,
+      generation: msg.generation,
+      postedAt: msg.postedAt,
+    };
+    // Latency: if no engine pass ran within this frame, drain NOW — the wait
+    // for the next frame tick would dominate keystroke→blit for a human typing
+    // cadence. Faster-than-frame bursts still coalesce via the scheduled tick
+    // (single-flight, newest-wins — §9's one-pass-per-frame cap is preserved).
+    if (performance.now() - lastEditPass > 12) drainLatch();
+    else scheduleLatch();
+    return;
+  }
+
+  if (msg.type === "tap") {
+    // Renderer-as-editor tap routing (the Android onTapParagraph analog, all
+    // in the worker where the state lives): a tap INSIDE the open paragraph
+    // moves the caret; anywhere else commits, then the hit paragraph is
+    // SELECTED (not opened — select-then-act). Tapping the already-selected
+    // paragraph a second time is the shortcut into editing.
+    if (!doc) return;
+    if (editor && msg.page === editPage && editParaBounds &&
+        msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
+        msg.yPt >= editParaBounds[1] && msg.yPt <= editParaBounds[3]) {
+      const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+      postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+      return;
+    }
+    if (editor) commitEditor();   // tap outside / another paragraph: commit first
+    const hit = hitParagraph(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
+    if (!hit) { clearSelection(); return; }   // empty space: just deselect
+    const again = selectedPara &&
+      selectedPara.page === msg.page && selectedPara.index === hit.index;
+    clearSelection();
+    if (again) {
+      openEditorAt(msg.page, msg.xPt, msg.yPt, -1);   // re-groups only if the gate demands
+    } else {
+      selectPara(msg.page, hit, msg.xPt, msg.yPt);
+      // Warm the core's one-slot grouping in the background so the Edit /
+      // Delete that usually follows a select doesn't pay the re-group.
+      if (coreGroupedPage !== msg.page || !coreGroupFresh) requestGroupJob(msg.page);
+    }
+    return;
+  }
+
+  if (msg.type === "openSelected") {
+    // The shell's Edit action: open the selected paragraph, caret at the point
+    // it was selected at. Re-resolved from a fresh grouping (the index may have
+    // shifted since selection) — same routing a tap takes.
+    if (!doc || !selectedPara) return;
+    const { page, xPt, yPt } = selectedPara;
+    clearSelection();
+    if (editor) commitEditor();
+    openEditorAt(page, xPt, yPt, -1);
+    return;
+  }
+
+  if (msg.type === "deleteSelected") {
+    if (!doc || !selectedPara) return;
+    const { page, xPt, yPt } = selectedPara;
+    clearSelection();
+    deleteParagraphAt(page, xPt, yPt);
+    return;
+  }
+
+  if (msg.type === "deselect") {
+    clearSelection();
+    return;
+  }
+
+  // Undo/redo take NO arguments: the core knows which page each step belongs
+  // to, and a shell that passed one could pass a stale one.
+  if (msg.type === "undo") { applyHistory("undo"); return; }
+  if (msg.type === "redo") { applyHistory("redo"); return; }
+  if (msg.type === "history") { postHistory(true); return; }
+
+  // DIAGNOSTIC: the whole journal, for a host debug panel. Read straight from
+  // the core (pdfe_history_describe) — never a mirror kept here, because a
+  // mirror shows what THIS FILE believes was recorded, which is exactly the
+  // wrong answer when the two disagree. Pull-only: nothing computes it per
+  // keystroke, so a closed panel costs nothing.
+  if (msg.type === "historyDump") {
+    if (!doc) { postMessage({ type: "historyDump", dump: null }); return; }
+    // Two-call sizing: ask for the length, then read it (the JSON grows with
+    // the stacks, so no fixed buffer can be right).
+    const need = F.historyDescribe(doc, 0, 0);
+    let dump = null;
+    if (need > 0) {
+      const buf = mod._malloc(need + 1);
+      F.historyDescribe(doc, buf, need + 1);
+      const json = new TextDecoder().decode(new Uint8Array(mod.HEAPU8.buffer, buf, need));
+      mod._free(buf);
+      try { dump = JSON.parse(json); } catch (e) { dump = { parseError: String(e) }; }
+    }
+    postMessage({ type: "historyDump", dump });
+    return;
+  }
+
+  // How far the selected box may be dragged and still land on the page, so the
+  // SDK's ghost stops where the drop will. Asked once when a drag is promoted —
+  // it is a pure function of the box and the page, so it cannot change mid-drag,
+  // and the core clamps the real move regardless of what the preview showed.
+  if (msg.type === "moveLimits") {
+    if (!doc || !selectedPara) { postMessage({ type: "moveLimits", limits: null }); return; }
+    const page = selectedPara.page;
+    ensureCoreGroup(page);
+    const hit = hitParagraph(page, selectedPara.xPt, selectedPara.yPt);
+    if (!hit) { postMessage({ type: "moveLimits", limits: null }); return; }
+    const lp = mod._malloc(16);
+    const ok = F.blockMoveLimits(doc, acquirePage(page), hit.blockIndex, lp);
+    const limits = ok ? readF32(lp, 4) : null;
+    mod._free(lp);
+    postMessage({ type: "moveLimits", limits });
+    return;
+  }
+
+  // EXPERIMENTAL (feature/web-block-move): drag the selected box to a new spot.
+  // Driven off the SELECTION, like Edit and Delete, so the worker stays the only
+  // thing that decides which block an action applies to.
+  if (msg.type === "moveSelected") {
+    if (!doc || !selectedPara) return;
+    const { page, xPt, yPt } = selectedPara;
+    moveBlockAt(page, xPt, yPt, Number(msg.dx) || 0, Number(msg.dy) || 0);
+    return;
+  }
+
+  if (msg.type === "toggleLineMode") {
+    // Commit the open paragraph and reopen it in the OTHER line mode, forced
+    // past the core heuristic (the Android btnLineMode analog). The paragraph
+    // is re-resolved by hit-testing its own box center against the fresh
+    // grouping commitEditor left behind.
+    if (!editor || !editParaBounds) return;
+    const page = editPage;
+    const cx = (editParaBounds[0] + editParaBounds[2]) / 2;
+    const cy = (editParaBounds[1] + editParaBounds[3]) / 2;
+    const forced = F.editLineMode(editor) === 1 ? 0 : 1;
+    commitEditor();
+    openEditorAt(page, cx, cy, forced);
+    return;
+  }
+
+  if (msg.type === "groups") {
+    // Faint paragraph boxes (the Android edit-mode overlay): hand back every
+    // paragraph's union bounds. A cached page answers immediately (scrolling
+    // back to a page costs nothing); a fresh page becomes a LOW-priority latch
+    // job, because grouping a dense page runs 100-250 ms and must never sit in
+    // front of paints, tiles, or a tap.
+    if (!doc) return;
+    const cached = groupCache.get(msg.page);
+    if (cached) { postMessage({ type: "groups", page: msg.page, blocks: cached }); return; }
+    requestGroupJob(msg.page);
+    return;
+  }
+
+  if (msg.type === "selectWord") {
+    // Long-press word selection (the Android onSelectWord analog): boundary at
+    // the pressed point, expanded to the containing non-whitespace run. The
+    // boundary map clamps to the open run, so selection can never leave it
+    // (the SEL6 invariant holds by construction).
+    if (!editor || msg.page !== editPage) return;
+    const text = readEditorText();
+    let idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    idx = Math.max(0, Math.min(idx, text.length));
+    const isWord = (c) => c !== undefined && !/\s/.test(c);
+    // A boundary can sit just past the pressed word's last char — step back
+    // one when the left neighbour is a word char but the right isn't.
+    if (!isWord(text[idx]) && isWord(text[idx - 1])) idx--;
+    if (!isWord(text[idx])) {   // pressed whitespace: just move the caret
+      postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+      return;
+    }
+    let ws = idx, we = idx + 1;
+    while (ws > 0 && isWord(text[ws - 1])) ws--;
+    while (we < text.length && isWord(text[we])) we++;
+    postMessage({
+      type: "selectionChanged", start: ws, end: we,
+      rects: readSelectionRects(ws, we),
+      h0: readCaret(ws), h1: readCaret(we),
+    });
+    return;
+  }
+
+  if (msg.type === "selectRange") {
+    // Select an explicit char range — the index-based sibling of selectWord, and
+    // what Ctrl/Cmd+A drives with (0, length). Same reply, so the shell needs no
+    // new case; a collapsed range degrades to a caret move.
+    if (!editor) return;
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start, len));
+    const e = Math.max(s, Math.min(msg.end, len));
+    if (e <= s) {
+      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      return;
+    }
+    postMessage({
+      type: "selectionChanged", start: s, end: e,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  if (msg.type === "dragCaret") {
+    // The caret thumb: move the COLLAPSED caret to the dragged point. Same
+    // boundary map as tap/drag (so it can never leave the open run), but it must
+    // never take the `tap` path — tap commits the run when the point lands
+    // outside its bounds, which a fingertip mid-drag will do.
+    if (!editor || msg.page !== editPage) return;
+    const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    return;
+  }
+
+  if (msg.type === "dragSelect") {
+    // Mouse/touch drag selection: anchor = the press point, head = the drag
+    // point, both mapped through the boundary map (clamped to the run, so the
+    // SEL6 invariant holds here too). Collapsing back to the anchor becomes a
+    // plain caret move.
+    if (!editor || msg.page !== editPage) return;
+    const a = F.editBoundary(editor, msg.ax, msg.ay);
+    const b = F.editBoundary(editor, msg.xPt, msg.yPt);
+    const s = Math.min(a, b), e = Math.max(a, b);
+    if (e <= s) {
+      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      return;
+    }
+    postMessage({
+      type: "selectionChanged", start: s, end: e, headAtStart: b < a,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  if (msg.type === "caretLine") {
+    // ArrowUp/Down: move one VISUAL line using core geometry — the 1×1 sink
+    // textarea wraps at every char, so its native up/down degenerates to
+    // left/right. Take the caret's x, step one line height up/down (PDF y
+    // grows upward), and let the wrap map's boundaryAt pick the char. Past
+    // the first/last line it lands back on the same line — a harmless no-op.
+    // With |edge| (Home/End — same degenerate-sink problem) stay ON the
+    // caret's line (mid-line y) and clamp an extreme x to its first/last
+    // boundary instead.
+    // With |extend| (Shift held) the moved index is the selection HEAD and
+    // |anchor| stays fixed — vertical selection extension by the PDF wrap.
+    if (!editor) return;
+    const c = readCaret(msg.index);   // [x, topPt, botPt], topPt > botPt
+    if (!c) return;
+    let x, y;
+    if (msg.edge) {
+      x = msg.edge < 0 ? -1e6 : 1e6;
+      y = (c[1] + c[2]) / 2;
+    } else {
+      const h = Math.max(2, c[1] - c[2]);
+      x = c[0];
+      y = msg.dir < 0 ? c[1] + 0.7 * h : c[2] - 0.7 * h;
+    }
+    let idx = F.editBoundary(editor, x, y);
+    if (msg.edge > 0) {
+      // The line-end boundary IS the wrap point, and the wrap point's caret
+      // renders at the NEXT line's start — step back while the caret still
+      // draws below the starting line so End visually stays on its own line.
+      const h = Math.max(2, c[1] - c[2]);
+      while (idx > msg.index) {
+        const cc = readCaret(idx);
+        if (cc && cc[2] < c[2] - 0.5 * h) idx--;
+        else break;
+      }
+    }
+    if (msg.extend) {
+      const s = Math.min(msg.anchor, idx), e = Math.max(msg.anchor, idx);
+      if (e > s) {
+        postMessage({
+          type: "selectionChanged", start: s, end: e, headAtStart: idx < msg.anchor,
+          rects: readSelectionRects(s, e),
+          h0: readCaret(s), h1: readCaret(e),
+        });
+        return;
+      }
+    }
+    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    return;
+  }
+
+  if (msg.type === "dragHandle") {
+    // Selection handle drag: map the dragged point to a char boundary and move
+    // ONE end, never flipping past the other (start stays < end — SEL4).
+    if (!editor) return;
+    const len = readEditorText().length;
+    let s = msg.start, e = msg.end;
+    const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
+    if (msg.which === 0) s = Math.max(0, Math.min(idx, e - 1));
+    else e = Math.min(len, Math.max(idx, s + 1));
+    postMessage({
+      type: "selectionChanged", start: s, end: e, headAtStart: msg.which === 0,
+      rects: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  if (msg.type === "commit") {
+    commitEditor();
+    return;
+  }
+
+  if (msg.type === "save") {
+    await saveDocument(!!msg.forceInHeap);
+    return;
+  }
+
+  if (msg.type === "reapStaging") {
+    // Delivery finished reading the staged file (§6): drop it so OPFS quota
+    // doesn't carry a copy of the last save around.
+    try {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry(SAVE_STAGING);
+    } catch (e) { /* nothing staged, or already gone */ }
+    return;
+  }
+};

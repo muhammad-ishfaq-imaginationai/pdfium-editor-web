@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-049b70d";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-5d31421";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js

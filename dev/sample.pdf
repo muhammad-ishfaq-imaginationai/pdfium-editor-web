@@ -1,0 +1,59 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1776 >>
+stream
+BT /F2 20 Tf 1 0 0 1 64 750 Tm (PDF Text Editor) Tj ET
+BT /F1 10 Tf 1 0 0 1 64 724 Tm (Built On C, Speed like Jahaz) Tj ET
+BT /F2 13 Tf 1 0 0 1 64 688 Tm (What this page is) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 667 Tm (This is a sample document generated for the editor demo. Every line you) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 641 Tm (see is real text in the PDF's own text layer, not a picture of text and) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 615 Tm (not an overlay drawn on top. Turn on Edit, tap a paragraph, and type.) Tj ET
+BT /F2 13 Tf 1 0 0 1 64 578 Tm (Try these) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 557 Tm (?   Edit this paragraph and watch the lines below it reflow to fit.) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 531 Tm (?   Edit a heading instead. Headings keep their line, they do not reflow.) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 505 Tm (?   Select a word, then delete it. The spacing closes up as it should.) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 479 Tm (?   Press Save. What downloads is a real PDF with your edits in its text.) Tj ET
+BT /F2 13 Tf 1 0 0 1 64 442 Tm (Why it works this way) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 421 Tm (Most PDF tools cannot change existing text, so they draw a box over it and) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 395 Tm (hope you never open the file anywhere else. This editor rewrites the text) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 369 Tm (objects themselves, then re-renders with the same engine that wrote them,) Tj ET
+BT /F1 11 Tf 1 0 0 1 64 343 Tm (so what you see while editing is what ends up in the saved file.) Tj ET
+BT /F1 9 Tf 1 0 0 1 64 302 Tm (Engine       PDFium, compiled to WebAssembly) Tj ET
+BT /F1 9 Tf 1 0 0 1 64 280 Tm (Editing      one C++ core, shared by web, Android and iOS) Tj ET
+BT /F1 9 Tf 1 0 0 1 64 258 Tm (Sample       our own content, free to redistribute) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+7 0 obj
+<< /Title (PDF Text Editor sample) /Producer (pdfium-editor demo sample generator) >>
+endobj
+xref
+0 8
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000257 00000 n 
+0000002084 00000 n 
+0000002181 00000 n 
+0000002283 00000 n 
+trailer
+<< /Size 8 /Root 1 0 R /Info 7 0 R >>
+startxref
+2384
+%%EOF

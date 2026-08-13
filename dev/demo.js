@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-7c60ed0";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-1c4eee6";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -53,6 +53,10 @@ const setHint = (mode, text) => {
 // ?v=<anything new> (e.g. the time) to be certain you are testing your build.
 const params = new URLSearchParams(location.search);
 const forcedTier = Number(params.get("tier")) || 0;
+// ?pdf=<url> — DEV ONLY: open a specific document instead of the built-in sample,
+// so a test link can point straight at the file a bug was reported on. The dev
+// server serves the repo root, so ?pdf=../wasm/testdata/cvtemplate.pdf works.
+const forcedPdf = params.get("pdf");
 const blockKB = Number(params.get("block")) || 0;
 const forceInHeap = params.has("noopfs");
 // In the DEV tree the stamp is the literal "dev" (build_site.sh replaces it for
@@ -69,15 +73,39 @@ if (version !== stamped) $("appver").textContent = version;
 // This page is the public tester site, so it opens as exactly what a consumer
 // gets. The constant is the whole truth at load time — there is no UI to change
 // it and nothing is remembered per browser, so every load is identical.
-// Parity-gate rule 6 fails the release if this stops being `false`.
-const BLOCK_MOVE_DEFAULT = false;
+// BOX MOVING IS ON HERE, AND ONLY HERE (user directive 2026-08-10: "box moving will
+// be enabled in local host demo").
+//
+// This page is a DEVELOPER host: it is served raw from `web/` by dev_server.py on
+// localhost, and deployed as `/dev/` — the site whose banner says UNRELEASED. It stopped
+// being the tester site on 2026-08-07, when the release demo moved to
+// `examples/react-demo`, which is built by INSTALLING the published package
+// (docs/DEMO_SITES.md). Testers use THAT site. Nobody reaches this one by accident.
+//
+// ⚠️ THIS IS NOT THE CONSUMER DEFAULT, and turning it on here does not move it.
+// The promise in CONSUMER_CONTRACT.md §2bis is that the PACKAGE defaults box moving
+// off, which is `this._blockMove = !!opts.blockMove` in the SDK — absent means off.
+// A host switching it on is exactly the opt-in that promise describes, the same way a
+// consuming product may switch it on. The release demo passes no such option, so it
+// stays off there; whether it ever should is the user's call at release time, and is
+// deliberately still open.
+//
+// Parity-gate rule 6 still enforces the real promise on the SDK and on Android; it no
+// longer asserts against this file, and says why. Do NOT re-add an assertion here —
+// it would be guarding a page no consumer can see.
+const BLOCK_MOVE_DEFAULT = true;
+
+// ?move=0 turns it back OFF for a single load, so the shipped default can still be
+// observed from this page without editing it. (This is the inverse of the old
+// ?move=1 opt-in, which existed while the default was off.)
+const blockMoveOn = params.get("move") === "0" ? false : BLOCK_MOVE_DEFAULT;
 
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
-  blockMove: BLOCK_MOVE_DEFAULT,
+  blockMove: blockMoveOn,
 });
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
@@ -177,7 +205,7 @@ editor.on("ready", (caps) => {
   setStatus("engine ready — loading corpus PDF…");
   // The published site ships no sample (build_site.sh), so this normally fails
   // there and the empty state takes over — that is the intended first screen.
-  openDocument(SAMPLE_PDF).catch(() => {
+  openDocument(forcedPdf || SAMPLE_PDF).catch(() => {
     setStage("empty");
     setStatus("engine ready");
   });
@@ -195,6 +223,31 @@ editor.on("opened", (info) => {
 
 // Unsaved-changes dot on the Save button.
 editor.on("dirty", ({ dirty }) => { $("save").classList.toggle("dirty", dirty); });
+
+// ---- undo / redo (dev testing of true text undo, 2026-08-05) ---------------
+// The history lives in the ENGINE (docs/UNDO_REDO.md), so the button state is
+// MIRRORED from it and never computed here — the host cannot know what is
+// undoable. Ctrl+Z / Ctrl+Y are bound by the editor itself (undoShortcuts:
+// "auto"); these buttons are the same two calls for a tester with a trackpad.
+$("undo").addEventListener("click", () => editor.undo());
+$("redo").addEventListener("click", () => editor.redo());
+editor.on("history", (h) => {
+  $("undo").disabled = !h.canUndo;
+  $("redo").disabled = !h.canRedo;
+  $("undo").title = h.canUndo ? `undo (Ctrl+Z) — page ${h.undoPage + 1}` : "nothing to undo";
+  $("redo").title = h.canRedo ? `redo (Ctrl+Y) — page ${h.redoPage + 1}` : "nothing to redo";
+});
+// Every step LEAVES the editing box by design (a step is a document-level action,
+// not something that happens under the caret), so say what happened: the box comes
+// back selected and the user taps to type again.
+// The SDK emits the STEP KIND ("undo" / "redo"), not a generic event.
+for (const kind of ["undo", "redo"]) {
+  editor.on(kind, (r) => {
+    setStatus(r.ok
+      ? `${kind} applied on page ${r.page + 1} — the box is selected again, tap to type`
+      : `nothing left to ${kind} here`);
+  });
+}
 
 function describeLoad(info) {
   const mb = (info.bytes / (1024 * 1024)).toFixed(1);
@@ -263,7 +316,82 @@ editor.on("editmode", ({ editMode }) => {
   setHint(editMode ? "Edit" : "View", editMode
     ? "Edit mode — tap a paragraph to select it, then Edit or Delete"
     : "View mode — press Edit to enable editing");
+  $("colorbox").hidden = !editMode;
 });
+
+// ---- text colour (HOST chrome) ---------------------------------------------
+// The SDK owns no palette: it takes any 0xAARRGGBB (or a hex string) and reports
+// what the engine finds. Everything here — the control, and what "mixed" looks
+// like — is ours.
+const colorInput = $("textcolor"), colorMixed = $("colormixed");
+const hex2 = (n) => n.toString(16).padStart(2, "0");
+
+// Paint the swatch from the ENGINE's answer. A NULL colorArgb means the selection
+// spans more than one colour, and <input type="color"> cannot render indeterminate
+// — hence the separate "mixed" chip rather than a lie in the swatch.
+function showTextStyle(style) {
+  const argb = style && style.colorArgb;
+  colorMixed.hidden = !(style && style.colorArgb === null);
+  if (argb == null) return;
+  colorInput.value =
+    "#" + hex2((argb >>> 16) & 0xff) + hex2((argb >>> 8) & 0xff) + hex2(argb & 0xff);
+}
+
+// LIVE while the user drags inside the picker (user requirement 2026-08-11: "it must
+// reflect live on the selected text"), so `input` — which fires continuously — not
+// just `change`, which only fires when the picker closes.
+//
+// Two things make that safe, and both are needed:
+//   * the CORE coalesces consecutive style applies to the same range into ONE undo
+//     step, so a whole drag is a single Ctrl+Z (undo.cpp, pdfeUndoRecordStyle);
+//   * this throttle keeps us off the every-frame path — each apply is a real
+//     split/coalesce/rebuild/re-render, and the picker can fire far faster than that
+//     is worth doing. A trailing call guarantees the LAST colour always lands, which
+//     is the one the user actually chose.
+let colorPending = null, colorTimer = 0;
+const COLOR_THROTTLE_MS = 60;
+function applyColorThrottled(value) {
+  colorPending = value;
+  if (colorTimer) return;
+  const fire = () => {
+    colorTimer = 0;
+    if (colorPending === null) return;
+    const v = colorPending;
+    colorPending = null;
+    editor.applyTextColor(v);
+    colorTimer = setTimeout(fire, COLOR_THROTTLE_MS);   // trailing edge
+  };
+  fire();
+}
+colorInput.addEventListener("input", (ev) => applyColorThrottled(ev.target.value));
+// The authoritative final value when the picker closes — the throttle may have
+// dropped the last `input`, and this is the colour the user committed to.
+colorInput.addEventListener("change", (ev) => editor.applyTextColor(ev.target.value));
+
+// The cursor moved or the range changed — the engine reports the colour there, and
+// per the agreed UX the swatch follows the cursor. The SDK owns the override's
+// LIFETIME (drop on a real cursor move, keep on a click back to the same index
+// after a pick — docs/STYLING.md §2); a host that also called clearTypingColor()
+// here would defeat that same-index rule, which is exactly what this handler did
+// until 2026-08-13. Hosts only paint.
+editor.on("selection", ({ start, end, style }) => {
+  showTextStyle(style);
+});
+editor.on("styled", ({ what, style, following }) => {
+  showTextStyle(style);
+  if (what === "color") setHint("Typing", "Colour applied — Ctrl+Z undoes it");
+  // The cursor moved to text of a different colour: the swatch follows it, so the
+  // user sees what the next character will be before typing it. `following` is
+  // false when the host asked for a sticky picked colour instead.
+  if (what === "caret" && following && style && style.colorArgb != null) {
+    setHint("Typing", "Cursor moved — the swatch now shows the colour here");
+  }
+});
+// A freshly opened run reports the style AT ITS CARET by itself (a `styled`
+// event with what:"caret"), so there is nothing to ask for here. This used to
+// call requestTextStyle(0, 0) — the style at the START of the run — which showed
+// the first word's colour no matter where the user actually put the cursor.
+editor.on("editclose", () => { colorMixed.hidden = true; });
 
 // Select-then-act: the SDK draws the selected box and its Edit/Delete bar; the
 // host only reports it (and could drive the same actions from its own chrome).
@@ -320,10 +448,11 @@ editor.on("page", ({ page, pageCount }) => {
 });
 
 function goToTypedPage() {
-  // Finish any open run before leaving it behind: a jump deliberately does not
-  // commit (that is a host decision, like save), and the next keystroke would
-  // scroll the caret — and the view — right back to it. No-op if nothing is open.
-  editor.commit();
+  // Leave the open run before jumping away from it: the SDK deliberately does
+  // not do it for a page jump (that is a host decision), and the next keystroke
+  // would scroll the caret — and the view — right back to it. This also drops
+  // the keyboard, which matters on a phone. No-op if nothing is open.
+  editor.getOutOfBoxEditing();
   // The input is 1-based (what the user reads); the SDK is 0-based.
   const ok = editor.goToPage(Number(pageNum.value) - 1);
   pageNum.classList.toggle("bad", !ok);

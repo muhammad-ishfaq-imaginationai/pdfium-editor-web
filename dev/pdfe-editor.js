@@ -160,6 +160,29 @@ export class PdfeError extends Error {
   }
 }
 
+/**
+ * A colour to packed 0xAARRGGBB, or null if it cannot be parsed.
+ *
+ * Accepts a NUMBER (already packed — passed straight through, so a host can hand us
+ * exactly what it stores) or a CSS-ish hex string: #rgb, #rrggbb, #rrggbbaa. A
+ * string without alpha becomes OPAQUE, because <input type="color"> yields #rrggbb
+ * and a user picking a colour there means a visible one.
+ *
+ * Deliberately NOT a full CSS colour parser: named colours and rgb()/hsl() would
+ * need a canvas round-trip, and the palette is the host's business (it can convert).
+ */
+function parseArgb(color) {
+  if (typeof color === "number" && Number.isFinite(color)) return color >>> 0;
+  if (typeof color !== "string") return null;
+  let h = color.trim().replace(/^#/, "");
+  if (/^[0-9a-f]{3}$/i.test(h)) h = h.split("").map((c) => c + c).join("");
+  if (/^[0-9a-f]{6}$/i.test(h)) h = "ff" + h;              // no alpha => opaque
+  else if (/^[0-9a-f]{8}$/i.test(h)) h = h.slice(6) + h.slice(0, 6);  // rrggbbaa -> aarrggbb
+  else return null;
+  const n = parseInt(h, 16);
+  return Number.isNaN(n) ? null : (n >>> 0);
+}
+
 function percentile(arr, p) {
   if (!arr.length) return 0;
   const s = [...arr].sort((a, b) => a - b);
@@ -210,10 +233,20 @@ export class PdfeEditor {
     this._backgroundColor = opts.backgroundColor || PDFE_DEFAULT_BG;
     // BLOCK MOVE (dragging a box to a new position) is EXPERIMENTAL and therefore
     // OFF unless a host opts in — user decision 2026-08-04, shipping it in 1.7.3.
-    // Off means the gesture is not armed AND moveSelection() is a no-op, so a
-    // product that hits trouble with it can be switched back to the previous
-    // behaviour with one flag and no redeploy of this SDK (docs/BLOCK_MOVE.md).
-    this._blockMove = !!opts.blockMove;
+    // DEFAULT ON since 2026-08-12 (user directive: box moving is no longer
+    // experimental and ships in the next release). Off means the gesture is not
+    // armed AND moveSelection() is a no-op, so a product that hits trouble with
+    // it can still be switched back with one flag and no redeploy of this SDK
+    // (docs/BLOCK_MOVE.md).
+    this._blockMove = opts.blockMove ?? true;
+
+    // How long a picked typing colour lives (docs/STYLING.md §2). DEFAULT ON:
+    // the colour lasts until the user moves the cursor, then the caret's own
+    // colour takes over — what every word processor does, and what the core's
+    // contract was written for. OFF keeps the pick sticky until the host clears
+    // it, which is the behaviour a form-filling host wants when every field it
+    // types into must come out one colour regardless of what was there.
+    this._typingColorFollowsCaret = opts.typingColorFollowsCaret ?? true;
 
     // ---- document/view state --------------------------------------------------
     this._pages = [];            // [{w,h}] PDF points
@@ -251,12 +284,23 @@ export class PdfeEditor {
     // Mirror of the ENGINE's history state. Never computed here: canUndo is
     // whatever the core says, so a stale local flag can never grey the wrong
     // button (docs/UNDO_REDO.md §1 S1).
-    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
+    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1,
+                      recording: false };
+    // Set when the engine TRUNCATED the undo stack (PDFE_UNDO_UNAVAILABLE): the
+    // document is still modified but the stack no longer proves it, so from here
+    // on only a save or a fresh document may clear the flag. Without this, the
+    // one path that empties the stack without reverting anything would report a
+    // modified document as saved — and a host that gates its "discard changes?"
+    // prompt on `dirty` would throw the edits away.
+    this._dirtyUntracked = false;
     this._lastCaretGeom = null;
     this._lastEditBounds = null;      // [l,b,r,t] live bounds of the open run
     this._lastSelection = [];
     this._lastHandles = [null, null];
     this._selRange = null;
+    // The engine's last style report for the character selection. A NULL FIELD
+    // means MIXED; null overall means unknown/no run.
+    this._textStyle = null;
     this._editGeneration = 0;
     this._composing = false;
     // The caret thumb is TOUCH-ONLY (a permanent grip under a mouse caret is
@@ -352,9 +396,11 @@ export class PdfeEditor {
     this._docName = opts.name || blob.name || "document.pdf";
     this._docBytes = blob.size;
     this._dirty = false;
+    this._dirtyUntracked = false;
     this._painted = new Set();
     this._selected = null;
-    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
+    this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1,
+                      recording: false };
     this._closeEditUiState();
     const p = this._promiseFor("open");
     this._post({ type: "open", blob, tier: opts.tier || 0, blockKB: opts.blockKB || 0,
@@ -376,6 +422,21 @@ export class PdfeEditor {
    * The SDK deliberately shows no dialog of its own.
    */
   async save(opts = {}) {
+    // SAVING IMPLIES LEAVING THE BOX — one host call, not two (user directive
+    // 2026-08-12), and the same order Android has always used (`afterCommit`).
+    // The worker commits the run inside saveDocument() either way, so this is
+    // not about losing text; it is about the UI: without it the box stayed open
+    // and the KEYBOARD stayed up over the save sheet / download on iOS and
+    // Android. Done here rather than in the worker because the sink and the
+    // overlays live on this side.
+    //
+    // FIRST STATEMENT, BEFORE EVERY `await`: this must run inside the host's
+    // click handler, synchronously. Behind an await it lands a microtask later,
+    // outside the user gesture — the same constraint that forces editSelection()
+    // to focus synchronously to raise a keyboard at all (S39), read the other way
+    // round. It is also why this sits before the no-document check: leaving the
+    // box is right even when the save then rejects.
+    this.getOutOfBoxEditing();
     await this._readyPromise;
     if (!this._pages.length) throw new PdfeError("no-document", "nothing open to save");
     const forceInHeap = this._simulateNoOpfs || !!opts.forceInHeap;
@@ -417,7 +478,8 @@ export class PdfeEditor {
     if (on) {
       this._sweepVisible();
     } else {
-      if (this._editingPage >= 0) this._post({ type: "commit" });
+      // Turning edit mode off is leaving box editing, keyboard included.
+      this.getOutOfBoxEditing();
       this._post({ type: "deselect" });
       this._selected = null;
       this._pageGroups.clear();
@@ -428,8 +490,33 @@ export class PdfeEditor {
   }
   toggleEditMode() { this.setEditMode(!this._editMode); }
 
-  /** Commit the open run (the tap-outside/Done gesture, for host buttons). */
-  commit() { if (this._editingPage >= 0) this._post({ type: "commit" }); }
+  /**
+   * LEAVE BOX EDITING — the programmatic form of tapping outside the box, and
+   * what a host should call when its own chrome needs the user out of a run
+   * (a Done button, a route change, opening a dialog, before a save).
+   *
+   * Keeps the typing: the run is committed into the document, never discarded.
+   *
+   * AND DROPS THE KEYBOARD, which is the half a host cannot do itself: the
+   * typing target is our internal sink, so only we can blur it. Without this the
+   * box closed while the on-screen keyboard stayed up over whatever the host
+   * showed next — visible on Android and iOS, invisible on desktop, which is
+   * why it survived so long. Android's SDK has always hidden the IME here
+   * (`hideEditBox`); this is web/iOS catching up.
+   *
+   * Safe to call when nothing is open — then it does nothing at all.
+   */
+  getOutOfBoxEditing() {
+    if (this._editingPage >= 0) this._post({ type: "commit" });
+    this._setSinkFocus(false);
+  }
+
+  /**
+   * The original name for {@link getOutOfBoxEditing}, kept forever: hosts ship
+   * against it and removing a public method is a MAJOR break
+   * (docs/CONSUMER_CONTRACT.md). Identical behaviour, including the keyboard.
+   */
+  commit() { this.getOutOfBoxEditing(); }
 
   /**
    * The paragraph the user has SELECTED (first tap in edit mode) — the state
@@ -493,6 +580,99 @@ export class PdfeEditor {
     if (!this._blockMove) this._hideMoveGhost();
     return this._blockMove;
   }
+
+  // ---- character-level styling: colour ------------------------------------
+  // The PALETTE IS THE HOST'S BUSINESS (user directive 2026-08-10: "its on client
+  // side, how many color they want to use. they will pass selected color to our
+  // sdk"). This SDK owns no colour identity, no swatch list and no naming — it
+  // takes any 32-bit value and reports what the engine finds.
+
+  /**
+   * Apply a colour to the character selection in the open run, AND make it the
+   * colour of newly typed characters. No-op when no run is open. With a bare caret
+   * it sets only the typing colour, which is a real capability, not a failure.
+   *
+   * `color`: 0xAARRGGBB, or "#rgb" / "#rrggbb" / "#rrggbbaa".
+   */
+  applyTextColor(color) {
+    if (this._editingPage < 0) return;
+    const argb = parseArgb(color);
+    if (argb === null) {
+      this._emit("error", { code: "color-failed", detail: `unparseable colour: ${color}` });
+      return;
+    }
+    // Styling the selection IS an interaction with the editor, so the next
+    // Ctrl+Z belongs to us — even though the gesture's pointerdown landed on
+    // the host's colour control and released the ownership latch. Ownership
+    // only; deliberately NO sink.focus(): a native picker popup may still be
+    // open (live drag), and on iOS a focus() here would pop the keyboard
+    // mid-pick (the S39 rule).
+    this._ownsKeyboard = true;
+    // THE SINK IS THE AUTHORITY for the range, not this._selRange: Shift+arrow moves
+    // the sink's own selection before the worker has replied. Same rule Android
+    // follows by re-reading its IME sink live.
+    const s = this.sink.selectionStart, e = this.sink.selectionEnd;
+    // Typing colour first, so it is armed even if there is no range to paint.
+    // A COLLAPSED pick carries the caret index it was armed at (`at`): picking
+    // in a host control steals focus, and the user's click back to that SAME
+    // index must keep the pick instead of dropping it (the worker's
+    // postCaretMoved owns that rule — docs/STYLING.md §2). A range apply sends
+    // no index: the painted text needs no revival.
+    this._post({ type: "setTypingColor", argb, set: 1, at: e > s ? -1 : s });
+    if (e > s) this._post({ type: "applyColor", argb, start: s, end: e });
+  }
+
+  /**
+   * Drop the typing-colour override, back to inheriting from the character on the
+   * left. THE SHELL CALLS THIS ON AN EXPLICIT CURSOR MOVE — a tap, an arrow key, a
+   * handle drag — and never on typing. The core cannot make that distinction (both
+   * arrive as a new caret), which is why the lifetime lives here.
+   */
+  clearTypingColor() {
+    if (this._editingPage < 0) return;
+    this._post({ type: "setTypingColor", argb: 0, set: 0 });
+  }
+
+  /**
+   * Choose how long a picked typing colour lives — both behaviours are supported
+   * and this switches between them at runtime (docs/STYLING.md §2):
+   *
+   * - `true` (default): the pick applies to what you type next, and is DROPPED
+   *   the moment the user moves the cursor — the caret's own colour takes over
+   *   and a `styled` event with `what: "caret"` tells you what it now is, so
+   *   your swatch can follow. What a word processor does.
+   * - `false`: the pick is STICKY until `clearTypingColor()`, so everything typed
+   *   in this session comes out that colour wherever the cursor goes. What a
+   *   form-filling host wants.
+   *
+   * The caret's colour is still reported either way — only the override's
+   * lifetime changes — so a host can show it without adopting the behaviour.
+   */
+  setTypingColorFollowsCaret(on) {
+    this._typingColorFollowsCaret = !!on;
+    this._post({ type: "setTypingColorFollowsCaret", on: this._typingColorFollowsCaret });
+    return this._typingColorFollowsCaret;
+  }
+  /** Whether a picked typing colour is dropped when the cursor moves. */
+  get typingColorFollowsCaret() { return this._typingColorFollowsCaret; }
+
+  /** Ask the engine for the style at a caret or over a range; answered by `styled`. */
+  requestTextStyle(start, end) {
+    if (this._editingPage < 0) return;
+    this._post({ type: "styleAt", start: start | 0, end: (end == null ? start : end) | 0 });
+  }
+
+  /** The character range selected inside the open run, or null (no run / bare caret).
+   *  Read LIVE from the sink, so it is always exact. Prefer the `selection` event. */
+  get textSelection() {
+    if (this._editingPage < 0) return null;
+    const s = this.sink.selectionStart, e = this.sink.selectionEnd;
+    return e > s ? { start: s, end: e } : null;
+  }
+
+  /** The ENGINE's last report for that range. A NULL FIELD MEANS MIXED — show a
+   *  blank control, never a guess. Cached from the last event; prefer `selection`. */
+  get textStyle() { return this._textStyle || null; }
 
   // ---- undo / redo --------------------------------------------------------
   // The history lives in the ENGINE, not here (docs/UNDO_REDO.md): every
@@ -659,9 +839,18 @@ export class PdfeEditor {
       if (e.defaultPrevented) return;                  // the sink listener got it
       if (this.undoShortcuts === "container" && !this._ownsKeyboard) return;
       if (!this._ownsKeyboard) return;
-      // Never steal from a real input the host owns outside our container.
+      // Never steal from a real input the host owns outside our container —
+      // where "real" means IT HAS TEXT UNDO TO PROTECT. A colour swatch, range
+      // slider or checkbox cannot hold a caret, so Ctrl+Z aimed at it is aimed
+      // at the DOCUMENT: after picking a colour the browser leaves focus on the
+      // host's <input type=color>, and treating that as a protected input made
+      // undo silently dead until the user happened to click back into the page
+      // (user-reported 2026-08-12; measured — the keydown arrived with
+      // target INPUT:color and defaultPrevented false).
       const t = e.target;
-      if (t && t !== this.sink && !this.container.contains(t) &&
+      const textless = t && t.tagName === "INPUT" &&
+        /^(color|range|checkbox|radio|button|submit|reset|file)$/.test(t.type || "");
+      if (t && t !== this.sink && !this.container.contains(t) && !textless &&
           (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
       this._handleHistoryKey(e);
     });
@@ -856,6 +1045,9 @@ export class PdfeEditor {
       this._emit("error", { code: err.code, detail: err.message });
     };
     this._readyPromise = new Promise((resolve) => { this._resolveReady = resolve; });
+    // The worker owns the caret sites, so it owns the flag. Posted rather than
+    // read from a constructor argument because a host may flip it at runtime.
+    this._post({ type: "setTypingColorFollowsCaret", on: this._typingColorFollowsCaret });
   }
 
   _onWorkerMessage(msg) {
@@ -898,8 +1090,14 @@ export class PdfeEditor {
         this._selected = { page: msg.page, index: msg.index, bounds: msg.bounds,
                            blockIndex: msg.blockIndex ?? -1 };
         this._renderBoxes();
+        // BOUNDS TRAVEL WITH THE EVENT (2026-08-13): a host that hides our
+        // Edit/Delete bar has to place its own, and asking for geometry after
+        // the fact is a round trip that lands a frame late — Android's
+        // onSelectionChanged has carried the rect from the start, so this is
+        // also event parity, not just convenience. PDF points, [l,b,r,t].
         this._emit("select", { selection: { page: msg.page, index: msg.index,
-                                           blockIndex: msg.blockIndex ?? -1 } });
+                                           blockIndex: msg.blockIndex ?? -1,
+                                           bounds: msg.bounds || null } });
         break;
       case "paraDeselected":
         if (!this._selected) break;
@@ -924,7 +1122,25 @@ export class PdfeEditor {
         this._history = {
           canUndo: !!msg.canUndo, canRedo: !!msg.canRedo,
           undoPage: msg.undoPage ?? -1, redoPage: msg.redoPage ?? -1,
+          recording: !!msg.recording,
         };
+        // THE UNDO STACK IS THE AUTHORITY ON "IS THIS DOCUMENT MODIFIED?" — it
+        // is the same set of facts `dirty` was tracking separately, and two
+        // flags for one question drift. They drifted here: undoing every edit
+        // emptied the stack and still left the Save dot lit.
+        //
+        // While recording, a non-empty stack IS "modified" and an empty one IS
+        // "unmodified" — both directions, or REDO leaves a modified document
+        // looking saved (measured: the mutation sites never fire for a step, so
+        // a clear-only rule is one-way and never sets it back).
+        //
+        // The mutation sites still call _setDirty(true) as well, and that is not
+        // redundant: they are synchronous with the keystroke, so the flag can
+        // never lag the engine, and they are what keeps `dirty` working when
+        // recording is off.
+        if (this._history.recording) {
+          this._setDirty(this._history.canUndo || this._dirtyUntracked);
+        }
         this._emit("history", { ...this._history });
         break;
       case "historyDump":
@@ -933,6 +1149,11 @@ export class PdfeEditor {
         break;
       case "historyApplied": {
         if (!msg.ok) {
+          // -3 TRUNCATES the stack (pdfe.h): it empties without reverting
+          // anything, so from now on an empty stack no longer proves the
+          // document is unmodified. Latch, or the next `history` event would
+          // report these very edits as saved.
+          if (msg.code === -3) this._dirtyUntracked = true;
           this._emit("error", new PdfeError(
             msg.error || "history-unavailable",
             msg.code === -3
@@ -977,7 +1198,10 @@ export class PdfeEditor {
         }
         this._renderBoxes();
         if (!msg.blocks) this._requestGroups(msg.page);
-        this._setDirty(true);
+        // Deliberately NOT _setDirty(true): a step is the one mutation whose
+        // direction is unknown here. Undoing the last edit leaves an unmodified
+        // document, so the `history` event that follows decides — setting the
+        // flag here first would light the Save dot for a frame and then clear it.
         this._emit(msg.kind, { page: msg.page, ok: true, live: !!msg.live });
         break;
       }
@@ -1034,10 +1258,30 @@ export class PdfeEditor {
         this._drawHandles(null, null);
         this.scrollCaretIntoView();
         this._emit("editopen", this.editing);
+        // Opening a run places a cursor, so it reports the style there exactly as
+        // a move does — one event for hosts to drive a swatch from, and no reason
+        // for a host to ask separately (asking meant guessing an index, and the
+        // guess was 0: the first word's colour, not the caret's).
+        this._textStyle = msg.style || null;
+        this._emit("styled", {
+          what: "caret", page: msg.page, style: msg.style || null,
+          caretIndex: msg.caretIndex, following: this._typingColorFollowsCaret,
+        });
         break;
       }
       case "caretMoved":
         this.sink.setSelectionRange(msg.index, msg.index);
+        // THE CURSOR MOVED, SO THE STYLE UNDER IT IS THE ONE THAT MATTERS NOW.
+        // Reported on every caret move, whichever lifetime mode is on: a host
+        // must be able to show the colour the next keystroke will take. With
+        // `typingColorFollowsCaret` on, the worker has already dropped any
+        // picked override, so this IS that colour; with it off, the pick still
+        // wins and `following: false` says so.
+        this._textStyle = msg.style || null;
+        this._emit("styled", {
+          what: "caret", page: this._editingPage, style: msg.style || null,
+          caretIndex: msg.index, following: !!msg.following,
+        });
         // I9 belt-and-braces: the reposition path must refocus too, or any
         // focus loss preventDefault didn't cover becomes permanent.
         this.sink.focus({ preventScroll: true });
@@ -1059,7 +1303,44 @@ export class PdfeEditor {
         this._drawCaret(null);
         this._drawSelection(msg.rects || []);
         this._drawHandles(msg.h0, msg.h1);
-        this._emit("selection", { start: msg.start, end: msg.end });
+        this._textStyle = msg.style || null;
+        this._emit("selection", { start: msg.start, end: msg.end, style: msg.style || null });
+        break;
+      case "styleRead":
+        this._textStyle = msg.style || null;
+        this._emit("styled", { what: "read", page: msg.page, style: msg.style || null });
+        break;
+      case "styleApplied":
+        if (!msg.ok) {
+          this._emit("error", { code: "color-failed", page: msg.page,
+                                detail: "the engine refused the colour" });
+          break;
+        }
+        if (msg.runBounds) this._drawEditBox(msg.runBounds);
+        // NO CARET. A style apply only ever happens with a RANGE selected (the
+        // worker returns early on a collapsed one), and a range has no caret —
+        // `selectionChanged` draws none for exactly this reason. Drawing one put a
+        // blinking bar at the START of the run while the selection was still
+        // highlighted mid-run, which read as "the cursor jumped to the beginning".
+        this._drawCaret(null);
+        this._drawSelection(msg.selection || []);
+        if (msg.selEnd > msg.selStart) {
+          // Keep BOTH the range and its handles. An earlier version hid the handles,
+          // on the theory that these 18px circles were covering the recoloured text —
+          // they are bigger than a small word at low zoom, so it looked plausible.
+          // It was wrong: the colour was invisible because the demo listened for
+          // `change`, which the native picker only fires when it CLOSES, and clicking
+          // inside the box is what closed it. Live `input` is the real fix, and the
+          // handles must stay so the selection can still be adjusted.
+          this._selRange = [msg.selStart, msg.selEnd];
+          this._drawHandles(msg.h0, msg.h1);
+        }
+        this._textStyle = msg.style || null;
+        this._setDirty(true);
+        // Deliberately NOT latencySamples and NOT the `edit` event: a style pick is
+        // not a keystroke, and folding it in would pollute the keystroke->blit p95
+        // the demo and the perf gate read.
+        this._emit("styled", { what: msg.what, page: msg.page, style: msg.style || null });
         break;
       case "editApplied": {
         // Keep the blue box on the run as typing reflows/grows it.
@@ -1102,7 +1383,13 @@ export class PdfeEditor {
           this._requestGroups(page);
         }
         this._renderBoxes();
-        if (msg.ok) this._setDirty(true);
+        // `ok` means the COMMIT succeeded, not that anything changed — opening a
+        // box and leaving it without typing commits fine and changed nothing. So
+        // while recording, let the forced `history` post that follows this message
+        // decide (same rule as an undo/redo step); setting it here would light the
+        // Save dot for every box a user merely looked inside, and only a blink of
+        // it even once the stack corrected the flag.
+        if (msg.ok && !this._history.recording) this._setDirty(true);
         this._emit("editclose", { page, ok: !!msg.ok });
         break;
       }
@@ -1124,6 +1411,7 @@ export class PdfeEditor {
       case "saved": {
         this._closeEditUiState();
         this._renderBoxes();
+        this._dirtyUntracked = false;   // saved bytes match the document again
         this._setDirty(false);
         const info = {
           file: msg.file, bytes: msg.bytes, ms: msg.ms, flat: !!msg.flat,
@@ -1875,6 +2163,34 @@ export class PdfeEditor {
         // (a pan with nothing open must not raise one on iOS — S39).
         if (dragging) { this._setSinkFocus(this._editingPage >= 0); return; }
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
+        // SHIFT+CLICK EXTENDS THE SELECTION, the way it does in every text field
+        // on the desktop: the caret's existing anchor stays put and the click
+        // becomes the new head. Web-only by nature — it needs a keyboard and a
+        // mouse at once, which a phone shell does not have (there, the handles
+        // are the equivalent).
+        //
+        // The ANCHOR is the end that is NOT the head, so repeated shift+clicks
+        // keep pivoting on the same character instead of collapsing onto the
+        // previous click. `selectionDirection` is what distinguishes them, and
+        // the selectionChanged handler already writes it back on every reply.
+        //
+        // Before the double-tap check: with Shift down this is an extend, not a
+        // word-select, and two shift+clicks in the same spot must not become one.
+        //
+        // Gated on the click being INSIDE the open run, not merely on the same
+        // page: editBoundary clamps to the run, so a shift+click out in the
+        // margin would silently select all the way to whichever end was nearer
+        // instead of doing what an unmodified click there does (commit, and pick
+        // the box you actually clicked).
+        if (uv.shiftKey && this._editingPage === page &&
+            this._lastEditBounds && this._inBounds(this._lastEditBounds, { xPt, yPt })) {
+          const s0 = this.sink.selectionStart, e0 = this.sink.selectionEnd;
+          const anchor = (s0 !== e0 && this.sink.selectionDirection === "backward")
+            ? e0 : s0;
+          this._post({ type: "selectToPoint", page, xPt, yPt, anchor });
+          this._setSinkFocus(true);   // a run is open, so the keyboard belongs to us
+          return;
+        }
         // Double-tap / double-click selects the word — the mouse-and-touch
         // sibling of long-press, reusing the SAME `selectWord` message so the
         // word-expansion rule lives in exactly one place (the worker). Detected
@@ -2060,7 +2376,17 @@ export class PdfeEditor {
     this._listen(this.sink, "compositionstart", () => { this._composing = true; });
     this._listen(this.sink, "compositionupdate", () => push());
     this._listen(this.sink, "compositionend", () => { this._composing = false; push(); });
-    this._listen(this.sink, "input", () => { if (!this._composing) push(); });
+    this._listen(this.sink, "input", () => {
+      if (this._composing) return;
+      push();
+      // Phase 5 (word-level undo): a ~300 ms typing pause finishes the word —
+      // the next keystroke starts a fresh undo entry. The core is clockless;
+      // this debounce is the shell's half of pdfe_history_seal. Whitespace,
+      // leaving the box and caret moves seal on their own paths.
+      clearTimeout(this._sealTimer);
+      this._sealTimer = setTimeout(() => this._post({ type: "sealHistory" }), 300);
+    });
+    this._listen(this.sink, "blur", () => this._post({ type: "sealHistory" }));
     this._listen(this.sink, "keydown", (e) => {
       // Undo/redo FIRST — before every other binding. See _handleHistoryKey for
       // why its preventDefault is load-bearing.
@@ -2105,7 +2431,31 @@ export class PdfeEditor {
       }
       // Left/Right move the caret (or extend with Shift) without firing an
       // input event — mirror those so the overlays track.
-      if (["ArrowLeft", "ArrowRight"].includes(e.key)) setTimeout(push, 0);
+      if (["ArrowLeft", "ArrowRight"].includes(e.key)) {
+        setTimeout(push, 0);
+        // AND REPORT THE STYLE AT THE NEW CARET. An arrow key is an explicit
+        // cursor move, exactly like a click, so it owes the host the same answer
+        // — but Left/Right are the only caret motion the sink handles ENTIRELY on
+        // its own: Up/Down/Home/End go through `caretLine` and taps through
+        // `tap`, both of which reach postCaretMoved in the worker, while these
+        // reached nothing. The swatch therefore kept the colour of wherever the
+        // caret had last been PUT BY MOUSE (reported: colour a word red, then
+        // arrow back over black text and the toolbar stays red).
+        //
+        // A collapsed `selectRange` is deliberately the vehicle: the worker
+        // degrades it to postCaretMoved, so the style read and the typing-colour
+        // clear are the same code every other cursor move already runs.
+        setTimeout(() => {
+          if (this._editingPage < 0) return;
+          const s = this.sink.selectionStart, en = this.sink.selectionEnd;
+          // Shift+arrow is left alone: its reply carries no `headAtStart`, so
+          // driving it through here would reset the sink's selectionDirection and
+          // the NEXT Shift+arrow would extend the wrong end. The edit pass above
+          // already carries that case's handles.
+          if (s !== en) return;
+          this._post({ type: "selectRange", start: s, end: s });
+        }, 0);
+      }
     });
   }
 }

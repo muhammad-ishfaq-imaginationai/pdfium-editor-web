@@ -132,6 +132,13 @@ const ready = createPdfe({
   F.redo          = m.cwrap("pdfe_redo", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.historyClear  = m.cwrap("pdfe_history_clear", null, ["number"]);
+  // Phase 5: seal the newest entry so later keystrokes start a fresh one. The
+  // core is clockless; the ~300 ms idle rule lives in the SDK's debounce.
+  F.historySeal   = m.cwrap("pdfe_history_seal", null, ["number"]);
+  F.historySetEnabled = m.cwrap("pdfe_history_set_enabled", null, ["number", "number"]);
+  // Asked, never assumed: the SDK clears its unsaved-changes flag from an empty
+  // undo stack, and that inference is only valid while recording is ON.
+  F.historyEnabled = m.cwrap("pdfe_history_enabled", "number", ["number"]);
   F.historyDescribe = m.cwrap("pdfe_history_describe", "number",
     ["number", "number", "number"]);
   F.editCaretIndex = m.cwrap("pdfe_edit_caret_index", "number", ["number"]);
@@ -152,6 +159,13 @@ const ready = createPdfe({
   F.editCaret     = m.cwrap("pdfe_edit_caret", "number", ["number", "number", "number"]);
   F.editBoundary  = m.cwrap("pdfe_edit_boundary_at", "number", ["number", "number", "number"]);
   F.editSelRects  = m.cwrap("pdfe_edit_selection_rects", "number",
+    ["number", "number", "number", "number", "number"]);
+  // character-level styling (colour today; size and fonts reuse the same reader)
+  F.editApplyColor = m.cwrap("pdfe_edit_apply_color", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editSetTypingColor = m.cwrap("pdfe_edit_set_typing_color", "number",
+    ["number", "number", "number"]);
+  F.editStyleAt   = m.cwrap("pdfe_edit_style_at", "number",
     ["number", "number", "number", "number", "number"]);
   F.editCommit    = m.cwrap("pdfe_edit_commit", "number", ["number", "number"]);
   F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
@@ -281,6 +295,78 @@ function readCaret(index) {
   return v; // [x, topPt, botPt] page points
 }
 
+// The style of characters [s, e) as the CORE reports it. A NULL field means MIXED
+// across the range — never a guessed value, because a swatch showing one of several
+// colours makes the user's next click overwrite text they never looked at.
+// A collapsed range (e <= s) reads the character BEFORE the cursor, which is the
+// same inherit-from-the-left rule a typed character follows.
+const PDFE_STYLE_COLOR = 1, PDFE_STYLE_SIZE = 2, PDFE_STYLE_BASELINE = 8;
+function readRangeStyle(s, e) {
+  if (!editor) return null;
+  const ptr = mod._malloc(12 * 4);
+  const mask = F.editStyleAt(editor, s, e, ptr, 0);
+  const v = readF32(ptr, 12);
+  mod._free(ptr);
+  if (mask < 0) return null;
+  const argb = (mask & PDFE_STYLE_COLOR)
+    ? (((Math.round(v[3]) << 24) | (Math.round(v[0]) << 16) |
+        (Math.round(v[1]) << 8) | Math.round(v[2])) >>> 0)
+    : null;
+  return {
+    start: s, end: e,
+    colorArgb: argb,
+    sizePt: (mask & PDFE_STYLE_SIZE) ? v[4] : null,
+    baselineOffset: (mask & PDFE_STYLE_BASELINE) ? v[7] : null,
+  };
+}
+
+// THE CARET MOVED DELIBERATELY — a tap inside the run, an arrow key, a caret-handle
+// drag, a selection collapsing. Every such site goes through here and NO typing site
+// does, which is the whole point: the core cannot tell a tap from a keystroke (both
+// arrive as a new caret), so this function IS the distinction the core's contract
+// asks the shell to make (pdfe.h, pdfe_edit_set_typing_color).
+//
+// Two things ride on it:
+//  - the style AT the caret goes out with the message, so a host can repaint its
+//    swatch to the colour the next character will actually take;
+//  - when `typingColorFollowsCaret` is on, a pending typing-colour override is
+//    DROPPED, so typing after the move inherits from the character to the left
+//    instead of the colour picked before the move.
+let typingColorFollowsCaret = true;
+// WHERE the pending override was ARMED (caret index at pick time; -1 = none),
+// and with what colour. Picking a colour in a HOST CONTROL steals focus, so the
+// user's very next gesture is a click back into the box — and if that click
+// lands on the SAME caret index, it is not a cursor move in intent, it is
+// "give me my keyboard back". Dropping the pick there made every picker
+// unusable for arming a typing colour (user-reported 2026-08-13), and every
+// host would have had to reimplement the exception — so it lives HERE, in the
+// same choke point that owns the drop. A click anywhere ELSE is a real move
+// and drops the pick exactly as §2 documents.
+let typingColorArmedAt = -1;
+let typingColorArmedArgb = 0;
+function postCaretMoved(index) {
+  const keepPick = typingColorFollowsCaret && typingColorArmedAt >= 0 &&
+                   index === typingColorArmedAt;
+  if (typingColorFollowsCaret && editor && !keepPick) {
+    F.editSetTypingColor(editor, 0, 0);
+    typingColorArmedAt = -1;
+  }
+  // A deliberate caret move finishes the word (Phase 5): the next keystroke
+  // must start a fresh undo entry, not merge into text typed somewhere else.
+  if (doc) F.historySeal(doc);
+  // Collapsed range: readRangeStyle reads the character BEFORE the cursor —
+  // the same inherit-from-the-left rule a typed character follows, so this IS
+  // the colour the next keystroke gets. When the pick SURVIVES, the next
+  // keystroke takes the pick — report that, or the host's swatch would lie.
+  const style = readRangeStyle(index, index);
+  if (keepPick && style) style.colorArgb = typingColorArmedArgb >>> 0;
+  postMessage({
+    type: "caretMoved", index, caret: readCaret(index),
+    style,
+    following: typingColorFollowsCaret,
+  });
+}
+
 function readSelectionRects(s, e) {
   const n = F.editSelRects(editor, s, e, 0, 0);
   if (n <= 0) return [];
@@ -404,8 +490,18 @@ function hitParagraph(page, xPt, yPt) {
     if (!block || area < block.area) block = { b, area };
   }
   if (!block) return null;
+  const hit = pickPara(block.b, xPt, yPt);
+  if (!hit) return null;
+  return { index: hit.index, bounds: hit.bounds,
+           blockIndex: block.b.index, blockBounds: block.b.bounds };
+}
+
+// Which paragraph of a KNOWN block a point means: the smallest one containing it,
+// else the nearest. Split out of hitParagraph so the post-move re-select can pick a
+// paragraph inside a block it identified some other way, without duplicating this.
+function pickPara(block, xPt, yPt) {
   let best = null, nearest = null, nearestDist = Infinity;
-  for (const para of block.b.paras) {
+  for (const para of block.paras) {
     const r = para.bounds;
     if (xPt >= r[0] && xPt <= r[2] && yPt >= r[1] && yPt <= r[3]) {
       const area = (r[2] - r[0]) * (r[3] - r[1]);
@@ -417,10 +513,37 @@ function hitParagraph(page, xPt, yPt) {
     const d = dx * dx + dy * dy;
     if (d < nearestDist) { nearestDist = d; nearest = para; }
   }
-  const hit = best ? best.para : nearest;
-  if (!hit) return null;
-  return { index: hit.index, bounds: hit.bounds,
-           blockIndex: block.b.index, blockBounds: block.b.bounds };
+  return best ? best.para : nearest;
+}
+
+// THE BOX THE USER DRAGGED, after the page has been re-grouped — and it is NOT
+// reliably the one under the drop point. hitParagraph prefers the SMALLEST box
+// containing the point, which is right for a tap (the tightest target under a
+// finger) and wrong here: drop a large box across several small ones and a small
+// one wins, so the selection jumped off the box the user was holding.
+//
+// Identity guarantees the moved box neither merged nor split (docs/BLOCK_MOVE.md
+// §5 — five guards enforce it), so after re-grouping its rect IS its old rect
+// translated by the drag. Matching that rect is a whole-box signal; a point test
+// is a one-pixel one. Best overlap wins, by intersection-over-union so that a box
+// merely CROSSED by the drop cannot beat the box that actually landed there.
+function findMovedBlock(blocks, want) {
+  let best = null, bestScore = 0;
+  const wantArea = Math.max(0, want[2] - want[0]) * Math.max(0, want[3] - want[1]);
+  for (const b of blocks) {
+    const r = b.bounds;
+    const iw = Math.min(r[2], want[2]) - Math.max(r[0], want[0]);
+    const ih = Math.min(r[3], want[3]) - Math.max(r[1], want[1]);
+    if (iw <= 0 || ih <= 0) continue;
+    const inter = iw * ih;
+    const union = (r[2] - r[0]) * (r[3] - r[1]) + wantArea - inter;
+    const score = union > 0 ? inter / union : 0;
+    if (score > bestScore) { bestScore = score; best = b; }
+  }
+  // A high bar deliberately: anything less than a near-exact match means the box
+  // did NOT survive the move intact, and silently selecting a lookalike would
+  // hide that. Fall back to the point hit and let the old behaviour show.
+  return bestScore >= 0.5 ? best : null;
 }
 
 // Re-render ONLY the dirty page-point rect as a strip (§4): offset baked into
@@ -457,7 +580,12 @@ function commitEditor() {
   noteMutation(page);                      // indices/bounds may have shifted
   editor = 0; editPage = -1; editParaBounds = null;
   postMessage({ type: "editClosed", page, ok: ok === 1 });
-  postHistory();
+  // FORCED, not deduped. Entering a box and leaving it without typing changes
+  // neither flag, so a deduped post sends nothing — and the shell is left holding
+  // the unsaved-changes flag its editclose handler had just set, with an empty
+  // undo stack contradicting it. The close is exactly when the shell needs the
+  // stack's answer, whether or not the answer changed (the S15 rule).
+  postHistory(true);
 }
 
 // ---- undo / redo ------------------------------------------------------------
@@ -471,16 +599,20 @@ function commitEditor() {
 let lastHistory = "";   // "canUndo,canRedo" — so the event fires only on change
 
 function historyState() {
-  if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1 };
+  if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1, recording: false };
   const u = F.undoPage(doc), r = F.redoPage(doc);
-  return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r };
+  // |recording| rides along because an empty stack means two different things:
+  // "everything has been undone" while recording, and "nothing was ever written
+  // down" while not. Only the first one says the document is unmodified.
+  return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r,
+           recording: !!F.historyEnabled(doc) };
 }
 
 // Re-query and post, but only when the pair actually changed: this is called
 // from every mutator tail, and a typing burst must not spam the shell.
 function postHistory(force) {
   const h = historyState();
-  const key = `${h.canUndo},${h.canRedo}`;
+  const key = `${h.canUndo},${h.canRedo},${h.recording}`;
   if (!force && key === lastHistory) return;
   lastHistory = key;
   postMessage({ type: "history", ...h });
@@ -676,10 +808,24 @@ function deleteParagraphAt(page, xPt, yPt) {
 // the BOXES are now stable across it. The selection is therefore re-established
 // by hit-testing the DROP point against the new grouping, never by reusing the
 // old index.
-function moveBlockAt(page, xPt, yPt, dx, dy) {
+function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
   if (editor) commitEditor();
   ensureCoreGroup(page);
-  const hit = hitParagraph(page, xPt, yPt);
+  // WHICH BOX MOVES IS THE SELECTION'S ANSWER, not the anchor point's, whenever
+  // the caller knows the selected rect. After a box has been dropped across
+  // others its anchor lies inside several boxes at once, and hitParagraph
+  // resolves that tie by SMALLEST AREA — so the neighbour won and the next nudge
+  // dragged the wrong box out from under the user.
+  let hit = null;
+  if (wantBounds) {
+    const b = findMovedBlock(cachedGroups(page), wantBounds);
+    const para = b && pickPara(b, xPt, yPt);
+    if (para) {
+      hit = { index: para.index, bounds: para.bounds,
+              blockIndex: b.index, blockBounds: b.bounds };
+    }
+  }
+  if (!hit) hit = hitParagraph(page, xPt, yPt);
   if (!hit) { postMessage({ type: "blockMoved", page, ok: false }); return; }
 
   const dp = mod._malloc(16);
@@ -702,13 +848,35 @@ function moveBlockAt(page, xPt, yPt, dx, dy) {
        Math.max(bb[2], bb[2] + dx), Math.max(bb[3], bb[3] + dy)];
   renderDirtyStrip(page, strip);
 
-  // Re-group and re-select at the DROP point, so the box the user just dragged
-  // stays selected and can be nudged again without re-tapping.
+  // Re-group, then re-select THE BOX THAT MOVED — never merely the box under the
+  // drop point (user directive 2026-08-12: "the dragged box must remain selected
+  // in every case"). Dropping a large box onto small ones handed the selection to
+  // one of the small ones, because the point test prefers the smallest box that
+  // contains the point. Identity says the moved box is intact, so we look for its
+  // translated rect and only fall back to the point when that fails.
   const blocks = groupPage(page);   // also restores the fresh-open gate
-  const reHit = hitParagraph(page, xPt + dx, yPt + dy);
+  const dropX = xPt + dx, dropY = yPt + dy;
+  const movedBlock = findMovedBlock(blocks,
+    [bb[0] + dx, bb[1] + dy, bb[2] + dx, bb[3] + dy]);
+  let reHit = null;
+  if (movedBlock) {
+    // Anchor inside the box we actually moved, so a follow-up nudge re-finds the
+    // same box even if the drop point sits over a neighbour.
+    const para = pickPara(movedBlock, dropX, dropY);
+    if (para) {
+      reHit = { index: para.index, bounds: para.bounds,
+                blockIndex: movedBlock.index, blockBounds: movedBlock.bounds };
+    }
+  }
+  if (!reHit) reHit = hitParagraph(page, dropX, dropY);
   if (reHit) {
+    // The anchor must be inside the SELECTED box: it is what the next move and the
+    // next tap resolve from, and the raw drop point can be over a neighbour.
+    const rb = reHit.blockBounds;
+    const ax = Math.min(Math.max(dropX, rb[0]), rb[2]);
+    const ay = Math.min(Math.max(dropY, rb[1]), rb[3]);
     selectedPara = { page, index: reHit.index, bounds: reHit.blockBounds,
-                     xPt: xPt + dx, yPt: yPt + dy };
+                     xPt: ax, yPt: ay };
   } else {
     selectedPara = null;
   }
@@ -721,7 +889,10 @@ function moveBlockAt(page, xPt, yPt, dx, dy) {
     selection: selectedPara
       ? { index: reHit.index, bounds: reHit.blockBounds,
           blockIndex: reHit.blockIndex, blockBounds: reHit.blockBounds,
-          xPt: xPt + dx, yPt: yPt + dy }
+          // The CLAMPED anchor, the same one selectedPara holds — reporting the raw
+          // drop point would leave the shell and the worker disagreeing about where
+          // the selection lives the moment the drop lands over a neighbour.
+          xPt: selectedPara.xPt, yPt: selectedPara.yPt }
       : null,
   });
   postHistory();
@@ -748,6 +919,10 @@ function openEditorAt(page, xPt, yPt, lineMode) {
   editor = ed;
   editPage = page;
   editParaBounds = hit.blockBounds;
+  // A fresh session starts with no pick in flight — a pending same-index
+  // revival must never leak across sessions (the index would name a spot in a
+  // different run).
+  typingColorArmedAt = -1;
   const text = readEditorText();
   const caretIdx = F.editBoundary(editor, xPt, yPt);
   postMessage({
@@ -761,6 +936,13 @@ function openEditorAt(page, xPt, yPt, lineMode) {
     runBounds: readRunBounds(text.length) || hit.blockBounds, // the blue editing box
     isParagraph: F.editIsPara(editor) === 1,
     linePreserve: F.editLineMode(editor) === 1,
+    // THE STYLE AT THE CARET THE USER JUST PLACED — not at the start of the run.
+    // Opening a run is a deliberate cursor placement like any other, so it owes
+    // the host the same answer a caret move does. A host that instead asked for
+    // the style at index 0 painted its swatch with the FIRST word's colour: colour
+    // that word red, double-click into the middle of the box, and the toolbar said
+    // red while typing correctly produced black.
+    style: readRangeStyle(caretIdx, caretIdx),
   });
 }
 
@@ -1215,6 +1397,14 @@ onmessage = async (e) => {
       postMessage({ type: "openFailed", code: openErrorCode(err), err });
       return;
     }
+    // ⚠️ HISTORY IS ON IN THIS BUILD, for testing true text undo (user request
+    // 2026-08-05). It is normally OPT-IN and OFF, and whether it ships on is the
+    // user's call, NOT a side effect of this workstream — decide it before any
+    // release (docs/RELEASING.md) and remember what "on" now costs: a recorded
+    // edit PARKS the objects it replaces instead of destroying them, so the page
+    // accumulates inactive objects until the journal is cleared. Must be enabled
+    // BEFORE the first edit — enabling later starts an empty journal.
+    F.historySetEnabled(doc, 1);
     const n = F.pageCount(doc);
     const dims = mod._malloc(8);
     // Measure WITHOUT loading pages: FPDF_LoadPage makes the document retain
@@ -1291,6 +1481,11 @@ onmessage = async (e) => {
   }
 
   if (msg.type === "edit") {
+    // Typing consumes the pick's moment: after a keystroke the caret has moved
+    // by insertion, so "the index the pick was armed at" no longer names the
+    // user's spot. The override itself lives on (typing never clears it) —
+    // only the same-index revival stops applying.
+    typingColorArmedAt = -1;
     // Newest-wins: overwrite any not-yet-drained edit (§9).
     pendingEdit = {
       fullText: msg.fullText,
@@ -1320,7 +1515,7 @@ onmessage = async (e) => {
         msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
         msg.yPt >= editParaBounds[1] && msg.yPt <= editParaBounds[3]) {
       const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
-      postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+      postCaretMoved(idx);
       return;
     }
     if (editor) commitEditor();   // tap outside / another paragraph: commit first
@@ -1369,6 +1564,10 @@ onmessage = async (e) => {
   // to, and a shell that passed one could pass a stale one.
   if (msg.type === "undo") { applyHistory("undo"); return; }
   if (msg.type === "redo") { applyHistory("redo"); return; }
+  // Phase 5: the SDK's ~300 ms idle debounce (and blur) says "the pause
+  // happened" — the next keystroke starts a fresh word-level undo entry.
+  if (msg.type === "sealHistory") { if (doc) F.historySeal(doc); return; }
+
   if (msg.type === "history") { postHistory(true); return; }
 
   // DIAGNOSTIC: the whole journal, for a host debug panel. Read straight from
@@ -1401,7 +1600,13 @@ onmessage = async (e) => {
     if (!doc || !selectedPara) { postMessage({ type: "moveLimits", limits: null }); return; }
     const page = selectedPara.page;
     ensureCoreGroup(page);
-    const hit = hitParagraph(page, selectedPara.xPt, selectedPara.yPt);
+    // Same rule as the move itself: the SELECTED box's rect decides, or a drag
+    // starting from a box dropped over others would be clamped to a neighbour's
+    // travel range instead of its own.
+    const selBlock = findMovedBlock(cachedGroups(page), selectedPara.bounds);
+    const hit = selBlock
+      ? { blockIndex: selBlock.index }
+      : hitParagraph(page, selectedPara.xPt, selectedPara.yPt);
     if (!hit) { postMessage({ type: "moveLimits", limits: null }); return; }
     const lp = mod._malloc(16);
     const ok = F.blockMoveLimits(doc, acquirePage(page), hit.blockIndex, lp);
@@ -1416,8 +1621,12 @@ onmessage = async (e) => {
   // thing that decides which block an action applies to.
   if (msg.type === "moveSelected") {
     if (!doc || !selectedPara) return;
-    const { page, xPt, yPt } = selectedPara;
-    moveBlockAt(page, xPt, yPt, Number(msg.dx) || 0, Number(msg.dy) || 0);
+    const { page, xPt, yPt, bounds } = selectedPara;
+    // Pass the SELECTED BOX'S RECT, not just its anchor: once a box has been
+    // dropped across others, the anchor sits inside more than one box and the
+    // point test picks the smallest — so a second nudge moved a neighbour
+    // instead of the box the user was still holding.
+    moveBlockAt(page, xPt, yPt, Number(msg.dx) || 0, Number(msg.dy) || 0, bounds);
     return;
   }
 
@@ -1463,7 +1672,7 @@ onmessage = async (e) => {
     // one when the left neighbour is a word char but the right isn't.
     if (!isWord(text[idx]) && isWord(text[idx - 1])) idx--;
     if (!isWord(text[idx])) {   // pressed whitespace: just move the caret
-      postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+      postCaretMoved(idx);
       return;
     }
     let ws = idx, we = idx + 1;
@@ -1471,7 +1680,7 @@ onmessage = async (e) => {
     while (we < text.length && isWord(text[we])) we++;
     postMessage({
       type: "selectionChanged", start: ws, end: we,
-      rects: readSelectionRects(ws, we),
+      rects: readSelectionRects(ws, we), style: readRangeStyle(ws, we),
       h0: readCaret(ws), h1: readCaret(we),
     });
     return;
@@ -1486,12 +1695,12 @@ onmessage = async (e) => {
     const s = Math.max(0, Math.min(msg.start, len));
     const e = Math.max(s, Math.min(msg.end, len));
     if (e <= s) {
-      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      postCaretMoved(s);
       return;
     }
     postMessage({
       type: "selectionChanged", start: s, end: e,
-      rects: readSelectionRects(s, e),
+      rects: readSelectionRects(s, e), style: readRangeStyle(s, e),
       h0: readCaret(s), h1: readCaret(e),
     });
     return;
@@ -1504,7 +1713,33 @@ onmessage = async (e) => {
     // outside its bounds, which a fingertip mid-drag will do.
     if (!editor || msg.page !== editPage) return;
     const idx = F.editBoundary(editor, msg.xPt, msg.yPt);
-    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    postCaretMoved(idx);
+    return;
+  }
+
+  // SHIFT+CLICK — extend the selection from where the caret already is to the
+  // point clicked. WEB ONLY by nature: it needs a keyboard and a mouse together,
+  // which a phone shell does not have (the touch equivalent is the handles).
+  //
+  // Deliberately NOT dragSelect: that anchors on a page POINT (the press point of
+  // a drag), and this anchors on a character INDEX — the selection's fixed end,
+  // which the shell knows and no point can reproduce once the caret has moved by
+  // keyboard. Everything after the anchor is identical, so the two share the
+  // clamp, the collapse-to-caret rule and the reply shape.
+  if (msg.type === "selectToPoint") {
+    if (!editor || msg.page !== editPage) return;
+    const len = readEditorText().length;
+    const a = Math.max(0, Math.min(msg.anchor | 0, len));
+    const b = F.editBoundary(editor, msg.xPt, msg.yPt);
+    const s = Math.min(a, b), e = Math.max(a, b);
+    // Shift+clicking exactly where the caret is means "no selection", not a
+    // zero-width one — same rule dragSelect follows when a drag collapses.
+    if (e <= s) { postCaretMoved(s); return; }
+    postMessage({
+      type: "selectionChanged", start: s, end: e, headAtStart: b < a,
+      rects: readSelectionRects(s, e), style: readRangeStyle(s, e),
+      h0: readCaret(s), h1: readCaret(e),
+    });
     return;
   }
 
@@ -1518,12 +1753,12 @@ onmessage = async (e) => {
     const b = F.editBoundary(editor, msg.xPt, msg.yPt);
     const s = Math.min(a, b), e = Math.max(a, b);
     if (e <= s) {
-      postMessage({ type: "caretMoved", index: s, caret: readCaret(s) });
+      postCaretMoved(s);
       return;
     }
     postMessage({
       type: "selectionChanged", start: s, end: e, headAtStart: b < a,
-      rects: readSelectionRects(s, e),
+      rects: readSelectionRects(s, e), style: readRangeStyle(s, e),
       h0: readCaret(s), h1: readCaret(e),
     });
     return;
@@ -1569,13 +1804,13 @@ onmessage = async (e) => {
       if (e > s) {
         postMessage({
           type: "selectionChanged", start: s, end: e, headAtStart: idx < msg.anchor,
-          rects: readSelectionRects(s, e),
+          rects: readSelectionRects(s, e), style: readRangeStyle(s, e),
           h0: readCaret(s), h1: readCaret(e),
         });
         return;
       }
     }
-    postMessage({ type: "caretMoved", index: idx, caret: readCaret(idx) });
+    postCaretMoved(idx);
     return;
   }
 
@@ -1590,8 +1825,85 @@ onmessage = async (e) => {
     else e = Math.min(len, Math.max(idx, s + 1));
     postMessage({
       type: "selectionChanged", start: s, end: e, headAtStart: msg.which === 0,
-      rects: readSelectionRects(s, e),
+      rects: readSelectionRects(s, e), style: readRangeStyle(s, e),
       h0: readCaret(s), h1: readCaret(e),
+    });
+    return;
+  }
+
+  // ---- character-level styling ---------------------------------------------
+  // The colour NEWLY TYPED characters take. Fire-and-forget: nothing to draw, and
+  // nothing to reply. The SHELL clears it on an explicit cursor move and never on
+  // typing — the core cannot tell a tap from a keystroke (docs/STYLING.md).
+  if (msg.type === "setTypingColor") {
+    if (editor) F.editSetTypingColor(editor, msg.argb >>> 0, msg.set ? 1 : 0);
+    // Remember WHERE a collapsed-caret pick armed the override (msg.at; -1 for
+    // a range apply or a clear): a tap back to that exact index keeps the pick
+    // — see postCaretMoved.
+    typingColorArmedAt = msg.set && msg.at != null && msg.at >= 0 ? msg.at : -1;
+    typingColorArmedArgb = msg.set ? (msg.argb >>> 0) : 0;
+    return;
+  }
+
+  // Which of the two lifetimes a picked colour has (docs/STYLING.md §2):
+  // ON  — it lasts until the user moves the cursor, then the caret's own colour
+  //       takes over (the default; what a word processor does).
+  // OFF — it is sticky until the host clears it, so every run typed in this
+  //       session takes the picked colour wherever the cursor goes.
+  if (msg.type === "setTypingColorFollowsCaret") {
+    typingColorFollowsCaret = !!msg.on;
+    return;
+  }
+
+  if (msg.type === "applyColor") {
+    if (!editor) return;                       // no run open: silent, like selectWord
+    // ORDER MATTERS. msg.start/end were computed against the SINK's current text, so
+    // a keystroke still sitting in the latch must land FIRST or the indices point at
+    // the wrong characters — and that set_text pass would then rebuild the run and
+    // drop the colour. The `edit` branch's inline drain makes this window narrow,
+    // not absent, so do not rely on it.
+    if (pendingEdit) drainLatch();
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start, len));
+    const e = Math.max(s, Math.min(msg.end, len));
+    if (e <= s) return;
+    dirtyPages.add(editPage);
+    noteMutation(editPage);                    // split/coalesce renumbers objects
+    const dPtr = mod._malloc(16);
+    const rc = F.editApplyColor(editor, s, e, msg.argb >>> 0, dPtr);
+    const dirty = readF32(dPtr, 4);
+    mod._free(dPtr);
+    syncEditTextPage();
+    // A colour change moves nothing, so the core's rect is inside the run and there
+    // is no growth to union in (that guard exists for reflow, which colour cannot
+    // cause).
+    const blitMs = renderDirtyStrip(editPage, dirty);
+    postMessage({
+      type: "styleApplied", what: "color", ok: rc >= 0, page: editPage,
+      argb: msg.argb >>> 0,
+      // Diagnostics, the same pair editApplied carries: `dirty` empty or blitMs 0
+      // means the strip was never repainted, which is the first thing to check if a
+      // colour ever fails to appear.
+      dirty, blitMs: Math.round(blitMs * 100) / 100,
+      // NO caret: this path only runs with a RANGE (it returns early on a collapsed
+      // one), and a range has no caret. It used to send readCaret(-1), and -1 clamps
+      // to index 0 — so the shell drew a blinking bar at the START of the run while
+      // the highlight sat mid-run, which reads as the cursor jumping to the beginning.
+      selection: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e), selStart: s, selEnd: e,
+      runBounds: readRunBounds(len),
+      style: readRangeStyle(s, e),             // read back AFTER the write
+    });
+    postHistory();                             // a style change is a recordable step
+    return;
+  }
+
+  // The style at a caret or over a range, on demand — what a host paints its swatch
+  // from when nothing has changed but the cursor moved.
+  if (msg.type === "styleAt") {
+    postMessage({
+      type: "styleRead", page: editPage,
+      style: editor ? readRangeStyle(msg.start | 0, msg.end | 0) : null,
     });
     return;
   }

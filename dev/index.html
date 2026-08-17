@@ -394,7 +394,7 @@
         </svg>
       </span>
       <span class="name">pdfium<span>-editor</span></span>
-      <span id="appver" title="deployed version">1.7.5-1c4eee6-w57b8f79</span>
+      <span id="appver" title="deployed version">1.7.5-a4c7117-wd323618</span>
     </div>
 
     <div class="rule"></div>
@@ -457,6 +457,21 @@
       <span id="colormixed" hidden title="the selection spans more than one colour">mixed</span>
     </span>
 
+    <!-- FONT FAMILY + BOLD/ITALIC — HOST chrome again, and here the point is sharper:
+         THE HOST PROVIDES THE VARIANTS (docs/FONTS.md). The SDK ships no font list, so
+         this <select> is populated from the faces THIS PAGE registers with loadFont();
+         a product would offer its own. The B and I buttons are disabled from
+         style.canBold / style.canItalic, because a family with no bold face is
+         refused rather than faked — greying out is how the user finds that out
+         BEFORE clicking. An empty selection in the picker means MIXED. -->
+    <span class="seg" id="fontbox" hidden>
+      <select id="fontfamily" title="font family" aria-label="font family"></select>
+      <button class="btn icon" id="bold" title="bold (the family's bold face)"
+              aria-label="bold" disabled><b>B</b></button>
+      <button class="btn icon" id="italic" title="italic (the family's italic face)"
+              aria-label="italic" disabled><i>I</i></button>
+    </span>
+
     <!-- UNDO / REDO — dev testing of docs/UNDO_REDO.md §6 (true text undo), added
          at the user's request 2026-08-05 so the fix can be exercised in a browser.
          Both leave the editing box by design: a step is a document-level action,
@@ -493,6 +508,16 @@
         </svg>
       </button>
       <div id="menu" role="menu">
+        <!-- THE TWO LIFETIMES A PICKED COLOUR CAN HAVE (docs/STYLING.md §2). Checked =
+             STICKY: the pick survives cursor moves until it is cleared, which is what a
+             form-filling product wants. Unchecked (the default) = follow the caret. The
+             SDK ships the switch and no UI for it, because which one a product wants is
+             the product's decision — so this control is HOST chrome, exactly like the
+             Android harness's ⋯ menu item. -->
+        <label class="mrow" for="stickycolor">
+          <input type="checkbox" id="stickycolor">
+          <span>Sticky colour (survives cursor moves)</span>
+        </label>
         <div class="mnote" id="enginenote">engine — checking…</div>
       </div>
     </div>
@@ -573,7 +598,7 @@
     </div>
   </div>
 
-  <script type="module" src="demo.js?v=1.7.5-1c4eee6-w57b8f79"></script>
+  <script type="module" src="demo.js?v=1.7.5-a4c7117-wd323618"></script>
 </body>
 </html>
 <style>

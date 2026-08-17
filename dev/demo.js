@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-1c4eee6-w57b8f79";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-a4c7117-wd323618";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -317,6 +317,7 @@ editor.on("editmode", ({ editMode }) => {
     ? "Edit mode — tap a paragraph to select it, then Edit or Delete"
     : "View mode — press Edit to enable editing");
   $("colorbox").hidden = !editMode;
+  $("fontbox").hidden = !editMode;
 });
 
 // ---- text colour (HOST chrome) ---------------------------------------------
@@ -330,12 +331,119 @@ const hex2 = (n) => n.toString(16).padStart(2, "0");
 // spans more than one colour, and <input type="color"> cannot render indeterminate
 // — hence the separate "mixed" chip rather than a lie in the swatch.
 function showTextStyle(style) {
+  // STICKY MODE: DO NOT REPAINT (user decision 2026-08-13, docs/STYLING.md §2). The
+  // report is the colour UNDER the cursor, and while a sticky pick is armed that is not
+  // what the next keystroke takes — so a swatch painted from it would say "black" while
+  // typing produces red. The host, which owns the switch, is the one that knows; the
+  // Android harness does exactly this in onTextSelectionChanged.
+  if (!editor.typingColorFollowsCaret) return;
   const argb = style && style.colorArgb;
   colorMixed.hidden = !(style && style.colorArgb === null);
   if (argb == null) return;
   colorInput.value =
     "#" + hex2((argb >>> 16) & 0xff) + hex2((argb >>> 8) & 0xff) + hex2(argb & 0xff);
 }
+
+// ---- font family + bold/italic (HOST chrome, and HOST-SUPPLIED FACES) -------
+// THE HOST PROVIDES THE VARIANTS (user decision 2026-08-13, docs/FONTS.md §2). The SDK
+// bundles no font catalog, so this list is ours and so are the bytes behind it. This
+// page offers the standard-14 ladder because those need no bytes at all — a product
+// would ship its own faces and pass them as ArrayBuffers instead.
+//
+// WHY BOTH FACES OF EACH FAMILY ARE REGISTERED, and this is the part a real host has
+// to copy: bold/italic resolve the SIBLING FACE of the family under the cursor. If
+// only "Helvetica" were registered, B on Helvetica text would be refused — correctly,
+// because nothing supplied a bold face. Registering the whole family is what makes the
+// B button light up.
+const HOST_FACES = [
+  "Helvetica", "Helvetica-Bold", "Helvetica-Oblique", "Helvetica-BoldOblique",
+  "Times-Roman", "Times-Bold", "Times-Italic", "Times-BoldItalic",
+  "Courier", "Courier-Bold", "Courier-Oblique", "Courier-BoldOblique",
+];
+// What the PICKER offers is deliberately narrower than what is REGISTERED: a user
+// picks a family, and the bold/italic buttons reach the rest. Offering
+// "Helvetica-BoldOblique" as a family would be a UI that asks the user to do the
+// engine's job.
+// Each entry carries the FAMILY KEY the SDK reports for it, because the picker must
+// match on that and not on the display name: text under the cursor reads
+// "Helvetica-Bold" while the family the user chose is "Helvetica". The keys are the
+// SDK's normalized form (lowercase, style suffix and spaces gone), which for the
+// standard-14 ladder is just the leading word.
+const PICKER_FAMILIES = [
+  ["", "Original", null],
+  ["Helvetica", "Helvetica (sans)", "helvetica"],
+  ["Times-Roman", "Times (serif)", "times"],
+  ["Courier", "Courier (mono)", "courier"],
+];
+const fontSelect = $("fontfamily"), boldBtn = $("bold"), italicBtn = $("italic");
+for (const [value, text] of PICKER_FAMILIES) {
+  const o = document.createElement("option");
+  o.value = value; o.textContent = text;
+  fontSelect.appendChild(o);
+}
+// A MIXED selection needs a blank option to select — <select> cannot render
+// indeterminate, and showing one of several families would be the lie the SDK's own
+// MIXED rule exists to prevent.
+const mixedOption = document.createElement("option");
+mixedOption.value = "__mixed"; mixedOption.textContent = "(mixed)";
+mixedOption.hidden = true;
+fontSelect.appendChild(mixedOption);
+// A SECOND placeholder, because there are two different truths a <select> cannot show
+// and collapsing them would misinform. The one above is the SDK's MIXED (several
+// families, where naming one would be the lie its MIXED rule exists to prevent); this
+// one is ONE family that this page does not offer -- which every document in the
+// corpus is, since they embed Arial and Calibri and this page ships standard-14.
+const otherOption = document.createElement("option");
+otherOption.value = "__other"; otherOption.textContent = "(document font)";
+otherOption.hidden = true;
+fontSelect.appendChild(otherOption);
+
+// Faces are registered once per OPENED DOCUMENT: the handles belong to the document,
+// so they do not survive opening another file.
+editor.on("opened", async () => {
+  const results = await Promise.all(HOST_FACES.map((name) => editor.loadFont({ name })));
+  const failed = results.filter((r) => !r.ok).map((r) => r.name);
+  if (failed.length) setHint("Fonts", `could not register: ${failed.join(", ")}`);
+});
+
+fontSelect.addEventListener("change", (ev) => {
+  const v = ev.target.value;
+  if (v.startsWith("__")) return;              // a placeholder is not a choice
+  editor.applyFont(v === "" ? null : v);
+});
+boldBtn.addEventListener("click", () => editor.applyBold(!boldBtn.classList.contains("active")));
+italicBtn.addEventListener("click", () =>
+  editor.applyItalic(!italicBtn.classList.contains("active")));
+
+// Paint the font controls from the ENGINE's answer — never from what we last sent.
+// Three separate MIXED cases, and they are independent: the FAMILY can be uniform
+// while bold-ness is not (Arial + Arial-Bold), which is exactly why the SDK reports
+// them as separate fields.
+function showFontStyle(style) {
+  if (!style) return;
+  // The picker matches on the FAMILY KEY, not on the display name: the text under the
+  // cursor reads "Helvetica-Bold" while the family the user picked is "Helvetica".
+  const fam = style.fontFamily;
+  const opt = fam == null ? null : PICKER_FAMILIES.find(([, , key]) => key === fam);
+  fontSelect.value = fam == null ? "__mixed" : (opt ? opt[0] : "__other");
+  // PRESSED state from `bold`/`italic`; ENABLED state from `canBold`/`canItalic`.
+  // Two different questions: "is it bold" and "could it be". A family with no bold
+  // face is refused by the SDK, and a disabled button is how the user learns that
+  // without clicking.
+  boldBtn.classList.toggle("active", style.bold === true);
+  italicBtn.classList.toggle("active", style.italic === true);
+  boldBtn.disabled = !style.canBold;
+  italicBtn.disabled = !style.canItalic;
+}
+
+// The refusal, as a host sees it. It is an `error` event with its own code rather than
+// a silent no-op precisely so this message can exist.
+editor.on("error", ({ code }) => {
+  if (code === "no-such-face")
+    setHint("Fonts", "this family has no such face — the SDK refuses rather than faking it");
+  if (code === "mixed-fonts")
+    setHint("Fonts", "the selection spans two fonts — select text in one font");
+});
 
 // LIVE while the user drags inside the picker (user requirement 2026-08-11: "it must
 // reflect live on the selected text"), so `input` — which fires continuously — not
@@ -368,6 +476,17 @@ colorInput.addEventListener("input", (ev) => applyColorThrottled(ev.target.value
 // dropped the last `input`, and this is the colour the user committed to.
 colorInput.addEventListener("change", (ev) => editor.applyTextColor(ev.target.value));
 
+// STICKY vs FOLLOW-THE-CARET — host chrome for the SDK's own switch (§2). Checked means
+// the pick is fixed until cleared; unchecked (default) means the caret decides.
+const stickyColor = $("stickycolor");
+stickyColor.addEventListener("change", () => {
+  const sticky = stickyColor.checked;
+  editor.setTypingColorFollowsCaret(!sticky);
+  setHint("Typing", sticky
+    ? "Sticky colour ON — the picked colour survives cursor moves; the swatch stops following"
+    : "Sticky colour OFF — the picked colour is dropped when the cursor moves");
+});
+
 // The cursor moved or the range changed — the engine reports the colour there, and
 // per the agreed UX the swatch follows the cursor. The SDK owns the override's
 // LIFETIME (drop on a real cursor move, keep on a click back to the same index
@@ -376,10 +495,22 @@ colorInput.addEventListener("change", (ev) => editor.applyTextColor(ev.target.va
 // until 2026-08-13. Hosts only paint.
 editor.on("selection", ({ start, end, style }) => {
   showTextStyle(style);
+  showFontStyle(style);
 });
-editor.on("styled", ({ what, style, following }) => {
+editor.on("styled", ({ what, style, following, fontName }) => {
   showTextStyle(style);
+  if (what === "typingFont") {
+    // Arming a font paints nothing, so there is no style to read back — the event
+    // names the face the next keystroke takes, and the picker shows that.
+    if (fontName != null) fontSelect.value = fontName;
+    setHint("Typing", `Font armed: ${fontName || "Original"} — it applies to what you ` +
+      "type next, and is dropped when you move the cursor");
+  } else {
+    showFontStyle(style);
+  }
   if (what === "color") setHint("Typing", "Colour applied — Ctrl+Z undoes it");
+  if (what === "font") setHint("Typing", "Font applied — Ctrl+Z undoes it");
+  if (what === "face") setHint("Typing", "Face applied — Ctrl+Z undoes it");
   // The cursor moved to text of a different colour: the swatch follows it, so the
   // user sees what the next character will be before typing it. `following` is
   // false when the host asked for a sticky picked colour instead.

@@ -301,6 +301,11 @@ export class PdfeEditor {
     // The engine's last style report for the character selection. A NULL FIELD
     // means MIXED; null overall means unknown/no run.
     this._textStyle = null;
+    // In-flight loadFont() resolvers, keyed by the host's font name — a LIST per
+    // name, because the worker interns a face once and answers once, so two callers
+    // racing on the same name must both be resolved by that single reply (a single
+    // slot would leave the first promise pending forever).
+    this._fontWaits = new Map();
     this._editGeneration = 0;
     this._composing = false;
     // The caret thumb is TOUCH-ONLY (a permanent grip under a mouse caret is
@@ -662,6 +667,122 @@ export class PdfeEditor {
     this._post({ type: "styleAt", start: start | 0, end: (end == null ? start : end) | 0 });
   }
 
+  // ---- character-level styling: the font FAMILY, and bold / italic ---------
+  // THE HOST PROVIDES THE VARIANTS (user decision 2026-08-13). This SDK bundles no
+  // font catalog — no name list, no bytes, no default ladder — for the same reason it
+  // owns no colour palette: which typefaces a product offers is the product's
+  // decision, and a bundled catalog is one every consumer would have to fight.
+  //
+  // So a face reaches the engine one way: the host loads it here. That was the whole
+  // gap on web — Android has had applyFont since its own picker shipped, and what it
+  // had that web did not was DELIVERY, not plumbing.
+
+  /**
+   * Register a font face the host provides, so it can be applied by name and so
+   * Bold/Italic can find it as a sibling of its family.
+   *
+   * ```js
+   * await editor.loadFont({ name: "Helvetica-Bold" });            // a standard-14 face
+   * await editor.loadFont({ name: "Roboto", bytes: ttfBytes });   // an embedded TTF
+   * ```
+   *
+   * `name` is the identity you apply by — your own label, not a filename. Pass
+   * `bytes` (ArrayBuffer/TypedArray) to embed a real font, or omit it to load a
+   * standard-14 face by its PDF name ("Helvetica", "Times-Bold", "Courier-Oblique"…).
+   * Embedded faces auto-embed on save.
+   *
+   * REGISTER EVERY VARIANT YOU WANT TO OFFER. `applyBold`/`applyItalic` resolve the
+   * SIBLING FACE of the family already under the cursor, and refuse when that face
+   * does not exist — they never synthesise a bold or slant a face by matrix. So a
+   * host that wants Bold to work on Roboto text loads Roboto-Bold too; the engine
+   * pairs them by family on its own (it reads the family, weight and slant off the
+   * font, so you do not restate them).
+   *
+   * Handles belong to the open DOCUMENT: re-register after opening another file.
+   * Resolves to `{ ok, name }`; `ok: false` carries a `reason`.
+   */
+  loadFont(spec) {
+    const name = String((spec && spec.name) || "");
+    if (!name) {
+      this._emit("error", { code: "bad-source", detail: "loadFont needs a name" });
+      return Promise.resolve({ ok: false, name, reason: "bad-source" });
+    }
+    let bytes = spec && spec.bytes;
+    if (bytes && !(bytes instanceof ArrayBuffer)) {
+      // Copy out of any TypedArray view so the transfer carries only these bytes.
+      bytes = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+    }
+    return new Promise((resolve) => {
+      const waits = this._fontWaits.get(name);
+      if (waits) { waits.push(resolve); return; }   // already in flight: share the reply
+      this._fontWaits.set(name, [resolve]);
+      // The bytes are TRANSFERRED, not copied: a font file is up to a few MB and the
+      // worker interns it into the document immediately.
+      this._post({ type: "loadFont", name, bytes: bytes || null },
+                 bytes ? [bytes] : undefined);
+    });
+  }
+
+  /**
+   * Apply a font FAMILY, in the same two-verb shape as `applyTextColor`: with a range
+   * selected it restyles that range; with a bare caret it sets the font NEWLY TYPED
+   * text takes.
+   *
+   * `name` is one you passed to `loadFont`. `null` means ORIGINAL — every character
+   * keeps the font it already had, which is a real value here (a font has a "no
+   * change" sentinel where a colour cannot, since every 32-bit value is a legal
+   * colour).
+   *
+   * THE TYPING FONT FOLLOWS THE CARET, and that is its ONLY lifetime (user decision
+   * 2026-08-13): it is dropped the moment the cursor moves, and there is deliberately
+   * no sticky mode and no switch. The one exception is the same one colour has — a
+   * click back to the SAME caret index keeps the pick, because picking in your own
+   * control steals focus and the click back is "give me my keyboard", not a move.
+   */
+  applyFont(name) {
+    if (this._editingPage < 0) return;
+    // Same ownership rule as applyTextColor: styling IS an interaction, so the next
+    // Ctrl+Z is ours even though the gesture landed on the host's picker. No focus()
+    // — a native <select> popup may still be open.
+    this._ownsKeyboard = true;
+    const s = this.sink.selectionStart, e = this.sink.selectionEnd;
+    this._post({ type: "applyFont", name: name == null ? null : String(name),
+                 start: s, end: e });
+  }
+
+  /**
+   * Turn BOLD on or off over the character selection.
+   *
+   * There is no bold PROPERTY in a PDF — only a different font — so this resolves the
+   * bold sibling of the family under the cursor and applies it. When that face does
+   * not exist it REFUSES and changes nothing, reporting `styleApplied` with
+   * `ok: false` and `reason: "no-such-face"`: no synthetic emboldening, and never
+   * another family's bold face (user decision 2026-08-13). Load the variant with
+   * `loadFont` and it works.
+   *
+   * Bind your button's `disabled` to `textStyle.canBold` and its pressed state to
+   * `textStyle.bold` — both come with every `styled`/`selection` event, so the button
+   * is right before the user clicks rather than after.
+   *
+   * Needs a RANGE: with a bare caret it reports `reason: "no-selection"` rather than
+   * quietly restyling the character behind the cursor.
+   */
+  applyBold(on) { this._applyFace(on == null ? true : !!on, null); }
+
+  /** Turn ITALIC on or off over the selection. Everything in `applyBold` applies,
+   *  with `canItalic` / `italic` as the button's inputs. */
+  applyItalic(on) { this._applyFace(null, on == null ? true : !!on); }
+
+  /** Both toggles are one engine call, because they are one mechanism: italicising
+   *  bold text needs the bold-italic FACE, not two independent flags. null = leave
+   *  that property as it is. */
+  _applyFace(bold, italic) {
+    if (this._editingPage < 0) return;
+    this._ownsKeyboard = true;
+    const s = this.sink.selectionStart, e = this.sink.selectionEnd;
+    this._post({ type: "applyFace", bold, italic, start: s, end: e });
+  }
+
   /** The character range selected inside the open run, or null (no run / bare caret).
    *  Read LIVE from the sink, so it is always exact. Prefer the `selection` event. */
   get textSelection() {
@@ -906,6 +1027,13 @@ export class PdfeEditor {
       reject(new PdfeError("destroyed", "editor destroyed"));
     }
     this._pending.clear();
+    // loadFont() RESOLVES rather than rejecting, here and everywhere: its answer is
+    // already an {ok, reason} record, so a host awaiting one at teardown gets a
+    // normal negative answer instead of an unhandled rejection during unmount.
+    for (const [name, waits] of this._fontWaits) {
+      for (const w of waits) w({ ok: false, name, reason: "destroyed" });
+    }
+    this._fontWaits.clear();
   }
 
   // ===========================================================================
@@ -1310,10 +1438,39 @@ export class PdfeEditor {
         this._textStyle = msg.style || null;
         this._emit("styled", { what: "read", page: msg.page, style: msg.style || null });
         break;
+      case "fontLoaded": {
+        // Resolve loadFont()'s promise, and surface a failure as an event too: a host
+        // that fired-and-forgot still needs to hear that its face never arrived.
+        const waits = this._fontWaits.get(msg.name);
+        if (waits) {
+          this._fontWaits.delete(msg.name);
+          for (const w of waits) w({ ok: !!msg.ok, name: msg.name, reason: msg.reason });
+        }
+        if (!msg.ok) {
+          this._emit("error", { code: msg.reason || "font-failed",
+                                detail: `could not load the font "${msg.name}"` });
+        }
+        break;
+      }
       case "styleApplied":
         if (!msg.ok) {
-          this._emit("error", { code: "color-failed", page: msg.page,
-                                detail: "the engine refused the colour" });
+          // A REFUSED FACE IS A PRODUCT OUTCOME, not an engine failure, and it needs
+          // its own code: "this family has no bold face" is something the host has to
+          // be able to tell the user, and reporting it as color-failed would be both
+          // wrong and unactionable (docs/FONTS.md §3).
+          const code = msg.reason || (msg.what === "color" ? "color-failed" : "font-failed");
+          this._emit("error", { code, page: msg.page, what: msg.what,
+                                detail: code === "no-such-face"
+                                  ? "the font family has no such face — load the variant with loadFont()"
+                                  : `the engine refused the ${msg.what} change` });
+          break;
+        }
+        // ARMING THE TYPING FONT paints nothing: there is no range, so there is no
+        // selection, no handles and no strip. It is still surface the host listens to,
+        // because its picker must show the face the next keystroke will take.
+        if (msg.what === "typingFont") {
+          this._emit("styled", { what: "typingFont", page: msg.page,
+                                 fontName: msg.fontName, style: this._textStyle });
           break;
         }
         if (msg.runBounds) this._drawEditBox(msg.runBounds);

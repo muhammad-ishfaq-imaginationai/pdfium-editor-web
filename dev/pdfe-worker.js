@@ -160,13 +160,30 @@ const ready = createPdfe({
   F.editBoundary  = m.cwrap("pdfe_edit_boundary_at", "number", ["number", "number", "number"]);
   F.editSelRects  = m.cwrap("pdfe_edit_selection_rects", "number",
     ["number", "number", "number", "number", "number"]);
-  // character-level styling (colour today; size and fonts reuse the same reader)
+  // character-level styling: colour, and (2026-08-13) the font FAMILY + bold/italic.
+  // Size reuses the same reader when it lands (docs/FONT_SIZING.md).
   F.editApplyColor = m.cwrap("pdfe_edit_apply_color", "number",
     ["number", "number", "number", "number", "number"]);
   F.editSetTypingColor = m.cwrap("pdfe_edit_set_typing_color", "number",
     ["number", "number", "number"]);
   F.editStyleAt   = m.cwrap("pdfe_edit_style_at", "number",
     ["number", "number", "number", "number", "number"]);
+  F.editFontNameAt = m.cwrap("pdfe_edit_font_name_at", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.editApplyFont = m.cwrap("pdfe_edit_apply_font", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editSetTypingFont = m.cwrap("pdfe_edit_set_typing_font", "number",
+    ["number", "number"]);
+  F.editApplyFace = m.cwrap("pdfe_edit_apply_face", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  // The DELIVERY half: a host hands us bytes (or a standard-14 name) and we intern
+  // the face on the DOCUMENT, then register it so apply_face can find it. Web had
+  // no font delivery story at all before this — that, not the plumbing, was why
+  // applyFont was Android-only (docs/FONTS.md §2).
+  F.loadAssetFont = m.cwrap("pdfe_load_asset_font", "number",
+    ["number", "number", "number", "number"]);
+  F.loadStandardFont = m.cwrap("pdfe_load_standard_font", "number", ["number", "number"]);
+  F.registerFace  = m.cwrap("pdfe_register_face", "number", ["number", "number"]);
   F.editCommit    = m.cwrap("pdfe_edit_commit", "number", ["number", "number"]);
   F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
   F.generateContent = m.cwrap("pdfe_generate_content", "number", ["number"]);
@@ -301,6 +318,27 @@ function readCaret(index) {
 // A collapsed range (e <= s) reads the character BEFORE the cursor, which is the
 // same inherit-from-the-left rule a typed character follows.
 const PDFE_STYLE_COLOR = 1, PDFE_STYLE_SIZE = 2, PDFE_STYLE_BASELINE = 8;
+// The FONT-IDENTITY bits (pdfe.h, 2026-08-13). FAMILY is separate from FONT on
+// purpose: one family can be carried by several subset handles, and a picker must
+// still be able to show its name.
+const PDFE_STYLE_FAMILY = 16, PDFE_STYLE_BOLD = 32, PDFE_STYLE_ITALIC = 64,
+      PDFE_STYLE_FACES = 128;
+const CAN_BOLD_ON = 1, CAN_BOLD_OFF = 2, CAN_ITALIC_ON = 4, CAN_ITALIC_OFF = 8;
+const FONT_NAME_BASE = 0, FONT_NAME_FAMILY = 1;
+
+// The range's font name, or null when it MIXES. Two-call, like every core string
+// getter; the core decides mixedness (one walk, shared with the mask) so this cannot
+// disagree with the bits above.
+function readFontName(s, e, which) {
+  const n = F.editFontNameAt(editor, s, e, which, 0, 0);
+  if (n <= 0) return null;
+  const ptr = mod._malloc(n);
+  F.editFontNameAt(editor, s, e, which, ptr, n);
+  const bytes = new Uint8Array(mod.HEAPU8.buffer, ptr, n - 1).slice();  // drop the NUL
+  mod._free(ptr);
+  return new TextDecoder().decode(bytes);
+}
+
 function readRangeStyle(s, e) {
   if (!editor) return null;
   const ptr = mod._malloc(12 * 4);
@@ -312,11 +350,26 @@ function readRangeStyle(s, e) {
     ? (((Math.round(v[3]) << 24) | (Math.round(v[0]) << 16) |
         (Math.round(v[1]) << 8) | Math.round(v[2])) >>> 0)
     : null;
+  const bold = (mask & PDFE_STYLE_BOLD) ? v[8] === 1 : null;
+  const italic = (mask & PDFE_STYLE_ITALIC) ? v[9] === 1 : null;
+  const faces = (mask & PDFE_STYLE_FACES) ? v[10] : 0;
   return {
     start: s, end: e,
     colorArgb: argb,
     sizePt: (mask & PDFE_STYLE_SIZE) ? v[4] : null,
     baselineOffset: (mask & PDFE_STYLE_BASELINE) ? v[7] : null,
+    // The font under the cursor, as a host's picker asks for it: a DISPLAY name and
+    // a MATCHING key. null = MIXED across the range, exactly like colour and size.
+    fontName: readFontName(s, e, FONT_NAME_BASE),
+    fontFamily: (mask & PDFE_STYLE_FAMILY) ? readFontName(s, e, FONT_NAME_FAMILY) : null,
+    bold, italic,
+    // WHETHER THE B / I BUTTON WOULD WORK, which is a different question from
+    // whether the text IS bold — the family may simply have no bold face, and this
+    // build REFUSES rather than faking one (docs/FONTS.md §3). Resolving "press B"
+    // into "turn it on or off" is the shell's job, so the host binds `disabled`
+    // straight to these instead of decoding out[10] itself.
+    canBold: bold === null ? false : !!(faces & (bold ? CAN_BOLD_OFF : CAN_BOLD_ON)),
+    canItalic: italic === null ? false : !!(faces & (italic ? CAN_ITALIC_OFF : CAN_ITALIC_ON)),
   };
 }
 
@@ -344,12 +397,33 @@ let typingColorFollowsCaret = true;
 // and drops the pick exactly as §2 documents.
 let typingColorArmedAt = -1;
 let typingColorArmedArgb = 0;
+// The STICKY pick, which outlives an edit session (null = none). See the
+// setTypingColor handler for why, and openEditorAt for where it is re-armed.
+let stickyColorArgb = null;
+// THE TYPING FONT HAS EXACTLY ONE LIFETIME — follow-the-caret (user decision
+// 2026-08-13: "no sticky mode for fonts"). So there is deliberately NO
+// typingFontFollowsCaret switch, and no cross-session sticky face: a font pick at a
+// bare caret is dropped by the very next cursor move, full stop.
+//
+// The SAME-INDEX EXCEPTION still applies, for the same measured reason colour needed
+// it (docs/STYLING.md §2): picking in a host control — a <select> is the obvious font
+// picker — steals focus from the sink, so the user's next gesture is a click back
+// into the box at the same spot. Without the exception a picker could never arm a
+// typing font at all.
+let typingFontArmedAt = -1;
+let typingFontArmedName = null;
 function postCaretMoved(index) {
   const keepPick = typingColorFollowsCaret && typingColorArmedAt >= 0 &&
                    index === typingColorArmedAt;
   if (typingColorFollowsCaret && editor && !keepPick) {
     F.editSetTypingColor(editor, 0, 0);
     typingColorArmedAt = -1;
+  }
+  const keepFont = typingFontArmedAt >= 0 && index === typingFontArmedAt;
+  if (editor && !keepFont && typingFontArmedAt >= 0) {
+    F.editSetTypingFont(editor, 0);   // 0 = back to each segment's Original font
+    typingFontArmedAt = -1;
+    typingFontArmedName = null;
   }
   // A deliberate caret move finishes the word (Phase 5): the next keystroke
   // must start a fresh undo entry, not merge into text typed somewhere else.
@@ -360,6 +434,14 @@ function postCaretMoved(index) {
   // keystroke takes the pick — report that, or the host's swatch would lie.
   const style = readRangeStyle(index, index);
   if (keepPick && style) style.colorArgb = typingColorArmedArgb >>> 0;
+  // Same rule for a surviving FONT pick, and deliberately the same SHAPE as colour's:
+  // the report names what the next keystroke will actually take, so a host's picker
+  // does not snap back to the font under the cursor. It carries colour's documented
+  // asymmetry with it — `bold`/`italic`/`fontFamily` still describe the character
+  // before the caret, because those are the only honest answers the core has for a
+  // face the host named. See docs/STYLING.md §2's warning; do not "fix" one of these
+  // two payloads without the other.
+  if (keepFont && style && typingFontArmedName) style.fontName = typingFontArmedName;
   postMessage({
     type: "caretMoved", index, caret: readCaret(index),
     style,
@@ -402,6 +484,49 @@ function readRunBounds(len) {
          Math.max(b[2], c[0]), Math.max(b[3], c[1])];
   }
   return b;
+}
+
+// ---- fonts (docs/FONTS.md) -----------------------------------------------------
+// Host-supplied faces, keyed by the host's own name. DOCUMENT-owned handles, so this
+// is cleared with the document — see the `open` handler.
+const fontHandles = new Map();
+
+// pdfe_edit_apply_face's negative codes -> the SDK's error vocabulary. The refusal is
+// a product outcome, not an internal failure: "this family has no bold face" is
+// something a host has to be able to tell the user, which is why it gets its own code
+// rather than a generic engine-error (docs/FONTS.md §3).
+function faceErrorCode(rc) {
+  if (rc === -3) return "no-such-face";   // PDFE_FACE_ERR_NO_FACE — THE refusal
+  if (rc === -2) return "mixed-fonts";    // PDFE_FACE_ERR_MIXED
+  if (rc === -1) return "no-selection";   // PDFE_FACE_ERR_SESSION
+  return "engine-error";                  // PDFE_FACE_ERR_APPLY, or anything new
+}
+
+// The reply both font verbs send. Shaped on applyColor's, with ONE difference that
+// matters: a font apply CHANGES METRICS, so it can rewrap and grow the run — the
+// paragraph's cached tap-routing bounds have to grow with it exactly as a keystroke's
+// do (I9), and the caller repaints a strip that already covers old ∪ new because the
+// core's dirty rect does.
+function postFontApplied(what, ok, s, e, dirty, extra) {
+  if (editParaBounds && dirty[2] > dirty[0] && dirty[3] > dirty[1]) {
+    editParaBounds = [
+      Math.min(editParaBounds[0], dirty[0]), Math.min(editParaBounds[1], dirty[1]),
+      Math.max(editParaBounds[2], dirty[2]), Math.max(editParaBounds[3], dirty[3]),
+    ];
+  }
+  const blitMs = renderDirtyStrip(editPage, dirty);
+  postMessage({
+    type: "styleApplied", what, ok, page: editPage,
+    dirty, blitMs: Math.round(blitMs * 100) / 100,
+    // NO caret, for applyColor's reason: this path only runs with a RANGE, and
+    // readCaret(-1) would clamp to index 0 and draw the bar at the start of the run.
+    selection: readSelectionRects(s, e),
+    h0: readCaret(s), h1: readCaret(e), selStart: s, selEnd: e,
+    runBounds: readRunBounds(readEditorText().length),
+    style: readRangeStyle(s, e),               // read back AFTER the write
+    ...extra,
+  });
+  postHistory();                               // a style change is a recordable step
 }
 
 // Run pdfe_group_page on |page| and refresh both caches (the core's one-slot
@@ -923,6 +1048,15 @@ function openEditorAt(page, xPt, yPt, lineMode) {
   // revival must never leak across sessions (the index would name a spot in a
   // different run).
   typingColorArmedAt = -1;
+  // The FONT pick is session-scoped in BOTH senses, because font has only the
+  // follow-the-caret lifetime (user decision 2026-08-13: no sticky mode). There is
+  // nothing to re-arm here, and that absence is the decision, not an omission.
+  typingFontArmedAt = -1;
+  typingFontArmedName = null;
+  // ...but a STICKY pick is deliberately NOT session-scoped: re-arm it on the new
+  // session so typing in this box takes the colour the host still shows.
+  if (!typingColorFollowsCaret && stickyColorArgb != null)
+    F.editSetTypingColor(editor, stickyColorArgb >>> 0, 1);
   const text = readEditorText();
   const caretIdx = F.editBoundary(editor, xPt, yPt);
   postMessage({
@@ -1352,6 +1486,10 @@ onmessage = async (e) => {
       tileQueue.length = 0; paintQueue.length = 0; pendingEdit = null;
       groupQueue.length = 0; groupQueued.clear(); groupCache.clear();
       coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
+      // Font handles are DOCUMENT-owned (pdfe_close_doc frees them), so the registry
+      // must not outlive the doc — a stale handle applied to the next file is a
+      // use-after-free. A host re-registers its faces after opening.
+      fontHandles.clear();
       F.closeDoc(doc); doc = 0; pages.length = 0;
       // Only now may the old source go: the doc read from it until this point.
       sourceBlob = null; sourceSize = 0; blocks.clear();
@@ -1486,6 +1624,7 @@ onmessage = async (e) => {
     // user's spot. The override itself lives on (typing never clears it) —
     // only the same-index revival stops applying.
     typingColorArmedAt = -1;
+    typingFontArmedAt = -1;   // same reason; the armed FACE itself lives on
     // Newest-wins: overwrite any not-yet-drained edit (§9).
     pendingEdit = {
       fullText: msg.fullText,
@@ -1837,6 +1976,15 @@ onmessage = async (e) => {
   // typing — the core cannot tell a tap from a keystroke (docs/STYLING.md).
   if (msg.type === "setTypingColor") {
     if (editor) F.editSetTypingColor(editor, msg.argb >>> 0, msg.set ? 1 : 0);
+    // STICKY SURVIVES THE BOX (user decision 2026-08-13). The core's typing colour
+    // lives on the EDIT SESSION, so opening another box used to lose it and typing
+    // fell back to the caret's colour — reported as wrong, and it is: "sticky until
+    // the host clears it" cannot mean "until the user taps the next paragraph".
+    // Remembered HERE, re-armed in openEditorAt. Only while sticky: a FOLLOW-mode
+    // pick is dropped by the very next cursor move, so persisting it would resurrect
+    // something the user already moved away from.
+    if (!typingColorFollowsCaret) stickyColorArgb = msg.set ? (msg.argb >>> 0) : null;
+    if (!msg.set) stickyColorArgb = null;      // clearTypingColor() ends it in both modes
     // Remember WHERE a collapsed-caret pick armed the override (msg.at; -1 for
     // a range apply or a clear): a tap back to that exact index keeps the pick
     // — see postCaretMoved.
@@ -1852,6 +2000,9 @@ onmessage = async (e) => {
   //       session takes the picked colour wherever the cursor goes.
   if (msg.type === "setTypingColorFollowsCaret") {
     typingColorFollowsCaret = !!msg.on;
+    // Back to follow-the-caret: the cross-session pick retires with the mode, or the
+    // next box would silently type in a colour whose lifetime rule no longer exists.
+    if (typingColorFollowsCaret) stickyColorArgb = null;
     return;
   }
 
@@ -1895,6 +2046,123 @@ onmessage = async (e) => {
       style: readRangeStyle(s, e),             // read back AFTER the write
     });
     postHistory();                             // a style change is a recordable step
+    return;
+  }
+
+  // ---- fonts: the DELIVERY contract, then the two verbs -----------------------
+  // THE HOST PROVIDES THE VARIANTS (user decision 2026-08-13). The SDK bundles no
+  // font catalog, so a face reaches the engine only by a host handing over bytes (or
+  // naming a standard-14 face). This is the web mirror of Android's FontCatalog ->
+  // FontSpec -> pdfe_load_asset_font path, and it is the thing web genuinely did not
+  // have — which is why applyFont was Android-only until now, plumbing aside.
+  //
+  // Handles are DOCUMENT-owned (freed at pdfe_close_doc), so the registry is keyed by
+  // the host's own name and cleared with the document; a host re-registers after
+  // opening a new file. Names are the identity a host applies by, exactly as Android
+  // keys its native font cache by the picker's display name rather than an asset path.
+  if (msg.type === "loadFont") {
+    const name = String(msg.name || "");
+    if (!doc || !name) {
+      postMessage({ type: "fontLoaded", ok: false, name, reason: "bad-source" });
+      return;
+    }
+    let handle = fontHandles.get(name) || 0;
+    if (!handle) {
+      if (msg.bytes && msg.bytes.byteLength) {
+        const src = new Uint8Array(msg.bytes);
+        const bp = mod._malloc(src.length);
+        mod.HEAPU8.set(src, bp);
+        // COMPOSITE (CID) always — pdfe_load_asset_font's contract, and the reason is
+        // a real bug (the Meticula zero-width-space one). Nothing to decide here.
+        handle = withUtf8(name, (np) => F.loadAssetFont(doc, np, bp, src.length));
+        mod._free(bp);
+      } else {
+        handle = withUtf8(name, (np) => F.loadStandardFont(doc, np));
+      }
+      if (handle) fontHandles.set(name, handle);
+    }
+    // REGISTERING IS WHAT MAKES BOLD/ITALIC POSSIBLE, and it is not optional here:
+    // a face nobody registered is a face pdfe_edit_apply_face cannot find, so a host
+    // that loaded Roboto-Bold would still be told "no bold face". The core derives
+    // the family, weight and slant from the font itself so all three shells agree.
+    if (handle) F.registerFace(doc, handle);
+    postMessage({
+      type: "fontLoaded", ok: !!handle, name,
+      reason: handle ? undefined : "font-failed",
+    });
+    return;
+  }
+
+  // APPLY A FAMILY. Two verbs over one gesture, the same shape as colour: a RANGE is
+  // restyled now, a BARE CARET arms what the next keystroke takes.
+  if (msg.type === "applyFont") {
+    if (!editor) return;                       // no run open: silent, like applyColor
+    if (pendingEdit) drainLatch();             // indices were computed against the sink
+    const name = msg.name == null ? null : String(msg.name);
+    // null / "" is ORIGINAL — the core's own sentinel for "keep each segment's own
+    // font", which is why a font can have one and a colour cannot (pdfe.h).
+    const handle = name ? (fontHandles.get(name) || 0) : 0;
+    if (name && !handle) {
+      postMessage({ type: "styleApplied", what: "font", ok: false, page: editPage,
+                    fontName: name, reason: "font-failed" });
+      return;
+    }
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start | 0, len));
+    const e = Math.max(s, Math.min(msg.end | 0, len));
+    if (e <= s) {
+      // BARE CARET: arm the typing font. Remember WHERE, so a click back to the same
+      // index keeps the pick (the picker-steals-focus exception above).
+      F.editSetTypingFont(editor, handle);
+      typingFontArmedAt = s;
+      typingFontArmedName = name;
+      postMessage({ type: "styleApplied", what: "typingFont", ok: true, page: editPage,
+                    fontName: name, caretIndex: s });
+      return;
+    }
+    dirtyPages.add(editPage);
+    noteMutation(editPage);                    // split/coalesce renumbers objects
+    const dPtr = mod._malloc(16);
+    const rc = F.editApplyFont(editor, s, e, handle, dPtr);
+    const dirty = readF32(dPtr, 4);
+    mod._free(dPtr);
+    syncEditTextPage();
+    postFontApplied("font", rc >= 0, s, e, dirty, { fontName: name });
+    return;
+  }
+
+  // BOLD / ITALIC. One message for both, because the core has one call for both —
+  // there is no bold property in a PDF, only a different font. `bold`/`italic` are
+  // true / false / null, where null means "leave that one alone".
+  if (msg.type === "applyFace") {
+    if (!editor) return;
+    if (pendingEdit) drainLatch();
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start | 0, len));
+    const e = Math.max(s, Math.min(msg.end | 0, len));
+    const tri = (v) => (v == null ? -1 : (v ? 1 : 0));
+    if (e <= s) {
+      // A collapsed range is a READ to the core, so it refuses rather than restyling
+      // the character before the cursor. Say so in the host's vocabulary instead of
+      // leaking PDFE_FACE_ERR_SESSION: "select something first" is the real answer.
+      postMessage({ type: "styleApplied", what: "face", ok: false, page: editPage,
+                    reason: "no-selection", bold: msg.bold, italic: msg.italic });
+      return;
+    }
+    dirtyPages.add(editPage);
+    noteMutation(editPage);
+    const dPtr = mod._malloc(16);
+    const rc = F.editApplyFace(editor, s, e, tri(msg.bold), tri(msg.italic), dPtr);
+    const dirty = readF32(dPtr, 4);
+    mod._free(dPtr);
+    syncEditTextPage();
+    // rc 0 is "already that face" — a success with nothing repainted, and the host
+    // still gets a fresh style read so its buttons settle.
+    postFontApplied("face", rc >= 0, s, e, dirty, {
+      bold: msg.bold, italic: msg.italic,
+      reason: rc >= 0 ? undefined : faceErrorCode(rc),
+      changed: rc > 0,
+    });
     return;
   }
 

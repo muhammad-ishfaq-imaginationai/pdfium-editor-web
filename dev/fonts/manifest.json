@@ -1,0 +1,212 @@
+{
+  "manifestVersion": 1,
+  "generatedBy": "scripts/build_fonts.sh",
+  "subset": "latin",
+  "unicodeRanges": "U+0020-007E,U+00A0-00FF,U+0100-017F,U+02C6-02DC,U+2013-2014,U+2018-201A,U+201C-201E,U+2020-2022,U+2026,U+2030,U+2039-203A,U+2044,U+20AC,U+2122,U+2212,U+FB01-FB02",
+  "families": [
+    {
+      "key": "liberationsans",
+      "label": "Liberation Sans",
+      "faces": [
+        {
+          "file": "LiberationSans-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 52688,
+          "sha256": "802d0d8d452f8332273f96083b4d386df6c1a29dfafd5868ef9e1603e7350efe"
+        },
+        {
+          "file": "LiberationSans-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 51504,
+          "sha256": "a19d0d49e0db7971bce8c1380f883a011c406903b2ac4e51c487198f0efd969e"
+        },
+        {
+          "file": "LiberationSans-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 51140,
+          "sha256": "21952af4ae73fdb55eb9eb307b0ba9f43bec9c9c8cfc00bd89b4316f3414026f"
+        },
+        {
+          "file": "LiberationSans-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 51188,
+          "sha256": "0a0ad331b968943c033990b36172c10fc3ca10ba5083ca1122e55f111d4f7d3d"
+        }
+      ]
+    },
+    {
+      "key": "liberationserif",
+      "label": "Liberation Serif",
+      "faces": [
+        {
+          "file": "LiberationSerif-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 65288,
+          "sha256": "fe6715f64d0b119cc89733be7b0e393cc34f0502fce8e0f154e605add25c6791"
+        },
+        {
+          "file": "LiberationSerif-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 56324,
+          "sha256": "aa85177ae543c8339b10d01ad48344f7102cf96616965d7098ffc3156374ddda"
+        },
+        {
+          "file": "LiberationSerif-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 58744,
+          "sha256": "ab01cbe6571c7f08fb2af88fae629dbb81037b8d997d01cdf85b39dc236ac810"
+        },
+        {
+          "file": "LiberationSerif-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 56676,
+          "sha256": "fab45f258d94112f5124618ec35a0577eab55d1aba06696a6e0126123db6bf72"
+        }
+      ]
+    },
+    {
+      "key": "liberationmono",
+      "label": "Liberation Mono",
+      "faces": [
+        {
+          "file": "LiberationMono-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 45156,
+          "sha256": "0ae820b62c5528b55c59fc9255c9767270684f8234cc31163eec588f9da1597b"
+        },
+        {
+          "file": "LiberationMono-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 45312,
+          "sha256": "3c67e5485f8036b6fd42fb77c84191637eff9f16fdd552784b2965885fef0fdc"
+        },
+        {
+          "file": "LiberationMono-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 38912,
+          "sha256": "e3cadc5850bd260a0ba81ae60e2eab6b8ca3f3cdaf976ebffc5e474ed86d8be3"
+        },
+        {
+          "file": "LiberationMono-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 39628,
+          "sha256": "82ebc6ecbfc99f9d44f8461e64de7ae87bc16ec5a4e498e7f48526a6d72c7131"
+        }
+      ]
+    },
+    {
+      "key": "carlito",
+      "label": "Carlito",
+      "faces": [
+        {
+          "file": "Carlito-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 148696,
+          "sha256": "71d0bd7485b8956e1d0fde1f19a624d58116a7953f7c1819ce1aeb0e8e1b51dd"
+        },
+        {
+          "file": "Carlito-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 171344,
+          "sha256": "873ee91b265c5427c0219786cdd4119f4d2399f01f78f484fa006cbfae66849a"
+        },
+        {
+          "file": "Carlito-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 141036,
+          "sha256": "78ecca67b1cde6a3723bee540ae42afe761af03b6195475a642735b0e773a77b"
+        },
+        {
+          "file": "Carlito-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 178076,
+          "sha256": "38c3275f676e497348c31c2670878884ebcb410806d9ef18e451258b99de792d"
+        }
+      ]
+    },
+    {
+      "key": "caladea",
+      "label": "Caladea",
+      "faces": [
+        {
+          "file": "Caladea-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 60768,
+          "sha256": "3c1fbb108caa2fc95e1b2a4e3c9228f9b05c59be4122358abb76e8d870c59786"
+        },
+        {
+          "file": "Caladea-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 63952,
+          "sha256": "c9d90510d400b4b8593808588ed22457014ef7547b826210e2240c716521cacf"
+        },
+        {
+          "file": "Caladea-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 62116,
+          "sha256": "855890e82f5aecd9ef6dd5d919a49a5246780aedf77888762b4ea6cd0b0188a2"
+        },
+        {
+          "file": "Caladea-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 63100,
+          "sha256": "026d56ef2bb1acf005f91b6a6cff500226511f42461b1f66a3d59a66e4099eb4"
+        }
+      ]
+    },
+    {
+      "key": "roboto",
+      "label": "Roboto",
+      "faces": [
+        {
+          "file": "Roboto-Regular.ttf",
+          "weight": 400,
+          "italic": false,
+          "bytes": 70944,
+          "sha256": "319826ec5359ca728facb7638a97052626f43109f7b2f79bb5ba45d972a28265"
+        },
+        {
+          "file": "Roboto-Bold.ttf",
+          "weight": 700,
+          "italic": false,
+          "bytes": 70076,
+          "sha256": "8a2dbccb21f051b75f27a3f5dba29bd0373b9efa3316d15e6c3451bc59f9a6d3"
+        },
+        {
+          "file": "Roboto-Italic.ttf",
+          "weight": 400,
+          "italic": true,
+          "bytes": 72308,
+          "sha256": "3f91e921eb5ad7253201bc46dd84f93451dcd82d9835aeafef4f2ff06b10f50f"
+        },
+        {
+          "file": "Roboto-BoldItalic.ttf",
+          "weight": 700,
+          "italic": true,
+          "bytes": 72628,
+          "sha256": "9651765fe8df0c07369bacb74003dc89eb6e618305c2341dfe1e2963a65f514d"
+        }
+      ]
+    }
+  ]
+}

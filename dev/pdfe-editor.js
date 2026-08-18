@@ -306,6 +306,10 @@ export class PdfeEditor {
     // racing on the same name must both be resolved by that single reply (a single
     // slot would leave the first promise pending forever).
     this._fontWaits = new Map();
+    // In-flight prepareFonts() resolvers. A LIST for the same reason: the bundled set is
+    // registered once per document and answered once, so every waiter shares that reply.
+    this._fontsWaits = [];
+    this._bundledFamilies = [];
     this._editGeneration = 0;
     this._composing = false;
     // The caret thumb is TOUCH-ONLY (a permanent grip under a mouse caret is
@@ -720,6 +724,30 @@ export class PdfeEditor {
       // worker interns it into the document immediately.
       this._post({ type: "loadFont", name, bytes: bytes || null },
                  bytes ? [bytes] : undefined);
+    });
+  }
+
+  /**
+   * Await the SDK's own bundled font families, and learn which ones there are.
+   *
+   * THEY REGISTER AUTOMATICALLY on every open — you do not have to call this to get
+   * working bold/italic, and that is deliberate: which faces are registered decides which
+   * face a bold/italic apply resolves to, and that answer lands in SAVED BYTES, so
+   * "the host forgot to call it" must not be a way for this platform to diverge from
+   * Android (docs/FONTS.md §2bis).
+   *
+   * What this gives you is the TIMING: the returned promise settles when the faces have
+   * landed, so you can show a spinner and only then tell the user the fonts are usable.
+   * Resolves `{ ok, families: [{ key, label, faces }], failed: [] }`; `families` is what a
+   * picker should offer, and `key` is what a style report's `fontFamily` will match.
+   *
+   * Add your OWN faces with `loadFont()` — they sit alongside these. Note that a face you
+   * add reaches one platform only; ours are the same everywhere by construction.
+   */
+  prepareFonts() {
+    return new Promise((resolve) => {
+      this._fontsWaits.push(resolve);
+      this._post({ type: "prepareFonts" });
     });
   }
 
@@ -1176,6 +1204,18 @@ export class PdfeEditor {
     // The worker owns the caret sites, so it owns the flag. Posted rather than
     // read from a constructor argument because a host may flip it at runtime.
     this._post({ type: "setTypingColorFollowsCaret", on: this._typingColorFollowsCaret });
+    // WHERE THE BUNDLED FONT SET LIVES. Default is `./fonts/` relative to the worker,
+    // which is the npm layout by construction (the worker ships at
+    // dist/assets/pdfe-worker.js, so the set is at dist/assets/fonts/). A host serving a
+    // different layout — the dev page in this repo, for one — passes `fontsUrl`. It is a
+    // constructor option like workerUrl/engineUrl rather than an open() option, because it
+    // describes the INSTALL, not the document.
+    if (opts.fontsUrl) {
+      this._post({
+        type: "prepareFonts",
+        fontsUrl: new URL(opts.fontsUrl, this._doc.baseURI).href,
+      });
+    }
   }
 
   _onWorkerMessage(msg) {
@@ -1438,6 +1478,24 @@ export class PdfeEditor {
         this._textStyle = msg.style || null;
         this._emit("styled", { what: "read", page: msg.page, style: msg.style || null });
         break;
+      case "fontsReady": {
+        this._bundledFamilies = msg.families || [];
+        const waits = this._fontsWaits.splice(0);
+        for (const w of waits) {
+          w({ ok: !(msg.failed || []).length, families: this._bundledFamilies,
+              failed: msg.failed || [] });
+        }
+        this._emit("fontsReady", { families: this._bundledFamilies, failed: msg.failed || [] });
+        // The faces that just landed change which B/I buttons are AVAILABLE, and the host
+        // was told the old answer while the fetch was in flight. Re-read at the current
+        // selection so a Calibri document's Bold button corrects itself instead of staying
+        // wrong until the next caret move. Only the main thread can do this: the worker
+        // does not track the selection, which lives in this side's sink.
+        if (this._editingPage >= 0 && this.sink) {
+          this.requestTextStyle(this.sink.selectionStart, this.sink.selectionEnd);
+        }
+        break;
+      }
       case "fontLoaded": {
         // Resolve loadFont()'s promise, and surface a failure as an event too: a host
         // that fired-and-forgot still needs to hear that its face never arrived.
@@ -1473,9 +1531,19 @@ export class PdfeEditor {
                                  fontName: msg.fontName, style: this._textStyle });
           break;
         }
+        // ARMING A FACE AT A BARE CARET paints nothing either, for the same reason as a
+        // typing font: there is no range, so no selection, no handles and no strip. It
+        // must also NOT mark the document dirty — nothing on the page changed — which is
+        // the whole reason it is a separate branch from the apply below.
+        if (msg.armed) {
+          this._textStyle = msg.style || null;
+          this._emit("styled", { what: "typingFace", page: msg.page,
+                                 style: msg.style || null });
+          break;
+        }
         if (msg.runBounds) this._drawEditBox(msg.runBounds);
-        // NO CARET. A style apply only ever happens with a RANGE selected (the
-        // worker returns early on a collapsed one), and a range has no caret —
+        // NO CARET. A style apply that gets here always had a RANGE selected (a bare
+        // caret took the `armed` branch above), and a range has no caret —
         // `selectionChanged` draws none for exactly this reason. Drawing one put a
         // blinking bar at the START of the run while the selection was still
         // highlighted mid-run, which read as "the cursor jumped to the beginning".

@@ -322,8 +322,11 @@ const PDFE_STYLE_COLOR = 1, PDFE_STYLE_SIZE = 2, PDFE_STYLE_BASELINE = 8;
 // purpose: one family can be carried by several subset handles, and a picker must
 // still be able to show its name.
 const PDFE_STYLE_FAMILY = 16, PDFE_STYLE_BOLD = 32, PDFE_STYLE_ITALIC = 64,
-      PDFE_STYLE_FACES = 128;
+      PDFE_STYLE_FACES = 128, PDFE_STYLE_FACE_SRC = 256;
 const CAN_BOLD_ON = 1, CAN_BOLD_OFF = 2, CAN_ITALIC_ON = 4, CAN_ITALIC_OFF = 8;
+// pdfe_edit_apply_face's positive non-apply: a bare caret armed the face for what is
+// typed next, and the page is untouched.
+const PDFE_FACE_ARMED = 2;
 const FONT_NAME_BASE = 0, FONT_NAME_FAMILY = 1;
 
 // The range's font name, or null when it MIXES. Two-call, like every core string
@@ -337,6 +340,74 @@ function readFontName(s, e, which) {
   const bytes = new Uint8Array(mod.HEAPU8.buffer, ptr, n - 1).slice();  // drop the NUL
   mod._free(ptr);
   return new TextDecoder().decode(bytes);
+}
+
+// ---- THE ONE CANONICAL FONT SET (docs/FONTS.md §2bis) -----------------------
+//
+// The same 6 families x 4 faces the AAR ships, fetched from `fonts/` next to this worker
+// and registered on the open document. It is registered AUTOMATICALLY rather than on
+// request, and that is a parity decision: which faces are registered decides which face a
+// bold/italic apply resolves to, and that answer lands in SAVED BYTES — so "the host
+// forgot to call prepareFonts" must not be a way for the same document to edit differently
+// on web than on Android.
+//
+// Default location is `./fonts/` RELATIVE TO THIS WORKER, which is the npm layout by
+// construction: the worker ships at dist/assets/pdfe-worker.js, so the set lands at
+// dist/assets/fonts/. A host on a different layout passes `fontsUrl` to open().
+let fontsBaseUrl = null;
+let bundledFonts = { state: "none", families: [], failed: [] };   // none|loading|ready
+
+async function registerBundledFonts() {
+  if (!doc || bundledFonts.state === "loading") return;
+  bundledFonts = { state: "loading", families: [], failed: [] };
+  const base = new URL(fontsBaseUrl || "./fonts/", self.location.href);
+  const docAtStart = doc;
+  try {
+    const man = await (await fetch(new URL("manifest.json", base))).json();
+    const families = [], failed = [];
+    for (const fam of man.families || []) {
+      let n = 0;
+      // The family's REGULAR face name, which is what a host passes to applyFont(): the
+      // picker offers a family, but applyFont takes a registered face, and B/I then reach
+      // the rest of the ladder. faces[0] is Regular by the manifest's own ordering.
+      const regular = (fam.faces && fam.faces[0] && fam.faces[0].file || "")
+        .replace(/\.ttf$/, "");
+      for (const face of fam.faces || []) {
+        // The document may have closed under us mid-fetch; a handle registered onto a
+        // freed doc is a use-after-free, so bail rather than press on.
+        if (doc !== docAtStart) return;
+        try {
+          const buf = await (await fetch(new URL(face.file, base))).arrayBuffer();
+          const src = new Uint8Array(buf);
+          const bp = mod._malloc(src.length);
+          mod.HEAPU8.set(src, bp);
+          // The cache key is the FACE name — the filename without .ttf — which is the
+          // same string Android uses, so both platforms key the per-document cache alike.
+          const name = face.file.replace(/\.ttf$/, "");
+          const h = withUtf8(name, (np) => F.loadAssetFont(doc, np, bp, src.length));
+          mod._free(bp);
+          if (h) { fontHandles.set(name, h); F.registerFace(doc, h); n++; }
+          else failed.push(face.file);
+        } catch { failed.push(face.file); }
+      }
+      if (n) families.push({ key: fam.key, label: fam.label, faces: n, regular });
+    }
+    bundledFonts = { state: "ready", families, failed };
+  } catch (e) {
+    // No manifest / no network: the SDK simply offers no bundled families. Everything
+    // else still works, and the standard-14 substitution rungs are built into the engine
+    // so Arial/Times/Courier bold-italic are unaffected.
+    bundledFonts = { state: "ready", families: [], failed: ["manifest.json"] };
+  }
+  postMessage({
+    type: "fontsReady",
+    families: bundledFonts.families,
+    failed: bundledFonts.failed,
+  });
+  // The faces that just landed change which B/I buttons are available, and the host was
+  // told the old answer before the fetch finished. The main thread re-reads the style off
+  // `fontsReady` — it owns the sink and therefore the selection, which this side does not
+  // track (every style request arrives carrying its own start/end).
 }
 
 function readRangeStyle(s, e) {
@@ -353,6 +424,12 @@ function readRangeStyle(s, e) {
   const bold = (mask & PDFE_STYLE_BOLD) ? v[8] === 1 : null;
   const italic = (mask & PDFE_STYLE_ITALIC) ? v[9] === 1 : null;
   const faces = (mask & PDFE_STYLE_FACES) ? v[10] : 0;
+  const subs = (mask & PDFE_STYLE_FACE_SRC) ? v[11] : 0;
+  // Which toggle would be served by ANOTHER family's face, folded the same way
+  // canBold/canItalic are — "press B" resolved into on-or-off — so the two answers
+  // cannot disagree about which direction the button is pointing.
+  const wouldSub = (isOn, onBit, offBit) =>
+    isOn === null ? false : !!(subs & (isOn ? offBit : onBit));
   return {
     start: s, end: e,
     colorArgb: argb,
@@ -370,6 +447,13 @@ function readRangeStyle(s, e) {
     // straight to these instead of decoding out[10] itself.
     canBold: bold === null ? false : !!(faces & (bold ? CAN_BOLD_OFF : CAN_BOLD_ON)),
     canItalic: italic === null ? false : !!(faces & (italic ? CAN_ITALIC_OFF : CAN_ITALIC_ON)),
+    // AND WHETHER PRESSING IT WOULD CHANGE THE TYPEFACE. The family may have no such
+    // face, in which case a metric-compatible sibling family serves it (Arial's bold
+    // italic comes from Helvetica's). The face is always REAL — never a synthetic
+    // slant or weight — but it is not the author's font, so a host that shows this is
+    // being honest and one that ignores it is not (docs/FONTS.md §3).
+    boldWouldSubstitute: wouldSub(bold, CAN_BOLD_ON, CAN_BOLD_OFF),
+    italicWouldSubstitute: wouldSub(italic, CAN_ITALIC_ON, CAN_ITALIC_OFF),
   };
 }
 
@@ -434,13 +518,17 @@ function postCaretMoved(index) {
   // keystroke takes the pick — report that, or the host's swatch would lie.
   const style = readRangeStyle(index, index);
   if (keepPick && style) style.colorArgb = typingColorArmedArgb >>> 0;
-  // Same rule for a surviving FONT pick, and deliberately the same SHAPE as colour's:
-  // the report names what the next keystroke will actually take, so a host's picker
-  // does not snap back to the font under the cursor. It carries colour's documented
-  // asymmetry with it — `bold`/`italic`/`fontFamily` still describe the character
-  // before the caret, because those are the only honest answers the core has for a
-  // face the host named. See docs/STYLING.md §2's warning; do not "fix" one of these
-  // two payloads without the other.
+  // Same rule for a surviving FONT PICK: the report names what the next keystroke will
+  // actually take, so a host's picker does not snap back to the font under the cursor.
+  // Only a pick needs restating here, and only its NAME — the pick is a host-named face
+  // the core cannot know about.
+  //
+  // A face ARMED BY B/I needs nothing: since 2026-08-18 the core reports the armed
+  // face's own name, family, bold and italic at a bare caret, which is what makes the B
+  // button un-press after being pressed. That also RESOLVED the asymmetry this comment
+  // used to warn about (name from the pick, bold/italic from the character) — there is
+  // now one answer for all four fields, and `typingFontArmedName` stays null for a face
+  // arm precisely so this line cannot become a second, rival answer.
   if (keepFont && style && typingFontArmedName) style.fontName = typingFontArmedName;
   postMessage({
     type: "caretMoved", index, caret: readCaret(index),
@@ -1568,6 +1656,14 @@ onmessage = async (e) => {
     // document may have left the shell's buttons enabled.
     lastHistory = "";
     postHistory(true);
+    // THE CANONICAL SET, on every open, without being asked. Font handles died with the
+    // previous document (fontHandles.clear() above), so this is per document. Started
+    // AFTER "opened" is posted and deliberately not awaited: a page must not wait on
+    // ~1.7 MB of faces to become interactive, and the only capability missing in that
+    // window is bold/italic on Calibri and Cambria — every other family is served by
+    // engine built-ins, which need no fetch at all.
+    bundledFonts = { state: "none", families: [], failed: [] };
+    registerBundledFonts();
     return;
   }
 
@@ -2141,28 +2237,53 @@ onmessage = async (e) => {
     const s = Math.max(0, Math.min(msg.start | 0, len));
     const e = Math.max(s, Math.min(msg.end | 0, len));
     const tri = (v) => (v == null ? -1 : (v ? 1 : 0));
-    if (e <= s) {
-      // A collapsed range is a READ to the core, so it refuses rather than restyling
-      // the character before the cursor. Say so in the host's vocabulary instead of
-      // leaking PDFE_FACE_ERR_SESSION: "select something first" is the real answer.
-      postMessage({ type: "styleApplied", what: "face", ok: false, page: editPage,
-                    reason: "no-selection", bold: msg.bold, italic: msg.italic });
-      return;
+    // A BARE CARET ARMS the face for what is typed next (PDFE_FACE_ARMED) rather than
+    // refusing, which is what pressing B with no selection has always meant. Nothing on
+    // the page changes, so this must NOT enter the dirty/mutation bookkeeping below —
+    // marking a document modified for an edit that never happened is a lie about what
+    // happened (docs/FONTS.md §3).
+    const arming = e <= s;
+    if (!arming) {
+      dirtyPages.add(editPage);
+      noteMutation(editPage);
     }
-    dirtyPages.add(editPage);
-    noteMutation(editPage);
     const dPtr = mod._malloc(16);
     const rc = F.editApplyFace(editor, s, e, tri(msg.bold), tri(msg.italic), dPtr);
     const dirty = readF32(dPtr, 4);
     mod._free(dPtr);
-    syncEditTextPage();
+    if (!arming) syncEditTextPage();
+    // ARM BOOKKEEPING: record WHERE it was armed so the caret-move choke point can drop
+    // it again (the same one-lifetime rule a font pick follows). Deliberately no
+    // typingFontArmedName — the CORE now reports the armed face's own name, family and
+    // bold/italic at a bare caret, so overriding the name here would be a second, rival
+    // answer to the same question.
+    if (rc === PDFE_FACE_ARMED) typingFontArmedAt = s;
     // rc 0 is "already that face" — a success with nothing repainted, and the host
-    // still gets a fresh style read so its buttons settle.
+    // still gets a fresh style read so its buttons settle. rc 2 is an arm: also a
+    // success, and also nothing repainted.
     postFontApplied("face", rc >= 0, s, e, dirty, {
       bold: msg.bold, italic: msg.italic,
       reason: rc >= 0 ? undefined : faceErrorCode(rc),
-      changed: rc > 0,
+      changed: rc === 1,          // ONLY a real apply modified the document
+      armed: rc === PDFE_FACE_ARMED,
     });
+    return;
+  }
+
+  // Register the bundled set (and report which families it offers). Called automatically
+  // after every open — handles are document-owned, so this is per document — and also
+  // callable by a host that wants to await readiness for its own progress UI.
+  if (msg.type === "prepareFonts") {
+    if (msg.fontsUrl) fontsBaseUrl = String(msg.fontsUrl);
+    if (bundledFonts.state === "ready") {
+      postMessage({
+        type: "fontsReady",
+        families: bundledFonts.families,
+        failed: bundledFonts.failed,
+      });
+    } else {
+      registerBundledFonts();          // deliberately not awaited: open must not block
+    }
     return;
   }
 

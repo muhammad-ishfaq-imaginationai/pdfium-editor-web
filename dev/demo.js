@@ -17,10 +17,14 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-a4c7117-wd323618";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-a4c7117-we913702";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
+// The ONE canonical font set (docs/FONTS.md §2bis). The SDK's default is `./fonts/` next
+// to the WORKER, which is the npm layout; this page serves the repo tree instead, so it
+// says where they really are — exactly what a host on a bespoke layout has to do.
+const FONTS_URL = "./fonts/";                          // build_site.sh → ./fonts/
 
 const $ = (id) => document.getElementById(id);
 const statusEl = $("status");
@@ -103,6 +107,7 @@ const blockMoveOn = params.get("move") === "0" ? false : BLOCK_MOVE_DEFAULT;
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
+  fontsUrl: FONTS_URL,
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
   blockMove: blockMoveOn,
@@ -381,6 +386,26 @@ for (const [value, text] of PICKER_FAMILIES) {
   o.value = value; o.textContent = text;
   fontSelect.appendChild(o);
 }
+
+// THE SDK'S OWN BUNDLED FAMILIES, appended to the picker as the SDK reports them
+// (docs/FONTS.md §2bis). They register themselves on every open, so this is not delivery —
+// it is discovery: `prepareFonts()` tells the host WHICH families exist and WHEN they are
+// usable, which is exactly what a picker needs and what a spinner waits on.
+//
+// The family KEY is what `applyFont` takes here, not a face name: the SDK resolves the
+// family's regular face itself, and B/I then reach the rest of the ladder.
+// Keyed by the family key (what a style report matches on); the option's VALUE is the
+// family's regular FACE name, because that is what applyFont() takes.
+const bundledOptions = new Map();
+function addBundledFamilies(families) {
+  for (const f of families) {
+    if (!f.regular || bundledOptions.has(f.key)) continue;
+    const o = document.createElement("option");
+    o.value = f.regular; o.textContent = f.label;
+    bundledOptions.set(f.key, o);
+    fontSelect.appendChild(o);
+  }
+}
 // A MIXED selection needs a blank option to select — <select> cannot render
 // indeterminate, and showing one of several families would be the lie the SDK's own
 // MIXED rule exists to prevent.
@@ -404,6 +429,17 @@ editor.on("opened", async () => {
   const results = await Promise.all(HOST_FACES.map((name) => editor.loadFont({ name })));
   const failed = results.filter((r) => !r.ok).map((r) => r.name);
   if (failed.length) setHint("Fonts", `could not register: ${failed.join(", ")}`);
+
+  // AND WAIT FOR THE SDK'S OWN SET. This is the host-visible loading step: the faces are
+  // already registering by themselves, and `prepareFonts()` is how a host knows when to
+  // stop saying "loading". Showing that state is the point of the API.
+  setHint("Fonts", "loading the bundled families…");
+  const bundled = await editor.prepareFonts();
+  addBundledFamilies(bundled.families);
+  setHint("Fonts", bundled.families.length
+    ? `${bundled.families.length} bundled families ready` +
+      (bundled.failed.length ? ` (${bundled.failed.length} failed)` : "")
+    : "no bundled families available");
 });
 
 fontSelect.addEventListener("change", (ev) => {
@@ -425,7 +461,13 @@ function showFontStyle(style) {
   // cursor reads "Helvetica-Bold" while the family the user picked is "Helvetica".
   const fam = style.fontFamily;
   const opt = fam == null ? null : PICKER_FAMILIES.find(([, , key]) => key === fam);
-  fontSelect.value = fam == null ? "__mixed" : (opt ? opt[0] : "__other");
+  // A bundled family is matched the same way — on the KEY the SDK reports, never on the
+  // display name — and its option carries the regular face as its value.
+  const bundled = fam == null ? null : bundledOptions.get(fam);
+  fontSelect.value = fam == null ? "__mixed"
+    : opt ? opt[0]
+    : bundled ? bundled.value
+    : "__other";
   // PRESSED state from `bold`/`italic`; ENABLED state from `canBold`/`canItalic`.
   // Two different questions: "is it bold" and "could it be". A family with no bold
   // face is refused by the SDK, and a disabled button is how the user learns that
@@ -434,6 +476,20 @@ function showFontStyle(style) {
   italicBtn.classList.toggle("active", style.italic === true);
   boldBtn.disabled = !style.canBold;
   italicBtn.disabled = !style.canItalic;
+  // AND WHETHER PRESSING IT WOULD CHANGE THE TYPEFACE. The family may have no such
+  // face, in which case a metric-compatible sibling serves it — Arial's bold italic
+  // comes from Helvetica's. The SDK reports that so a host can be honest about it, and
+  // a reference host that ignored its own report would be setting the wrong example.
+  // A title + a marker class, because the button must still read as available.
+  const subBold = !!style.boldWouldSubstitute, subItalic = !!style.italicWouldSubstitute;
+  boldBtn.classList.toggle("substitutes", subBold);
+  italicBtn.classList.toggle("substitutes", subItalic);
+  boldBtn.title = subBold ? "Bold — from a metric-compatible family (this one has no bold face)" : "Bold";
+  italicBtn.title = subItalic ? "Italic — from a metric-compatible family (this one has no italic face)" : "Italic";
+  if (subBold || subItalic) {
+    setHint("Fonts", `${[subBold && "bold", subItalic && "italic"].filter(Boolean).join(" and ")} ` +
+      `would come from a metric-compatible family — this one has no such face`);
+  }
 }
 
 // The refusal, as a host sees it. It is an `error` event with its own code rather than

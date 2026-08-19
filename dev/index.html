@@ -176,6 +176,10 @@
        reports that precisely so a host can say so. A dotted underline: visible, and
        clearly not the pressed state. */
     #bold.substitutes, #italic.substitutes { text-decoration: underline dotted; text-underline-offset: 3px; }
+    /* The press will reach only part of the selection (some fonts have no such face).
+       A different mark from .substitutes on purpose: they are different warnings —
+       "the typeface will change" vs "some characters will not change at all". */
+    #bold.partial, #italic.partial { outline: 1px dashed currentColor; outline-offset: 1px; }
 
     /* Unsaved-changes dot on Save (SDK `dirty` event). */
     #save { position: relative; }
@@ -407,7 +411,7 @@
         </svg>
       </span>
       <span class="name">pdfium<span>-editor</span></span>
-      <span id="appver" title="deployed version">1.7.5-a4c7117-we913702</span>
+      <span id="appver" title="deployed version">1.7.5-64a86c1-w5f2612a</span>
     </div>
 
     <div class="rule"></div>
@@ -423,6 +427,15 @@
     </label>
     <input id="file" class="sr-only" type="file" accept="application/pdf">
     <span id="docname" hidden></span>
+
+    <!-- DEV-ONLY: quick-open from the local test-files/ corpus, so a tester doesn't
+         have to click through the OS file picker for every fixture. Not SDK surface —
+         pure host convenience for this raw dev tree page, populated by parsing the dev
+         server's own directory listing (see demo.js). Stays hidden if that folder
+         isn't reachable, e.g. off the published site, which ships no test-files/. -->
+    <span class="seg" id="testfilesbox" hidden>
+      <select id="testfiles" title="open a file from test-files/" aria-label="test file"></select>
+    </span>
 
     <div class="grow"></div>
 
@@ -483,6 +496,12 @@
               aria-label="bold" disabled><b>B</b></button>
       <button class="btn icon" id="italic" title="italic (the family's italic face)"
               aria-label="italic" disabled><i>I</i></button>
+      <!-- FONT SIZE (phase 3, 2026-08-18). PRESETS plus a free entry, because a
+           dropdown alone cannot express "11.5" and the property is continuous. The
+           document's own size is added as an option when it is not a preset, so the
+           closed control reads the truth instead of snapping to the nearest preset —
+           the same rule the family picker follows with its "__other" option. -->
+      <select id="fontsize" title="font size (points)" aria-label="font size"></select>
     </span>
 
     <!-- UNDO / REDO — dev testing of docs/UNDO_REDO.md §6 (true text undo), added
@@ -611,7 +630,7 @@
     </div>
   </div>
 
-  <script type="module" src="demo.js?v=1.7.5-a4c7117-we913702"></script>
+  <script type="module" src="demo.js?v=1.7.5-64a86c1-w5f2612a"></script>
 </body>
 </html>
 <style>

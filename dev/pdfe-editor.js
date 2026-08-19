@@ -632,6 +632,59 @@ export class PdfeEditor {
   }
 
   /**
+   * Apply a font SIZE to the character selection, in the same two-verb shape as
+   * `applyTextColor`: a range is restyled, and a bare caret arms the size that newly
+   * typed characters take.
+   *
+   * `pt` is EFFECTIVE (on-page) points — what the user picked from your dropdown, not
+   * text-space units. On a matrix-scaled document those differ, and the core divides
+   * by |matrix.a| for you (I12); a host that pre-divided would halve the size twice.
+   *
+   * THE TYPING SIZE FOLLOWS THE CARET and that is its only lifetime — dropped when the
+   * cursor moves, with no sticky mode and no switch, matching the font family (the
+   * sticky option is colour-only by user decision — docs/STYLING.md §2).
+   *
+   * A non-positive size is REFUSED, not clamped: you get `styleApplied` with
+   * `ok: false` and `reason: "bad-size"`.
+   *
+   * Bind your dropdown's current value to `textStyle.sizePt`, which arrives with every
+   * `styled`/`selection` event and is `null` when the range mixes sizes — so the
+   * control can show "mixed" rather than lying about one of them.
+   */
+  applyFontSize(pt) {
+    if (this._editingPage < 0) return;
+    const sizePt = Number(pt);
+    if (!(sizePt > 0)) {
+      this._emit("error", { code: "size-failed", detail: `bad font size: ${pt}` });
+      return;
+    }
+    // Same ownership rule as applyTextColor and applyFont: styling IS an interaction
+    // with the editor, so the next Ctrl+Z is ours even though the gesture landed on
+    // the host's dropdown. Deliberately no sink.focus() — a native <select> popup may
+    // still be open, and on iOS focusing here pops the keyboard mid-pick (S39).
+    this._ownsKeyboard = true;
+    // THE SINK IS THE AUTHORITY for the range, not this._selRange — Shift+arrow moves
+    // it before the worker has replied.
+    const s = this.sink.selectionStart, e = this.sink.selectionEnd;
+    // Typing size first, so a collapsed pick is armed even with no range to paint. The
+    // collapsed case carries the caret index it was armed at for the same reason
+    // colour does: picking in a host control steals focus, and the click back to that
+    // same index must keep the pick rather than drop it.
+    this._post({ type: "setTypingSize", sizePt, set: 1, at: e > s ? -1 : s });
+    if (e > s) this._post({ type: "applySize", sizePt, start: s, end: e });
+  }
+
+  /**
+   * Drop the typing-SIZE override, back to inheriting from the character on the left.
+   * The twin of `clearTypingColor`, and the shell calls it on the same occasions: an
+   * explicit cursor move, never on typing.
+   */
+  clearTypingSize() {
+    if (this._editingPage < 0) return;
+    this._post({ type: "setTypingSize", sizePt: 0, set: 0 });
+  }
+
+  /**
    * Drop the typing-colour override, back to inheriting from the character on the
    * left. THE SHELL CALLS THIS ON AN EXPLICIT CURSOR MOVE — a tap, an arrow key, a
    * handle drag — and never on typing. The core cannot make that distinction (both
@@ -976,13 +1029,40 @@ export class PdfeEditor {
     return true;
   }
 
+  /**
+   * Could this element hold a TEXT CARET — i.e. does it have text undo of its own
+   * to protect from our Ctrl+Z? The one question both history-key guards ask
+   * (I67). `<select>`, `<button>`, a colour swatch, a range slider and a plain div
+   * all answer no: they take focus but they cannot be typed into.
+   *
+   * An INPUT with no `type` defaults to text, hence the empty alternative.
+   */
+  static _caretCapable(el) {
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    const tag = el.tagName || "";
+    if (tag === "TEXTAREA") return true;
+    if (tag !== "INPUT") return false;
+    return /^(|text|search|email|url|tel|password|number)$/.test((el.type || "").toLowerCase());
+  }
+
   _wireHistoryKeys() {
     if (this.undoShortcuts === "none") return;
     // Which surface the user last touched. Without this the SDK would steal
     // Ctrl+Z from a host that has its own binding elsewhere on the page.
+    //
+    // ONLY A CARET-CAPABLE SURFACE TAKES OWNERSHIP AWAY (I67). Releasing it on any
+    // outside pointerdown made every host toolbar click disarm Ctrl+Z until the user
+    // happened to click back into the page — the same defect as the keydown guard
+    // below, one event earlier, and the reason S45 had to hand `_ownsKeyboard = true`
+    // to applyTextColor and then to every style verb added after it. A toolbar that
+    // acts ON this editor is not a rival for the chord; a host's text field is. So
+    // host chrome leaves ownership exactly as it was, and the style verbs' re-take
+    // stays as the belt to this braces.
     this._ownsKeyboard = false;
     this._listen(this._doc, "pointerdown", (e) => {
-      this._ownsKeyboard = this.container.contains(e.target);
+      if (this.container.contains(e.target)) { this._ownsKeyboard = true; return; }
+      if (PdfeEditor._caretCapable(e.target)) this._ownsKeyboard = false;
     }, true);
     this._listen(this._doc, "keydown", (e) => {
       if (e.defaultPrevented) return;                  // the sink listener got it
@@ -990,17 +1070,27 @@ export class PdfeEditor {
       if (!this._ownsKeyboard) return;
       // Never steal from a real input the host owns outside our container —
       // where "real" means IT HAS TEXT UNDO TO PROTECT. A colour swatch, range
-      // slider or checkbox cannot hold a caret, so Ctrl+Z aimed at it is aimed
-      // at the DOCUMENT: after picking a colour the browser leaves focus on the
-      // host's <input type=color>, and treating that as a protected input made
-      // undo silently dead until the user happened to click back into the page
-      // (user-reported 2026-08-12; measured — the keydown arrived with
-      // target INPUT:color and defaultPrevented false).
+      // slider, checkbox or DROPDOWN cannot hold a caret, so Ctrl+Z aimed at one
+      // is aimed at the DOCUMENT.
+      //
+      // ASKED AS "CAN IT HOLD A CARET?", NOT AS A LIST OF EXCEPTIONS — and that
+      // polarity is the fix, not a tidy-up. S45 (2026-08-12) fixed this symptom for
+      // the colour swatch by EXEMPTING a list of textless <input> types, which left
+      // `SELECT` still counted as a protected input: it had been in the guard since
+      // the guard was written. So a size or family pick — both are `<select>`, and a
+      // dropdown keeps focus after a change — left Ctrl+Z silently dead, and stayed
+      // dead through every later action, because focus does not leave a <select> on
+      // its own. The user reported exactly that shape twice: "ctrl z not applying
+      // undo for font size", then "change font, drag box, ctrl z did not work
+      // either" (2026-08-19, I67 — measured in the browser: target SELECT#fontsize,
+      // defaultPrevented false, ownership already re-taken by applyFontSize).
+      //
+      // An exemption list fails DEAD when it is missing an entry; this test fails
+      // OPEN — an unlisted exotic widget gets undo it might not have wanted, instead
+      // of a document whose undo has silently stopped working.
       const t = e.target;
-      const textless = t && t.tagName === "INPUT" &&
-        /^(color|range|checkbox|radio|button|submit|reset|file)$/.test(t.type || "");
-      if (t && t !== this.sink && !this.container.contains(t) && !textless &&
-          (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName || ""))) return;
+      if (t && t !== this.sink && !this.container.contains(t) &&
+          PdfeEditor._caretCapable(t)) return;
       this._handleHistoryKey(e);
     });
   }
@@ -1565,11 +1655,23 @@ export class PdfeEditor {
         // Deliberately NOT latencySamples and NOT the `edit` event: a style pick is
         // not a keystroke, and folding it in would pollute the keystroke->blit p95
         // the demo and the perf gate read.
-        this._emit("styled", { what: msg.what, page: msg.page, style: msg.style || null });
+        // `partial` rides along on a face apply that reached only part of the range
+        // (some characters' fonts have no such face). It is a real edit either way —
+        // the dirty flag above is set for both — so this is disclosure, not a failure.
+        this._emit("styled", { what: msg.what, page: msg.page, style: msg.style || null,
+                               ...(msg.partial ? { partial: true } : {}) });
         break;
       case "editApplied": {
         // Keep the blue box on the run as typing reflows/grows it.
-        if (msg.runBounds) this._drawEditBox(msg.runBounds);
+        //
+        // PASSED THROUGH EVEN WHEN NULL (I68). This was `if (msg.runBounds)`, whose
+        // intent was "don't clobber a good box with nothing" and whose effect was
+        // "never take a stale box down": an emptied run reported no bounds, the
+        // redraw was skipped, and the rectangle from the last character stayed on the
+        // canvas. The worker now always sends the caret's own box for an empty run,
+        // so this is belt and braces — and the honest polarity either way, because a
+        // run with no bounds has no box.
+        this._drawEditBox(msg.runBounds || null);
         this._drawCaret(msg.caret);
         this._drawSelection(msg.selection || []);
         if (!msg.selection || !msg.selection.length) {
@@ -1586,6 +1688,36 @@ export class PdfeEditor {
           this._selRange = [msg.selStart, msg.selEnd];
           this._drawHandles(msg.h0, msg.h1);
         }
+        // I69 — THE ENGINE REFUSED SOME OF WHAT WE SENT. Anything no font in reach
+        // can draw is dropped instead of written, because writing it produces a
+        // different character (an emoji came back as U+00FF and SAVED that way).
+        //
+        // Re-seeding the sink is what makes the refusal stick: the textarea still
+        // holds the emoji, so without this the next keystroke re-sends it, the
+        // shell's char count disagrees with the engine's, and the user sees a
+        // character in their IME buffer that is not in the document. Programmatic
+        // `.value =` fires no `input`, so this cannot echo back as a keystroke —
+        // the same no-echo path editOpened uses.
+        if (msg.rejected) {
+          this.sink.value = msg.text;
+          // NOTHING HAPPENED, so the selection must come back too (I69b,
+          // user-reported on Android 2026-08-19: tapping an emoji with a word selected
+          // DELETED the word). The core refuses the whole gesture when every character
+          // it inserted is undrawable, so the text is already unchanged — but the sink
+          // had destroyed its own selection to make room, and a collapsed caret where
+          // a selected word used to be is still "something happened".
+          const pre = this._preEditSel;
+          const lim = msg.text.length;
+          if (pre && pre[1] <= lim) {
+            this.sink.setSelectionRange(pre[0], pre[1]);
+          } else {
+            const ci = Math.max(0, Math.min(msg.caretIndex ?? lim, lim));
+            this.sink.setSelectionRange(ci, ci);
+          }
+          this._emit("inputRejected", { page: msg.page, chars: msg.rejected,
+                                        reason: "unsupported-glyph" });
+        }
+        this._preEditSel = null;    // consumed: the next gesture captures its own
         this._editingChars = this.sink.value.length;
         this._setDirty(true);
         this.scrollCaretIntoView();   // typing must never push the caret off-screen
@@ -2598,6 +2730,16 @@ export class PdfeEditor {
 
     // Full composition handling from day one (§7): every intermediate buffer
     // state is mirrored (the worker's newest-wins latch coalesces).
+    // THE SELECTION THIS GESTURE IS ABOUT TO REPLACE (I69b). A sink mutation is
+    // destructive: by the time `input` fires, a selected word is already gone and the
+    // caret already collapsed. If the core then REFUSES the gesture (an emoji, which
+    // no font can draw), we have to put the selection back — and this is the last
+    // moment it exists. Captured only when there is no unsent change, so it names the
+    // state before the FIRST edit of a coalesced burst rather than the middle of one.
+    this._listen(this.sink, "beforeinput", () => {
+      if (this._preEditSel) return;
+      this._preEditSel = [this.sink.selectionStart, this.sink.selectionEnd];
+    });
     this._listen(this.sink, "compositionstart", () => { this._composing = true; });
     this._listen(this.sink, "compositionupdate", () => push());
     this._listen(this.sink, "compositionend", () => { this._composing = false; push(); });

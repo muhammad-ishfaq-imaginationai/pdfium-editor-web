@@ -142,6 +142,8 @@ const ready = createPdfe({
   F.historyDescribe = m.cwrap("pdfe_history_describe", "number",
     ["number", "number", "number"]);
   F.editCaretIndex = m.cwrap("pdfe_edit_caret_index", "number", ["number"]);
+  F.editLastRejected = m.cwrap("pdfe_edit_last_rejected", "number",
+    ["number", "number", "number"]);
   F.deleteBlock   = m.cwrap("pdfe_delete_block", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.editBegin     = m.cwrap("pdfe_edit_begin", "number",
@@ -160,10 +162,16 @@ const ready = createPdfe({
   F.editBoundary  = m.cwrap("pdfe_edit_boundary_at", "number", ["number", "number", "number"]);
   F.editSelRects  = m.cwrap("pdfe_edit_selection_rects", "number",
     ["number", "number", "number", "number", "number"]);
-  // character-level styling: colour, and (2026-08-13) the font FAMILY + bold/italic.
-  // Size reuses the same reader when it lands (docs/FONT_SIZING.md).
+  // character-level styling: colour, the font FAMILY + bold/italic (2026-08-13), and
+  // the font SIZE (2026-08-18). Size needed no new reader — pdfe_edit_style_at has
+  // reported out[4] since colour shipped, which is why readRangeStyle already carried
+  // `sizePt` before anything could set it (docs/FONT_SIZING.md).
   F.editApplyColor = m.cwrap("pdfe_edit_apply_color", "number",
     ["number", "number", "number", "number", "number"]);
+  F.editApplySize = m.cwrap("pdfe_edit_apply_size", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.editSetTypingSize = m.cwrap("pdfe_edit_set_typing_size", "number",
+    ["number", "number", "number"]);
   F.editSetTypingColor = m.cwrap("pdfe_edit_set_typing_color", "number",
     ["number", "number", "number"]);
   F.editStyleAt   = m.cwrap("pdfe_edit_style_at", "number",
@@ -304,6 +312,19 @@ function readEditorText() {
   return s;
 }
 
+// The characters the last set_text REFUSED (I69) — "" when it accepted everything,
+// which is the overwhelmingly common case, so this is one cheap call per keystroke.
+function readLastRejected() {
+  const n = F.editLastRejected(editor, 0, 0);
+  if (n <= 0) return "";
+  const ptr = mod._malloc(n * 2);
+  F.editLastRejected(editor, ptr, n);
+  const v = new Uint16Array(mod.HEAPU8.buffer, ptr, n);  // re-derived post-call (§10)
+  const s = String.fromCharCode(...v);
+  mod._free(ptr);
+  return s;
+}
+
 function readCaret(index) {
   const ptr = mod._malloc(12);
   const ok = F.editCaret(editor, index, ptr);
@@ -324,9 +345,16 @@ const PDFE_STYLE_COLOR = 1, PDFE_STYLE_SIZE = 2, PDFE_STYLE_BASELINE = 8;
 const PDFE_STYLE_FAMILY = 16, PDFE_STYLE_BOLD = 32, PDFE_STYLE_ITALIC = 64,
       PDFE_STYLE_FACES = 128, PDFE_STYLE_FACE_SRC = 256;
 const CAN_BOLD_ON = 1, CAN_BOLD_OFF = 2, CAN_ITALIC_ON = 4, CAN_ITALIC_OFF = 8;
+// …and, since 2026-08-18, the two questions a MIXED range asks. ALL_* is the toggle's
+// pressed state measured over the fonts that CAN carry the property (so one symbolic
+// bullet cannot jam the button); PART_* says the press will not reach everything.
+const ALL_BOLD = 16, ALL_ITALIC = 32, PART_BOLD = 64, PART_ITALIC = 128;
 // pdfe_edit_apply_face's positive non-apply: a bare caret armed the face for what is
 // typed next, and the page is untouched.
 const PDFE_FACE_ARMED = 2;
+// …and its positive PARTIAL apply: some runs took the face, some had none. Unlike an
+// arm this IS an edit — it dirtied and journalled — so it must set the document dirty.
+const PDFE_FACE_APPLIED_PARTIAL = 3;
 const FONT_NAME_BASE = 0, FONT_NAME_FAMILY = 1;
 
 // The range's font name, or null when it MIXES. Two-call, like every core string
@@ -428,8 +456,13 @@ function readRangeStyle(s, e) {
   // Which toggle would be served by ANOTHER family's face, folded the same way
   // canBold/canItalic are — "press B" resolved into on-or-off — so the two answers
   // cannot disagree about which direction the button is pointing.
-  const wouldSub = (isOn, onBit, offBit) =>
-    isOn === null ? false : !!(subs & (isOn ? offBit : onBit));
+  // THE PRESSED STATE the two toggles paint, and the direction every fold below takes.
+  // Reading it from the core rather than deriving it here is deliberate: which fonts
+  // count as "capable" is a face-resolution question, and letting three shells answer
+  // it separately is exactly how two platforms end up saving different documents.
+  const pressedB = bold === null ? !!(faces & ALL_BOLD) : bold;
+  const pressedI = italic === null ? !!(faces & ALL_ITALIC) : italic;
+  const wouldSub = (isOn, onBit, offBit) => !!(subs & (isOn ? offBit : onBit));
   return {
     start: s, end: e,
     colorArgb: argb,
@@ -440,20 +473,37 @@ function readRangeStyle(s, e) {
     fontName: readFontName(s, e, FONT_NAME_BASE),
     fontFamily: (mask & PDFE_STYLE_FAMILY) ? readFontName(s, e, FONT_NAME_FAMILY) : null,
     bold, italic,
-    // WHETHER THE B / I BUTTON WOULD WORK, which is a different question from
-    // whether the text IS bold — the family may simply have no bold face, and this
-    // build REFUSES rather than faking one (docs/FONTS.md §3). Resolving "press B"
-    // into "turn it on or off" is the shell's job, so the host binds `disabled`
-    // straight to these instead of decoding out[10] itself.
-    canBold: bold === null ? false : !!(faces & (bold ? CAN_BOLD_OFF : CAN_BOLD_ON)),
-    canItalic: italic === null ? false : !!(faces & (italic ? CAN_ITALIC_OFF : CAN_ITALIC_ON)),
+    // THE BUTTON'S PRESSED STATE, which is not `bold`. `bold` goes null on a mix and
+    // stays that way after a partial apply, so a host that painted from it would send
+    // "on" twice and the toggle would never come back off. This never returns null: for
+    // a uniform range it IS `bold`, and for a mix it is "every font that CAN be bold
+    // already is" (docs/FONTS.md §3ter).
+    boldPressed: pressedB,
+    italicPressed: pressedI,
+    // WHETHER THE B / I BUTTON WOULD DO ANYTHING — a different question from whether
+    // the text IS bold, since the family may simply have no bold face and this build
+    // REFUSES rather than faking one (docs/FONTS.md §3). Resolving "press B" into
+    // "turn it on or off" stays the shell's job, so a host binds `disabled` straight
+    // to these instead of decoding out[10] itself. Folded off the PRESSED state rather
+    // than off `bold`: the same expression as before for a uniform range, and the only
+    // one that has an answer for a mixed one (widened 2026-08-18 — a mixed range used
+    // to report false here because the core refused it).
+    canBold: !!(faces & (pressedB ? CAN_BOLD_OFF : CAN_BOLD_ON)),
+    canItalic: !!(faces & (pressedI ? CAN_ITALIC_OFF : CAN_ITALIC_ON)),
     // AND WHETHER PRESSING IT WOULD CHANGE THE TYPEFACE. The family may have no such
     // face, in which case a metric-compatible sibling family serves it (Arial's bold
     // italic comes from Helvetica's). The face is always REAL — never a synthetic
     // slant or weight — but it is not the author's font, so a host that shows this is
     // being honest and one that ignores it is not (docs/FONTS.md §3).
-    boldWouldSubstitute: wouldSub(bold, CAN_BOLD_ON, CAN_BOLD_OFF),
-    italicWouldSubstitute: wouldSub(italic, CAN_ITALIC_ON, CAN_ITALIC_OFF),
+    boldWouldSubstitute: wouldSub(pressedB, CAN_BOLD_ON, CAN_BOLD_OFF),
+    italicWouldSubstitute: wouldSub(pressedI, CAN_ITALIC_ON, CAN_ITALIC_OFF),
+    // AND WHETHER THE PRESS WILL REACH EVERYTHING. False for every uniform range, so a
+    // host that ignores it sees no change on the documents it already handled. Where it
+    // is true, pressing applies to the characters it can and leaves the rest exactly as
+    // they are — the user chose that over refusing the whole selection because one
+    // symbolic bullet cannot be bolded (2026-08-18).
+    boldPartial: !!(faces & PART_BOLD),
+    italicPartial: !!(faces & PART_ITALIC),
   };
 }
 
@@ -496,6 +546,13 @@ let stickyColorArgb = null;
 // typing font at all.
 let typingFontArmedAt = -1;
 let typingFontArmedName = null;
+// THE TYPING SIZE HAS THE SAME ONE LIFETIME AS THE FONT — follow-the-caret, no sticky
+// mode, no switch (pdfe.h is explicit that the sticky option is colour-only). The
+// same-index exception matters here more than anywhere: a size dropdown is a <select>,
+// so picking one ALWAYS steals focus from the sink, and without the exception a
+// collapsed pick could never survive the click back into the box.
+let typingSizeArmedAt = -1;
+let typingSizeArmedPt = 0;
 function postCaretMoved(index) {
   const keepPick = typingColorFollowsCaret && typingColorArmedAt >= 0 &&
                    index === typingColorArmedAt;
@@ -508,6 +565,12 @@ function postCaretMoved(index) {
     F.editSetTypingFont(editor, 0);   // 0 = back to each segment's Original font
     typingFontArmedAt = -1;
     typingFontArmedName = null;
+  }
+  const keepSize = typingSizeArmedAt >= 0 && index === typingSizeArmedAt;
+  if (editor && !keepSize && typingSizeArmedAt >= 0) {
+    F.editSetTypingSize(editor, 0, 0);   // clear: inherit from the character on the left
+    typingSizeArmedAt = -1;
+    typingSizeArmedPt = 0;
   }
   // A deliberate caret move finishes the word (Phase 5): the next keystroke
   // must start a fresh undo entry, not merge into text typed somewhere else.
@@ -530,6 +593,10 @@ function postCaretMoved(index) {
   // now one answer for all four fields, and `typingFontArmedName` stays null for a face
   // arm precisely so this line cannot become a second, rival answer.
   if (keepFont && style && typingFontArmedName) style.fontName = typingFontArmedName;
+  // Same rule again for a surviving SIZE pick: report the size the next keystroke will
+  // actually take, or the host's dropdown snaps back to the size under the cursor and
+  // the user's pick looks like it was ignored.
+  if (keepSize && style && typingSizeArmedPt > 0) style.sizePt = typingSizeArmedPt;
   postMessage({
     type: "caretMoved", index, caret: readCaret(index),
     style,
@@ -554,9 +621,23 @@ function readSelectionRects(s, e) {
 // grouping bounds (and editParaBounds, which only ever grows) go stale as soon
 // as the text reflows. null when there is no session / nothing to measure.
 function readRunBounds(len) {
-  if (!editor || len <= 0) return null;
-  const rects = readSelectionRects(0, len);
-  if (!rects.length) return null;
+  if (!editor) return null;
+  // AN EMPTY RUN IS STILL AN OPEN RUN (I68). This returned null for len <= 0, and
+  // the shells' `if (runBounds)` guards then skipped the redraw and LEFT THE
+  // PREVIOUS BOX ON SCREEN — so deleting a box's text down to nothing left a tiny
+  // blue rectangle sitting where the last surviving character had been, while the
+  // caret was somewhere else entirely (user-reported 2026-08-19, with a screenshot
+  // of exactly that: a caret, and a small empty rectangle a few centimetres away).
+  //
+  // The rule below already says the box must always contain the caret; at length 0
+  // the caret is ALL there is, so the box IS the caret's box. That keeps the "you
+  // are typing here" affordance honest — the user can still see where the next
+  // character will land — and it cannot go stale, because it moves with the caret.
+  const rects = len > 0 ? readSelectionRects(0, len) : [];
+  if (!rects.length) {
+    const c0 = readCaret(-1);                    // [x, topPt, botPt]
+    return c0 ? [c0[0], c0[2], c0[0], c0[1]] : null;
+  }
   let b = [rects[0][0], rects[0][1], rects[0][2], rects[0][3]];
   for (const r of rects) {
     b = [Math.min(b[0], r[0]), Math.min(b[1], r[1]),
@@ -1427,6 +1508,14 @@ function drainLatch() {
         ];
       }
       syncEditTextPage();
+      // I69: THE ENGINE MAY HAVE REFUSED SOME OF WHAT WE SENT. Anything no font in
+      // reach can draw is dropped rather than written, because writing it produces a
+      // DIFFERENT character (an emoji came back as U+00FF, and saved that way). So
+      // the engine's buffer — not `edit.fullText` — is the truth from here on: the
+      // shell re-seeds its sink from it, and everything measured below is measured
+      // over it.
+      const rejected = readLastRejected();
+      const engineText = rejected ? readEditorText() : edit.fullText;
       const blitMs = renderDirtyStrip(editPage, dirty);
       const hasSel = edit.selEnd > edit.selStart;
       const sel = hasSel ? readSelectionRects(edit.selStart, edit.selEnd) : [];
@@ -1448,7 +1537,14 @@ function drainLatch() {
         h1: hasSel ? readCaret(edit.selEnd) : null,
         selStart: edit.selStart,
         selEnd: edit.selEnd,
-        runBounds: readRunBounds(edit.fullText.length),   // the blue editing box
+        runBounds: readRunBounds(engineText.length),      // the blue editing box
+        // Present ONLY when the engine refused something (I69), so a host can say
+        // "emoji aren't supported here" instead of leaving the user pressing a dead
+        // key. |text| rides along on the same condition: the sink still holds the
+        // character the engine dropped, and re-seeding is what makes the refusal
+        // stick instead of being re-sent on the next keystroke.
+        ...(rejected ? { rejected, text: engineText,
+                         caretIndex: F.editCaretIndex(editor) } : {}),
 
         engineMs: Math.round(engineMs * 100) / 100,
         blitMs: Math.round(blitMs * 100) / 100,
@@ -2145,6 +2241,77 @@ onmessage = async (e) => {
     return;
   }
 
+  // ---- size: the same two verbs as colour, and ONE difference that matters -----
+  //
+  // A size apply MOVES GEOMETRY VERTICALLY — the only styling property that does.
+  // So unlike applyColor, whose comment says "a colour change moves nothing and the
+  // core's rect is inside the run", this one must repaint whatever the I25 height
+  // cascade pushed: the lines below the changed one ride down, and on a big change
+  // the run's own box grows past where it was. The core's dirty rect already covers
+  // that (it unions the old and new bounds), so the rule here is simply to trust it
+  // and to union the run's bounds as well rather than assuming the strip is enough.
+  if (msg.type === "applySize") {
+    if (!editor) return;                       // no run open: silent, like applyColor
+    // Same ordering rule as applyColor, and for the same reason: msg.start/end were
+    // computed against the SINK's text, so a latched keystroke must land first or the
+    // indices name the wrong characters and the set_text pass drops the size.
+    if (pendingEdit) drainLatch();
+    const len = readEditorText().length;
+    const s = Math.max(0, Math.min(msg.start, len));
+    const e = Math.max(s, Math.min(msg.end, len));
+    const pt = Number(msg.sizePt);
+    // The core REJECTS a non-positive size rather than clamping it, so refusing here
+    // keeps the two layers saying the same thing instead of sending it a value it will
+    // only bounce (pdfe.h: "never clamped").
+    if (!(pt > 0)) {
+      postMessage({ type: "styleApplied", what: "size", ok: false,
+                    reason: "bad-size", page: editPage, sizePt: pt });
+      return;
+    }
+    if (e <= s) {
+      postMessage({ type: "styleApplied", what: "size", ok: false,
+                    reason: "no-selection", page: editPage, sizePt: pt });
+      return;
+    }
+    dirtyPages.add(editPage);
+    noteMutation(editPage);                    // the apply re-typesets and renumbers
+    const dPtr = mod._malloc(16);
+    const rc = F.editApplySize(editor, s, e, pt, dPtr);
+    const dirty = readF32(dPtr, 4);
+    mod._free(dPtr);
+    syncEditTextPage();
+    const blitMs = renderDirtyStrip(editPage, dirty);
+    postMessage({
+      type: "styleApplied", what: "size", ok: rc >= 0, page: editPage,
+      sizePt: pt,
+      dirty, blitMs: Math.round(blitMs * 100) / 100,
+      selection: readSelectionRects(s, e),
+      h0: readCaret(s), h1: readCaret(e), selStart: s, selEnd: e,
+      runBounds: readRunBounds(readEditorText().length),
+      style: readRangeStyle(s, e),             // read back AFTER the write
+    });
+    postHistory();                             // a style change is a recordable step
+    return;
+  }
+
+  if (msg.type === "setTypingSize") {
+    if (!editor) return;
+    const pt = Number(msg.sizePt) || 0;
+    const on = msg.set ? 1 : 0;
+    if (on && !(pt > 0)) return;               // refused, not clamped — same as apply
+    F.editSetTypingSize(editor, pt, on);
+    // Remember WHERE it was armed, so the click back from the dropdown keeps it. `at`
+    // is -1 for a range apply, whose painted text needs no revival.
+    if (on && typeof msg.at === "number" && msg.at >= 0) {
+      typingSizeArmedAt = msg.at;
+      typingSizeArmedPt = pt;
+    } else if (!on) {
+      typingSizeArmedAt = -1;
+      typingSizeArmedPt = 0;
+    }
+    return;
+  }
+
   // ---- fonts: the DELIVERY contract, then the two verbs -----------------------
   // THE HOST PROVIDES THE VARIANTS (user decision 2026-08-13). The SDK bundles no
   // font catalog, so a face reaches the engine only by a host handing over bytes (or
@@ -2264,8 +2431,12 @@ onmessage = async (e) => {
     postFontApplied("face", rc >= 0, s, e, dirty, {
       bold: msg.bold, italic: msg.italic,
       reason: rc >= 0 ? undefined : faceErrorCode(rc),
-      changed: rc === 1,          // ONLY a real apply modified the document
+      // A PARTIAL apply modified the document exactly as much as a full one did — it
+      // dirtied a rect and journalled a step — so it must mark the document dirty.
+      // Treating it as "nothing happened" would lose the user's edit on close.
+      changed: rc === 1 || rc === PDFE_FACE_APPLIED_PARTIAL,
       armed: rc === PDFE_FACE_ARMED,
+      partial: rc === PDFE_FACE_APPLIED_PARTIAL,
     });
     return;
   }

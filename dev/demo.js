@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-a4c7117-we913702";
+import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-64a86c1-w5f2612a";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -251,6 +251,19 @@ for (const kind of ["undo", "redo"]) {
     setStatus(r.ok
       ? `${kind} applied on page ${r.page + 1} — the box is selected again, tap to type`
       : `nothing left to ${kind} here`);
+    // AND STOP THE STYLING CONTROLS ASSERTING A VALUE. A step leaves the editing box
+    // (the line above says so), and with no run open there is nothing to read a style
+    // from — so a control still showing the last pick is claiming something the
+    // document does not say. Found while testing I65 here: pick 20 pt, press undo, and
+    // the page went correctly back to 9.96 pt while the dropdown still read "20",
+    // which reads as "the undo did not work".
+    //
+    // Hooked to the STEP events, not to `editclose` — measured 2026-08-18: an
+    // undo closes the run (editing goes false) WITHOUT emitting editclose, so a
+    // host listening only to that never learns the box went away.
+    if (!editor.editing) resetStyleControls();
+    if (r.ok) setHint("Typing", `${kind} applied — size, text and line positions all ` +
+      "come from the restored objects");
   });
 }
 
@@ -279,6 +292,46 @@ function openFile(f) {
   });
 }
 $("file").addEventListener("change", (ev) => openFile(ev.target.files[0]));
+
+// ---- DEV-ONLY: quick-open from test-files/ ----------------------------------
+// This page is served from the repo root (dev_server.py), so the local corpus in
+// test-files/ is reachable at ../test-files/ from here. The plain http.server
+// subclass we run offers no JSON listing API, only the directory-index HTML it
+// already renders — so we parse the <a href> list out of that instead of adding
+// a server endpoint for dev tooling. Off the published site (which ships no
+// test-files/) the fetch 404s and the control just stays hidden.
+const testFilesBox = $("testfilesbox"), testFilesSelect = $("testfiles");
+async function loadTestFiles() {
+  let hrefs;
+  try {
+    const res = await fetch("../test-files/");
+    if (!res.ok) return;
+    hrefs = [...(await res.text()).matchAll(/<a href="([^"]+\.pdf)">/gi)].map((m) => m[1]);
+  } catch {
+    return;
+  }
+  if (!hrefs.length) return;
+  const placeholder = document.createElement("option");
+  placeholder.value = ""; placeholder.textContent = "Test files…";
+  testFilesSelect.appendChild(placeholder);
+  for (const href of hrefs) {
+    const o = document.createElement("option");
+    o.value = `../test-files/${href}`;
+    o.textContent = decodeURIComponent(href);
+    testFilesSelect.appendChild(o);
+  }
+  testFilesBox.hidden = false;
+}
+loadTestFiles();
+testFilesSelect.addEventListener("change", (ev) => {
+  const url = ev.target.value;
+  testFilesSelect.value = "";   // reset so re-picking the same file still fires `change`
+  if (!url) return;
+  openDocument(url).catch((e) => {
+    if (!editor.pageCount) setStage("empty");
+    setStatus(`error: ${e.message}`);
+  });
+});
 
 // Drag-and-drop onto the stage — host chrome, same one call as the picker. The
 // window-level handlers exist because a drop that misses the stage would
@@ -423,6 +476,26 @@ otherOption.value = "__other"; otherOption.textContent = "(document font)";
 otherOption.hidden = true;
 fontSelect.appendChild(otherOption);
 
+// …AND IT SHOWS THE FONT'S REAL NAME (user, 2026-08-18). The label above was a fixed
+// string, so a CV set in Arial read "(document font)" — the SDK had reported "ArialMT"
+// all along and this host threw it away. It is a placeholder for a family this PAGE
+// does not offer, not for a font nobody can name.
+//
+// Two details the fallback chain has to get right:
+//   * the SUBSET TAG is display noise. The SDK keeps it deliberately (it is part of the
+//     font's identity in the file), so stripping it is the host's call, not the SDK's.
+//   * `fontName` is null as soon as the range spans two NAMES — which is exactly the
+//     "Forename SURNAME" case, where the FAMILY is still uniform. Falling back to the
+//     family key there is what keeps the picker reading "Arial" instead of "(mixed)".
+const stripSubsetTag = (n) => String(n || "").replace(/^[A-Z]{6}\+/, "");
+const titleCaseKey = (k) => k ? k.charAt(0).toUpperCase() + k.slice(1) : "";
+function labelDocumentFont(style) {
+  const named = stripSubsetTag(style && style.fontName);
+  if (named) return named;
+  const fam = style && style.fontFamily;
+  return fam ? titleCaseKey(fam) : "(document font)";
+}
+
 // Faces are registered once per OPENED DOCUMENT: the handles belong to the document,
 // so they do not survive opening another file.
 editor.on("opened", async () => {
@@ -447,6 +520,107 @@ fontSelect.addEventListener("change", (ev) => {
   if (v.startsWith("__")) return;              // a placeholder is not a choice
   editor.applyFont(v === "" ? null : v);
 });
+
+// ---- font SIZE (phase 3) ----------------------------------------------------
+// Presets the user picked, plus "Custom…" — a dropdown cannot express 11.5 pt and the
+// property is continuous, so refusing the odd value would make the control lie about
+// what the SDK accepts.
+const SIZE_PRESETS = [6, 7, 8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
+const sizeSelect = $("fontsize");
+// The engine's most recent answer, kept only so the "Custom…" prompt can put the
+// control back if the user cancels — never as the source of truth for painting.
+let lastTextStyle = null;
+// MIXED and the document's own size get their own options, for the family picker's
+// reason: a range spanning two sizes has no single answer, and snapping the closed
+// <select> to the nearest preset would report a size the document does not have.
+const sizeMixedOption = document.createElement("option");
+sizeMixedOption.value = "__mixed";
+sizeMixedOption.textContent = "mixed";
+sizeMixedOption.hidden = true;
+const sizeOtherOption = document.createElement("option");
+sizeOtherOption.value = "__other";
+sizeOtherOption.hidden = true;
+function buildSizeOptions() {
+  sizeSelect.textContent = "";
+  for (const pt of SIZE_PRESETS) {
+    const o = document.createElement("option");
+    o.value = String(pt);
+    o.textContent = String(pt);
+    sizeSelect.appendChild(o);
+  }
+  const custom = document.createElement("option");
+  custom.value = "__custom";
+  custom.textContent = "Custom…";
+  sizeSelect.appendChild(custom);
+  sizeSelect.appendChild(sizeMixedOption);
+  sizeSelect.appendChild(sizeOtherOption);
+}
+buildSizeOptions();
+
+sizeSelect.addEventListener("change", (ev) => {
+  const v = ev.target.value;
+  if (v === "__custom") {
+    const typed = prompt("Font size in points:", "");
+    // Restore the control before applying: if the user cancels or types nonsense the
+    // dropdown must not be left reading "Custom…", which is not a size.
+    const pt = Number(typed);
+    if (!(pt > 0)) { showSizeStyle(lastTextStyle); return; }
+    editor.applyFontSize(pt);
+    return;
+  }
+  if (v.startsWith("__")) return;               // a placeholder is not a choice
+  editor.applyFontSize(Number(v));
+});
+
+// THE SIZE CONTROL MUST NOT CLAIM A SIZE WHEN THERE IS NO RUN TO READ ONE FROM.
+// Painting from the engine's answer is the rule, and with no run open there is no
+// answer — so the honest state is the blank placeholder, not the user's last pick.
+function resetSizeControl() {
+  lastTextStyle = null;
+  sizeOtherOption.textContent = "";
+  sizeSelect.value = "__other";
+}
+
+// …AND NEITHER MUST ANY OF THE OTHERS (2026-08-19). The rule above was written for the
+// size dropdown and then applied only to it, so after an undo the family select still
+// read "Times (serif)" and B/I still looked pressed while the page had gone back to
+// plain Arial — the very confusion the size fix existed to stop ("the undo did not
+// work"), just three controls over. GENERAL, not conditioned: the honest state with no
+// run open is "no answer" for every styling control, so they all reset together.
+//
+// Android already did this (its readout row goes to `font: —` / Size `—` / Colour `—`
+// and greys B/I), so this was also a one-platform drift — the asymmetry CLAUDE.md warns
+// about, where the same version behaves differently depending on which app you open.
+function resetStyleControls() {
+  resetSizeControl();
+  otherOption.textContent = "";
+  fontSelect.value = "__other";
+  boldBtn.classList.remove("active");
+  italicBtn.classList.remove("active");
+  // Disabled, because with no run open pressing them would do nothing — the same
+  // "would this change anything" question `canBold`/`canItalic` answer while editing.
+  boldBtn.disabled = true;
+  italicBtn.disabled = true;
+  colorMixed.hidden = true;
+}
+
+// Paint the size control from the ENGINE's answer, never from what we last sent — the
+// same rule the font controls follow. `sizePt` is null when the range mixes sizes.
+function showSizeStyle(style) {
+  if (!style) return;
+  const pt = style.sizePt;
+  if (pt == null) { sizeSelect.value = "__mixed"; return; }
+  // Round for the MATCH only, never for the apply: the document's size is a float and
+  // 9.96 pt is a real value (cvtemplate's body text is exactly that). Matching on a
+  // rounded number is what lets 9.96 select the "10" preset instead of falling through
+  // to "__other" on every single caret move.
+  const near = SIZE_PRESETS.find((p) => Math.abs(p - pt) < 0.05);
+  if (near != null) { sizeSelect.value = String(near); return; }
+  // Not a preset: name the document's actual size, so the closed control tells the
+  // truth. Two decimals, trimmed — "9.96", not "9.960000038146973".
+  sizeOtherOption.textContent = `${Math.round(pt * 100) / 100}`;
+  sizeSelect.value = "__other";
+}
 boldBtn.addEventListener("click", () => editor.applyBold(!boldBtn.classList.contains("active")));
 italicBtn.addEventListener("click", () =>
   editor.applyItalic(!italicBtn.classList.contains("active")));
@@ -464,16 +638,24 @@ function showFontStyle(style) {
   // A bundled family is matched the same way — on the KEY the SDK reports, never on the
   // display name — and its option carries the regular face as its value.
   const bundled = fam == null ? null : bundledOptions.get(fam);
+  // Name the document's own font before selecting the placeholder, so the closed
+  // <select> reads "Arial" rather than a generic label.
+  otherOption.textContent = labelDocumentFont(style);
   fontSelect.value = fam == null ? "__mixed"
     : opt ? opt[0]
     : bundled ? bundled.value
     : "__other";
-  // PRESSED state from `bold`/`italic`; ENABLED state from `canBold`/`canItalic`.
-  // Two different questions: "is it bold" and "could it be". A family with no bold
-  // face is refused by the SDK, and a disabled button is how the user learns that
-  // without clicking.
-  boldBtn.classList.toggle("active", style.bold === true);
-  italicBtn.classList.toggle("active", style.italic === true);
+  // PRESSED state from `boldPressed`/`italicPressed`; ENABLED state from
+  // `canBold`/`canItalic`. Two different questions: "should the button look pressed"
+  // and "would pressing it do anything". A family with no bold face is refused by the
+  // SDK, and a disabled button is how the user learns that without clicking.
+  //
+  // NOT from `bold`/`italic` (2026-08-18). Those go null over a mix and stay null after
+  // a partial apply, so painting from them leaves the button un-pressed while the SDK
+  // considers the range bold — press it again and this host would send "on" a second
+  // time and the toggle would never come back off.
+  boldBtn.classList.toggle("active", style.boldPressed === true);
+  italicBtn.classList.toggle("active", style.italicPressed === true);
   boldBtn.disabled = !style.canBold;
   italicBtn.disabled = !style.canItalic;
   // AND WHETHER PRESSING IT WOULD CHANGE THE TYPEFACE. The family may have no such
@@ -489,6 +671,17 @@ function showFontStyle(style) {
   if (subBold || subItalic) {
     setHint("Fonts", `${[subBold && "bold", subItalic && "italic"].filter(Boolean).join(" and ")} ` +
       `would come from a metric-compatible family — this one has no such face`);
+  }
+  // AND WHETHER THE PRESS WILL REACH EVERYTHING. Same contract as the substitution
+  // report above and disclosed the same way: before the click, from the same read that
+  // enables the button. A selection crossing a symbolic bullet is the everyday cause —
+  // the words bold and the bullet cannot, which is correct and needs saying.
+  const partBold = !!style.boldPartial, partItalic = !!style.italicPartial;
+  boldBtn.classList.toggle("partial", partBold);
+  italicBtn.classList.toggle("partial", partItalic);
+  if (partBold || partItalic) {
+    setHint("Fonts", `${[partBold && "bold", partItalic && "italic"].filter(Boolean).join(" and ")} ` +
+      `will not reach every character — some fonts in this selection have no such face`);
   }
 }
 
@@ -550,10 +743,12 @@ stickyColor.addEventListener("change", () => {
 // here would defeat that same-index rule, which is exactly what this handler did
 // until 2026-08-13. Hosts only paint.
 editor.on("selection", ({ start, end, style }) => {
+  lastTextStyle = style;
   showTextStyle(style);
   showFontStyle(style);
+  showSizeStyle(style);
 });
-editor.on("styled", ({ what, style, following, fontName }) => {
+editor.on("styled", ({ what, style, following, fontName, partial }) => {
   showTextStyle(style);
   if (what === "typingFont") {
     // Arming a font paints nothing, so there is no style to read back — the event
@@ -563,10 +758,25 @@ editor.on("styled", ({ what, style, following, fontName }) => {
       "type next, and is dropped when you move the cursor");
   } else {
     showFontStyle(style);
+    showSizeStyle(style);
   }
   if (what === "color") setHint("Typing", "Colour applied — Ctrl+Z undoes it");
+  if (what === "size") {
+    // The one property that moves geometry, so say what to look at: the lines below
+    // ride down, and the whole point of I65 is that ONE Ctrl+Z puts them back.
+    setHint("Typing", style && style.sizePt != null
+      ? `Size ${Math.round(style.sizePt * 100) / 100} pt applied — Ctrl+Z restores the ` +
+        "old size AND the line positions"
+      : "Size applied — Ctrl+Z undoes it");
+  }
   if (what === "font") setHint("Typing", "Font applied — Ctrl+Z undoes it");
-  if (what === "face") setHint("Typing", "Face applied — Ctrl+Z undoes it");
+  if (what === "face")
+    // `partial` is on the event as well as on the style report, because the two answer
+    // it at different moments: the report warns BEFORE the click, this confirms what
+    // actually happened. Either way it is one undo step.
+    setHint("Typing", partial
+      ? "Face applied where it could — some characters' fonts have no such face. Ctrl+Z undoes it all"
+      : "Face applied — Ctrl+Z undoes it");
   // The cursor moved to text of a different colour: the swatch follows it, so the
   // user sees what the next character will be before typing it. `following` is
   // false when the host asked for a sticky picked colour instead.
@@ -578,7 +788,7 @@ editor.on("styled", ({ what, style, following, fontName }) => {
 // event with what:"caret"), so there is nothing to ask for here. This used to
 // call requestTextStyle(0, 0) — the style at the START of the run — which showed
 // the first word's colour no matter where the user actually put the cursor.
-editor.on("editclose", () => { colorMixed.hidden = true; });
+editor.on("editclose", () => resetStyleControls());
 
 // Select-then-act: the SDK draws the selected box and its Edit/Delete bar; the
 // host only reports it (and could drive the same actions from its own chrome).

@@ -61,8 +61,31 @@ export function attachNativeHost(editor, opts = {}) {
 
   // "page" is in here so a native shell can show a live page number without
   // polling `state` on every scroll frame (the SDK already coalesces it).
-  for (const ev of ["ready", "opened", "editmode", "editopen", "editclose",
-                    "dirty", "zoom", "page", "error"]) {
+  // "history" is here so a native shell can enable/disable its undo and redo
+  // buttons from the ENGINE's answer instead of guessing. Without it a shell has
+  // no way to know a step exists, which is how iOS ended up with undo it could
+  // neither trigger nor display.
+  // "styled" and "selection" carry the style under the cursor. Without them a
+  // native shell cannot paint a colour swatch at all, let alone follow the caret
+  // — the 1.6.0 password gap shape exactly: surface that exists on web and never
+  // reached the platform that drives the bridge instead of the JS API.
+  //
+  // ⚠️ "select" vs "selection" ARE DIFFERENT EVENTS and the near-name is why the
+  // first one went missing for months (added 2026-08-13, user-reported):
+  //   * "select"    — a BOX was tapped or deselected  → {selection: {...}|null}
+  //   * "selection" — the TEXT RANGE/caret moved      → {start, end, style}
+  // Without "select" a native shell cannot tell that the user tapped a box at
+  // all, so it cannot drive its own Edit/Delete bar — the whole point of the
+  // chrome-free surface. "deleted" and "moved" complete the box lifecycle
+  // (tap → edit → move → delete); web and Android had them, the bridge did not.
+  // The release gate now enforces this list against the SDK's own events.
+  // "inputRejected" (2026-08-19) is on this list for the reason the list exists: the
+  // editor refuses input no font can draw (an emoji would otherwise be SAVED as a
+  // different character), and a native shell that never hears about it can only show
+  // a keyboard whose keys do nothing.
+  for (const ev of ["ready", "opened", "editmode", "select", "editopen", "editclose",
+                    "deleted", "moved", "dirty", "zoom", "page", "history", "styled",
+                    "selection", "inputRejected", "error", "fontsReady"]) {
     editor.on(ev, (detail) => emit(ev, detail));
   }
   if (opts.telemetry) editor.on("edit", (d) => emit("edit", d));
@@ -114,7 +137,42 @@ export function attachNativeHost(editor, opts = {}) {
 
     setEditMode: ({ on }) => { editor.setEditMode(!!on); return { editMode: editor.editMode }; },
     toggleEditMode: () => { editor.toggleEditMode(); return { editMode: editor.editMode }; },
+    /**
+     * Leave box editing: commit the open run and DROP THE KEYBOARD. A native
+     * shell needs this before it presents anything of its own over the WebView,
+     * and `save` now does it for you.
+     */
+    getOutOfBoxEditing: () => { editor.getOutOfBoxEditing(); return { editing: editor.editing }; },
+    /** The original name, kept forever — identical behaviour. */
     commit: () => { editor.commit(); return {}; },
+
+    // ---- undo / redo -------------------------------------------------------
+    // THE SEAM NO BROWSER TEST TOUCHES (CLAUDE.md's five seams, #4). Undo was built
+    // for web and then for Android, and iOS drives neither of those APIs — it drives
+    // this file. Without these three commands iOS has no undo at all, which is the
+    // exact shape of the 1.6.0 password gap: every test green, one platform missing
+    // the feature, discovered by a user.
+    //
+    // ⚠️ THE REPLY IS THE PAIR *BEFORE* THE STEP LANDS. editor.undo() posts to the
+    // worker and returns immediately, so canUndo/canRedo read here are the state the
+    // shell already had. They are returned anyway because a shell that wants a simple
+    // request/response gets something coherent — but the TRUTH is the "history" event
+    // forwarded above, which fires when the engine has actually applied the step. A
+    // shell that paints its buttons from this reply will be one step behind.
+    //
+    // There is deliberately no setHistoryEnabled command: the web SDK exposes no such
+    // toggle (this branch's worker turns recording on unconditionally), and inventing
+    // a bridge command with no API under it would be a lie the parity gate cannot see.
+    /**
+     * Phase 5 (word-level undo): tell the engine a typing pause happened, so
+     * the next keystroke starts a fresh undo entry. A native shell calls this
+     * from its own ~300 ms idle timer and on focus loss; the web SDK already
+     * does it for its own sink, so this exists for shells that drive editing
+     * through the bridge.
+     */
+    sealHistory: () => { editor._post({ type: "sealHistory" }); return {}; },
+    undo: () => { editor.undo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
+    redo: () => { editor.redo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
 
     setZoom: ({ zoom }) => { editor.setZoom(Number(zoom)); return { zoom: editor.zoom }; },
     zoomIn: () => { editor.zoomIn(); return { zoom: editor.zoom }; },
@@ -132,9 +190,101 @@ export function attachNativeHost(editor, opts = {}) {
     toggleLineMode: () => { editor.toggleLineMode(); return {}; },
     setLineMode: ({ preserve }) => { editor.setLineMode(!!preserve); return {}; },
 
+    // ---- character-level colour (docs/STYLING.md) ---------------------------
+    // The web SDK has had these since colour landed; the bridge had NONE of them,
+    // so a native shell could not colour text or even read the style under the
+    // cursor. Added with the caret-follows-colour work so the iOS phase is Swift
+    // wrapping and nothing more. They joined the gate's REQUIRED list on 2026-08-13,
+    // when Android's colour surface landed and the promise became one every shell
+    // could actually keep.
+
+    /** Colour the current selection, and arm the colour for what is typed next. */
+    applyTextColor: ({ color }) => { editor.applyTextColor(color); return {}; },
+    /** Drop the armed typing colour; the next character inherits from its left. */
+    clearTypingColor: () => { editor.clearTypingColor(); return {}; },
     /**
-     * Turn box dragging on or off — an EXPERIMENTAL feature that ships OFF
-     * (docs/BLOCK_MOVE.md). This command exists because a kill switch a phone shell
+     * Size the current selection, and arm the size for what is typed next. `pt` is
+     * EFFECTIVE (on-page) points — the number the user picked.
+     *
+     * This is the seam CLAUDE.md calls "the one that gets forgotten, because no browser
+     * test touches it": iOS drives this bridge and never calls the JS API, so a verb
+     * missing here is a capability iOS silently does not have. 1.6.0 shipped passwords
+     * to web and Android and not to iOS for exactly that reason.
+     */
+    applyFontSize: ({ pt, sizePt } = {}) => {
+      // Accept either key: the JS method's parameter is `pt`, while every style EVENT
+      // reports `sizePt`, and a native shell that echoes back what it was told is the
+      // obvious thing to write. Refusing one of them would be a papercut with no upside.
+      const v = Number(pt != null ? pt : sizePt);
+      editor.applyFontSize(v);
+      return {};
+    },
+    /** Drop the armed typing size; the next character inherits from its left. */
+    clearTypingSize: () => { editor.clearTypingSize(); return {}; },
+    /** Ask for the style at a caret/range — answered by the `styled` event. */
+    requestTextStyle: ({ start, end } = {}) => {
+      editor.requestTextStyle(start | 0, end == null ? null : end | 0);
+      return {};
+    },
+    /** Pick the lifetime: follow the caret (default) or stay sticky. */
+    setTypingColorFollowsCaret: ({ on } = {}) =>
+      ({ typingColorFollowsCaret: editor.setTypingColorFollowsCaret(!!on) }),
+    // The same switch for the TYPEFACE (family + bold/italic together, 2026-08-20).
+    // Here for the reason seam 4 exists at all: an iOS shell drives this bridge and
+    // never the JS API, so a capability missing here is missing on iOS only.
+    setTypingFontFollowsCaret: ({ on } = {}) =>
+      ({ typingFontFollowsCaret: editor.setTypingFontFollowsCaret(!!on) }),
+
+    // ---- the font FAMILY, and bold / italic (docs/FONTS.md) ------------------
+    // Seam 4, and the one that gets forgotten because no browser test touches it.
+    // A native shell is the ONLY consumer that cannot call the JS API, and fonts are
+    // precisely where it would be left behind: iOS ships its own bundled faces, so
+    // "the host provides the variants" means nothing to it without loadFont here.
+
+    /**
+     * Register a face the native side provides. `data` is BASE64 — a JSON bridge
+     * cannot carry bytes, the same constraint that gives `open` its `openBase64`
+     * twin and `save` its `readChunk` pull. Omit `data` to load a standard-14 face by
+     * its PDF name, which needs no bytes at all.
+     *
+     * Chunking is deliberately NOT offered: a font file is tens to hundreds of KB
+     * (`save` needs chunks because a PDF is megabytes), so one message is enough and
+     * a chunked protocol would be state nobody needs.
+     */
+    loadFont: async ({ name, data } = {}) =>
+      editor.loadFont({ name, bytes: data ? fromBase64(data).buffer : undefined }),
+
+    /**
+     * Await the SDK's own bundled families and learn which ones exist.
+     *
+     * They register automatically on every open, so a native shell does not need this to
+     * get working bold/italic — it needs it for the TIMING (show a spinner, then tell the
+     * user fonts are usable) and for the family list to build a picker from. Returns
+     * `{ ok, families: [{ key, label, faces }], failed }`; the `fontsReady` event carries
+     * the same payload for a shell that would rather listen than ask.
+     */
+    prepareFonts: async () => editor.prepareFonts(),
+
+    /** Apply a family: a selected range is restyled, a bare caret arms the typing
+     *  font. `name: null` = Original. */
+    applyFont: ({ name } = {}) => { editor.applyFont(name == null ? null : String(name)); return {}; },
+
+    /**
+     * Bold / italic over the selection. `on` defaults to true so a shell can send a
+     * bare `{cmd:"applyBold"}` for "make it bold".
+     *
+     * THE REFUSAL ARRIVES AS AN EVENT, not as this call's result: the apply is
+     * asynchronous (it crosses to the worker), so a shell greys its buttons from
+     * `selection`/`styled`'s `canBold`/`canItalic` and hears about a refusal through
+     * the forwarded `error` event with code `no-such-face`.
+     */
+    applyBold: ({ on } = {}) => { editor.applyBold(on == null ? true : !!on); return {}; },
+    applyItalic: ({ on } = {}) => { editor.applyItalic(on == null ? true : !!on); return {}; },
+
+    /**
+     * Turn box dragging on or off. It ships ON and is no longer experimental as of
+     * 2.0.0 (docs/BLOCK_MOVE.md), so this is primarily the OFF switch.
+     * This command exists because a kill switch a phone shell
      * cannot reach is not a kill switch: iOS runs this bundle inside a WKWebView, so
      * without it a native product could enable nothing and, worse, disable nothing.
      */
@@ -160,10 +310,27 @@ export function attachNativeHost(editor, opts = {}) {
       return {};
     },
 
+    /**
+     * Everything a shell needs to draw its chrome, pulled in one call.
+     *
+     * The three INDEPENDENT states a toolbar branches on are all here, because a
+     * shell that missed an event (a web-view reload, chrome built after the tap)
+     * otherwise has no way back to the truth:
+     *   * `selection`     — a BOX is selected: Edit / Delete / Move are live.
+     *   * `editing`       — a run is OPEN for typing: styling controls are live.
+     *   * `textSelection` — a character RANGE is selected inside it: an "apply to
+     *                       selection" action applies to that range rather than
+     *                       arming the typing style. `null` means a bare caret.
+     * `selection` and `textSelection` were added 2026-08-19; `state` had carried
+     * only `editing` for its whole life, which is the pull-side twin of the gap the
+     * `select` event had until 2026-08-13.
+     */
     state: () => ({
       pageCount: editor.pageCount, page: editor.currentPage,
       zoom: editor.zoom, editMode: editor.editMode, blockMove: editor.blockMove,
-      dirty: editor.dirty, editing: editor.editing, capabilities: editor.capabilities,
+      dirty: editor.dirty, editing: editor.editing, selection: editor.selection,
+      textSelection: editor.textSelection, textStyle: editor.textStyle,
+      capabilities: editor.capabilities,
       documentName: editor.documentName, documentBytes: editor.documentBytes,
       suggestedName: editor.suggestedName(),
     }),

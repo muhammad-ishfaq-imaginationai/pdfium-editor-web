@@ -171,6 +171,17 @@ export function attachNativeHost(editor, opts = {}) {
      * through the bridge.
      */
     sealHistory: () => { editor._post({ type: "sealHistory" }); return {}; },
+    /**
+     * The native shell persisted the document itself — it wrote the bytes from
+     * `save` to its own storage, uploaded them, or handed them to a share sheet
+     * that reported success — and is declaring it. Clears the undo/redo history
+     * and the dirty flag.
+     *
+     * A phone shell needs this more than a browser host does: it is the platform
+     * where the SDK produces bytes and something entirely outside the WebView
+     * decides whether they were kept. Send it AFTER the write succeeds.
+     */
+    markSaved: () => { editor.markSaved(); return { dirty: editor.dirty }; },
     undo: () => { editor.undo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
     redo: () => { editor.redo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
 

@@ -1970,6 +1970,16 @@ onmessage = async (e) => {
   // happened" — the next keystroke starts a fresh word-level undo entry.
   if (msg.type === "sealHistory") { if (doc) F.historySeal(doc); return; }
 
+  // The host persisted the document itself (an upload, its own storage) and is
+  // declaring it — same bookkeeping a save does, without producing bytes. Added
+  // 2026-08-24 with Android's markSaved(): the SDK cannot see where a host puts
+  // the bytes, so only the host can say a save happened (I78).
+  if (msg.type === "markSaved") {
+    if (doc) { F.historyClear(doc); postHistory(true); }
+    postMessage({ type: "markedSaved" });
+    return;
+  }
+
   if (msg.type === "history") { postHistory(true); return; }
 
   // DIAGNOSTIC: the whole journal, for a host debug panel. Read straight from

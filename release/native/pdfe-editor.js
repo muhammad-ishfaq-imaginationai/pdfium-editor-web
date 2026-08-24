@@ -657,8 +657,10 @@ export class PdfeEditor {
    * cursor moves, with no sticky mode and no switch, matching the font family (the
    * sticky option is colour-only by user decision — docs/STYLING.md §2).
    *
-   * A non-positive size is REFUSED, not clamped: you get `styleApplied` with
-   * `ok: false` and `reason: "bad-size"`.
+   * A non-positive size is REFUSED, not clamped: nothing changes and the host gets an
+   * `error` event with code `size-failed`. (`styleApplied` is an INTERNAL worker→shell
+   * message and `bad-size` an internal reason string — neither is public surface, and
+   * naming them here sent a client host looking for an event that does not exist.)
    *
    * Bind your dropdown's current value to `textStyle.sizePt`, which arrives with every
    * `styled`/`selection` event and is `null` when the range mixes sizes — so the
@@ -856,11 +858,13 @@ export class PdfeEditor {
    * change" sentinel where a colour cannot, since every 32-bit value is a legal
    * colour).
    *
-   * THE TYPING FONT FOLLOWS THE CARET, and that is its ONLY lifetime (user decision
-   * 2026-08-13): it is dropped the moment the cursor moves, and there is deliberately
-   * no sticky mode and no switch. The one exception is the same one colour has — a
-   * click back to the SAME caret index keeps the pick, because picking in your own
-   * control steals focus and the click back is "give me my keyboard", not a move.
+   * THE TYPING FONT FOLLOWS THE CARET by default: it is dropped the moment the cursor
+   * moves. `setTypingFontFollowsCaret(false)` makes the pick STICKY instead — it then
+   * survives caret moves AND box changes, which is the mode a form-filling host wants
+   * (the colour-only rule was reversed 2026-08-20). One exception in FOLLOW mode, the
+   * same one colour has — a click back to the SAME caret index keeps the pick, because
+   * picking in your own control steals focus and the click back is "give me my
+   * keyboard", not a move.
    */
   applyFont(name) {
     // ⚠️ A STICKY PICK IS ALLOWED WITH NO RUN OPEN, and that is the whole point of the
@@ -885,17 +889,21 @@ export class PdfeEditor {
    *
    * There is no bold PROPERTY in a PDF — only a different font — so this resolves the
    * bold sibling of the family under the cursor and applies it. When that face does
-   * not exist it REFUSES and changes nothing, reporting `styleApplied` with
-   * `ok: false` and `reason: "no-such-face"`: no synthetic emboldening, and never
-   * another family's bold face (user decision 2026-08-13). Load the variant with
-   * `loadFont` and it works.
+   * not exist it REFUSES and changes nothing, raising `error` with code
+   * `no-such-face`: no synthetic emboldening, and never another family's bold face
+   * (user decision 2026-08-13). Load the variant with `loadFont` and it works.
    *
    * Bind your button's `disabled` to `textStyle.canBold` and its pressed state to
-   * `textStyle.bold` — both come with every `styled`/`selection` event, so the button
-   * is right before the user clicks rather than after.
+   * `textStyle.boldPressed` — NOT to `textStyle.bold`, which is null over a mixed
+   * range and jams the toggle on (that is why boldPressed exists). Both come with
+   * every `styled`/`selection` event, so the button is right before the user clicks
+   * rather than after. `canBold` means "at least one font in the range can take the
+   * face", so an enabled button can still decline with `mixed-fonts`.
    *
-   * Needs a RANGE: with a bare caret it reports `reason: "no-selection"` rather than
-   * quietly restyling the character behind the cursor.
+   * A BARE CARET ARMS the face for what is typed next, exactly as a colour or a
+   * family does — a `styled` event with `what: "typingFace"`, nothing repainted, and
+   * the document NOT marked dirty. It does not refuse, so gate the button on
+   * `canBold` alone and never on having a selection.
    */
   applyBold(on) { this._applyFace(on == null ? true : !!on, null); }
 
@@ -1883,6 +1891,27 @@ export class PdfeEditor {
         break;
       }
     }
+  }
+
+  /**
+   * Tell the editor the current document has been persisted by the host: clears
+   * the undo/redo history and the dirty flag, exactly as a successful `save()`
+   * does. Emits `history` and (if it changed) `dirty`.
+   *
+   * `save()` already does this, so you only need `markSaved()` when YOU wrote the
+   * document somewhere the SDK cannot see — you uploaded the `File` from `save()`,
+   * or you persisted it through your own storage layer.
+   *
+   * Call it AFTER the write succeeds. Calling it first is the bug it exists to
+   * prevent: if the upload then fails, the undo stack is gone and the document
+   * claims to be saved.
+   *
+   * @since 2.1.0
+   */
+  markSaved() {
+    this._dirtyUntracked = false;
+    this._setDirty(false);
+    this._post({ type: "markSaved" });
   }
 
   /** Default file name for a save, derived from the opened document. */

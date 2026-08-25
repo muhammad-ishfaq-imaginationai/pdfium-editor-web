@@ -4,56 +4,166 @@
 << /Type /Catalog /Pages 2 0 R >>
 endobj
 2 0 obj
-<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+<< /Type /Pages /Kids [3 0 R 5 0 R] /Count 2 >>
 endobj
 3 0 obj
-<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /H 7 0 R /HB 8 0 R /HO 9 0 R /T 10 0 R /TB 11 0 R /C 12 0 R >> /XObject << /Im1 13 0 R /Im2 14 0 R /Im3 15 0 R >> >> /Contents 4 0 R >>
 endobj
 4 0 obj
-<< /Length 1776 >>
+<< /Length 2531 >>
 stream
-BT /F2 20 Tf 1 0 0 1 64 750 Tm (PDF Text Editor) Tj ET
-BT /F1 10 Tf 1 0 0 1 64 724 Tm (Built On C, Speed like Jahaz) Tj ET
-BT /F2 13 Tf 1 0 0 1 64 688 Tm (What this page is) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 667 Tm (This is a sample document generated for the editor demo. Every line you) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 641 Tm (see is real text in the PDF's own text layer, not a picture of text and) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 615 Tm (not an overlay drawn on top. Turn on Edit, tap a paragraph, and type.) Tj ET
-BT /F2 13 Tf 1 0 0 1 64 578 Tm (Try these) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 557 Tm (?   Edit this paragraph and watch the lines below it reflow to fit.) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 531 Tm (?   Edit a heading instead. Headings keep their line, they do not reflow.) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 505 Tm (?   Select a word, then delete it. The spacing closes up as it should.) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 479 Tm (?   Press Save. What downloads is a real PDF with your edits in its text.) Tj ET
-BT /F2 13 Tf 1 0 0 1 64 442 Tm (Why it works this way) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 421 Tm (Most PDF tools cannot change existing text, so they draw a box over it and) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 395 Tm (hope you never open the file anywhere else. This editor rewrites the text) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 369 Tm (objects themselves, then re-renders with the same engine that wrote them,) Tj ET
-BT /F1 11 Tf 1 0 0 1 64 343 Tm (so what you see while editing is what ends up in the saved file.) Tj ET
-BT /F1 9 Tf 1 0 0 1 64 302 Tm (Engine       PDFium, compiled to WebAssembly) Tj ET
-BT /F1 9 Tf 1 0 0 1 64 280 Tm (Editing      one C++ core, shared by web, Android and iOS) Tj ET
-BT /F1 9 Tf 1 0 0 1 64 258 Tm (Sample       our own content, free to redistribute) Tj ET
+q 30 0 0 30 501 744 cm /Im1 Do Q
+0.12 0.31 0.88 rg BT /HB 22 Tf 1 0 0 1 64 750 Tm (PDF Text Editor) Tj ET
+0.12 0.31 0.88 RG 1.6 w 64 738 m 531 738 l S
+0.36 0.41 0.47 rg BT /HO 10.5 Tf 1 0 0 1 64 720 Tm (Edit the real text layer of a PDF. No OCR, no overlay.) Tj ET
+0.08 0.1 0.13 rg BT /HB 13 Tf 1 0 0 1 64 686 Tm (What this page is) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 670 Tm (Every line you see is real text in this file's own text layer, not a) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 655 Tm (picture of text and not a box drawn on top of it. Turn on Edit, tap a) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 640 Tm (paragraph, and type. The glyphs on screen are the engine's own output.) Tj ET
+0.08 0.1 0.13 rg BT /HB 13 Tf 1 0 0 1 64 605 Tm (Try these) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 589 Tm (∑   Edit this paragraph and watch the lines below it reflow to fit.) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 574 Tm (∑   Edit a heading instead. Headings keep their line; they do not reflow.) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 559 Tm (∑   Select a word and delete it. The spacing closes up as it should.) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 544 Tm (∑   Grow a word to 24 pt. The line spacing grows with it, both ways.) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 529 Tm (∑   Press Save. What downloads is a real PDF with your edits inside.) Tj ET
+0.08 0.1 0.13 rg BT /HB 13 Tf 1 0 0 1 64 492 Tm (One line, two colours) Tj ET
+0.05 0.44 0.44 rg BT /H 11 Tf 1 0 0 1 64 476 Tm (This half of the sentence is teal, ) Tj ET
+0.64 0.15 0.17 rg BT /H 11 Tf 1 0 0 1 221.751 476 Tm (and this half is red.) Tj ET
+0.36 0.41 0.47 rg BT /H 9.5 Tf 1 0 0 1 64 461 Tm (Select across the join: a correct host shows a blank swatch, not one of them.) Tj ET
+0.08 0.1 0.13 rg BT /HB 9 Tf 1 0 0 1 64 431 Tm (Engine) Tj ET
+0.08 0.1 0.13 rg BT /H 9 Tf 1 0 0 1 126 431 Tm (PDFium, compiled to WebAssembly) Tj ET
+0.08 0.1 0.13 rg BT /HB 9 Tf 1 0 0 1 64 417 Tm (Editing) Tj ET
+0.08 0.1 0.13 rg BT /H 9 Tf 1 0 0 1 126 417 Tm (one C++ core, shared by web, Android and iOS) Tj ET
+0.08 0.1 0.13 rg BT /HB 9 Tf 1 0 0 1 64 403 Tm (Colour) Tj ET
+0.54 0.31 0 rg BT /H 9 Tf 1 0 0 1 126 403 Tm (this value is amber, the label beside it is not) Tj ET
+0.08 0.1 0.13 rg BT /HB 9 Tf 1 0 0 1 64 389 Tm (Sample) Tj ET
+0.08 0.1 0.13 rg BT /H 9 Tf 1 0 0 1 126 389 Tm (our own content and our own pictures, free to redistribute) Tj ET
+0.36 0.41 0.47 rg BT /H 8.5 Tf 1 0 0 1 64 54 Tm (Page 1 of 2  ∑  the simple half) Tj ET
 endstream
 endobj
 5 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /H 7 0 R /HB 8 0 R /HO 9 0 R /T 10 0 R /TB 11 0 R /C 12 0 R >> /XObject << /Im1 13 0 R /Im2 14 0 R /Im3 15 0 R >> >> /Contents 6 0 R >>
 endobj
 6 0 obj
-<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+<< /Length 3711 >>
+stream
+0.12 0.31 0.88 rg BT /HB 18 Tf 1 0 0 1 64 750 Tm (The complex half) Tj ET
+0.85 0.87 0.91 RG 1 w 64 740 m 531 740 l S
+0.08 0.1 0.13 rg BT /TB 14 Tf 1 0 0 1 205.359 710 Tm (A centred block, three lines deep) Tj ET
+0.08 0.1 0.13 rg BT /T 12 Tf 1 0 0 1 206.012 693 Tm (so the alignment classifier has enough) Tj ET
+0.36 0.41 0.47 rg BT /T 12 Tf 1 0 0 1 220.346 676 Tm (members to call it centred at all.) Tj ET
+0.36 0.41 0.47 rg BT /HO 10.5 Tf 1 0 0 1 399.6975 645 Tm (and this pair is right-aligned,) Tj ET
+0.36 0.41 0.47 rg BT /HO 10.5 Tf 1 0 0 1 347.187 631 Tm (which is a different arm of the classifier.) Tj ET
+0.08 0.1 0.13 rg BT /HB 12 Tf 1 0 0 1 64 597 Tm (Two columns) Tj ET
+0.08 0.1 0.13 rg BT /HB 12 Tf 1 0 0 1 307.5 597 Tm (Five families) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 64 581 Tm (These two blocks sit side by) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 64 567 Tm (side and share every baseline.) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 64 553 Tm (They must stay two paragraphs:) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 64 539 Tm (editing one may not pull a word) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 64 525 Tm (out of the other.) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 307.5 581 Tm (Helvetica sets this line.) Tj ET
+0.08 0.1 0.13 rg BT /HB 10.5 Tf 1 0 0 1 307.5 567 Tm (Helvetica Bold sets this one.) Tj ET
+0.05 0.44 0.44 rg BT /HO 10.5 Tf 1 0 0 1 307.5 553 Tm (Helvetica Oblique, this one.) Tj ET
+0.08 0.1 0.13 rg BT /T 10.5 Tf 1 0 0 1 307.5 539 Tm (Times Roman, a serif face.) Tj ET
+0.54 0.31 0 rg BT /C 10.5 Tf 1 0 0 1 307.5 525 Tm (Courier, monospaced.) Tj ET
+0.08 0.1 0.13 rg BT /HB 12 Tf 1 0 0 1 64 491 Tm (Mixed sizes on one line) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 64 474 Tm (This word is ) Tj ET
+0.64 0.15 0.17 rg BT /HB 19 Tf 1 0 0 1 125.732 474 Tm (LARGE) Tj ET
+0.08 0.1 0.13 rg BT /H 11 Tf 1 0 0 1 192.232 474 Tm ( and the rest is not.) Tj ET
+0.08 0.1 0.13 rg BT /HB 12 Tf 1 0 0 1 64 438 Tm (A small table) Tj ET
+0.93 0.95 0.98 rg 64 408 467 20 re f
+0.08 0.1 0.13 rg BT /HB 9.5 Tf 1 0 0 1 70 414 Tm (Platform) Tj ET
+0.08 0.1 0.13 rg BT /HB 9.5 Tf 1 0 0 1 214 414 Tm (Surface) Tj ET
+0.08 0.1 0.13 rg BT /HB 9.5 Tf 1 0 0 1 394 414 Tm (Status) Tj ET
+0.85 0.87 0.91 RG 0.8 w 64 408 m 531 408 l S
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 70 394 Tm (Web) Tj ET
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 214 394 Tm (JavaScript API) Tj ET
+0.05 0.44 0.44 rg BT /H 9.5 Tf 1 0 0 1 394 394 Tm (shipping) Tj ET
+0.85 0.87 0.91 RG 0.8 w 64 388 m 531 388 l S
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 70 374 Tm (Android) Tj ET
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 214 374 Tm (PdfeEditorView) Tj ET
+0.05 0.44 0.44 rg BT /H 9.5 Tf 1 0 0 1 394 374 Tm (shipping) Tj ET
+0.85 0.87 0.91 RG 0.8 w 64 368 m 531 368 l S
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 70 354 Tm (iOS) Tj ET
+0.08 0.1 0.13 rg BT /H 9.5 Tf 1 0 0 1 214 354 Tm (JSON bridge) Tj ET
+0.05 0.44 0.44 rg BT /H 9.5 Tf 1 0 0 1 394 354 Tm (shipping) Tj ET
+0.85 0.87 0.91 RG 0.8 w 64 348 m 531 348 l S
+q 122 0 0 74 64 234 cm /Im2 Do Q
+q 122 0 0 74 204 234 cm /Im3 Do Q
+0.36 0.41 0.47 rg BT /HO 8.5 Tf 1 0 0 1 64 222 Tm (Figure 1. Drawn pixel by pixel.) Tj ET
+0.36 0.41 0.47 rg BT /HO 8.5 Tf 1 0 0 1 204 222 Tm (Figure 2. Flat colours, on purpose.) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 342 296 Tm (Both pictures are generated by the) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 342 282 Tm (script that writes this file. Neither) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 342 268 Tm (is editable text, and neither moves) Tj ET
+0.08 0.1 0.13 rg BT /H 10.5 Tf 1 0 0 1 342 254 Tm (when you edit the words beside it.) Tj ET
+0.36 0.41 0.47 rg BT /H 8.5 Tf 1 0 0 1 64 54 Tm (Page 2 of 2  ∑  the complex half) Tj ET
+endstream
 endobj
 7 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>
+endobj
+8 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>
+endobj
+9 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Oblique /Encoding /WinAnsiEncoding >>
+endobj
+10 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Roman /Encoding /WinAnsiEncoding >>
+endobj
+11 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Times-Bold /Encoding /WinAnsiEncoding >>
+endobj
+12 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier /Encoding /WinAnsiEncoding >>
+endobj
+13 0 obj
+<< /Type /XObject /Subtype /Image /Width 64 /Height 64 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length 180 >>
+stream
+x⁄ÌŒ±Ä0D—≤-€∞„≤â°Çâ£¯"˝Ø+Øxe›KlÀvõ›*Û¯Ì©Y¸ˆ“~{Oﬂo’ƒ˝ˆï≤ﬂ…˙Õó¶ﬂâøûÇ~?^–ˇØÊˇãóÚ7‡u¸mx3^¡¡ß˚É¯\üËÔÇœÚ˜¬ß¯;‚«˚˚‚<x‡¡É<x‡¡É<x‡¡É<xqø,ﬁ„W∆˙≈Òuø>æ‚üÌ
+õ„D
+endstream
+endobj
+14 0 obj
+<< /Type /XObject /Subtype /Image /Width 180 /Height 110 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length 653 >>
+stream
+x⁄Ì“gNQÜ·}dYEñ¡BÈ	ÈΩëûÿÉ1¶òﬁ[ÇM1&Ω◊üYE2R$K¡g–0sÔπ„ôWz›sﬂˆÃØv@r8ÛudŸëÏ@t¥êÀ≤„πÔÄËD ;ôdßÚﬂ —È^@v¶Ô+ Í|ú- ≤sÖ/ÄË|? ªPdãü—•@vπÑX¯Ûª∞ãÛIWJü‡PsÕ\mª:7ÇT—‡d·µ°è–∑Ø0îG^áÆpU4hNΩ1U€®MΩ9Új¢áÒèŒ⁄[–b*èŒ‡€e(1ÿÜGaùÚ{(0ÜGaÛ›Qh0ﬁÜ¬ÊÆ±wP`ºèÌÕ˜†¬F∂7ﬂáu6¬ÿû˝`‚-l≥‘ÜÌŸaü•6lœ~4	6⁄∞Ω˘Ò‘(∞—ÜÌÕO†¬x
+õüNCÉÒ66?õyf€PúÅÉaËŒŒæÇSmË¨ÌÜÆËa®MÕÕAUƒ04ßˆÃøÑæpa(èÃ√ë}U·daÔ\
+Ü´m}ã;àÉÊ$úO* >˙ó Yqπà •ïm@4∏
+»Ü √œkÄhQ~»F◊∂ —‡cº≤	à&™Äl*v¥Ö„pÛ‘˙L	@
+œôﬁ@Hö%a¸Å3,n1Ï-˙{g7◊·ßµbÿ[àÁœm·?IÍ¡O¿SÃ#=¯	xñÖZ5=“‹ÉüÄ'Z¨Uìáﬂ.‡πñ∂+-ä/V∂\Øƒø7+ıä+ø≠Ó¨ô≈IƒŸÅ∂Cª§Û4EzéCt‰PÙêÚNí˝L˝$R{=íH|$â|f<{HÛıHÇÎ≈Ì•-ùDöØG\O·±)ÈÅÎ                Ä÷ıàäWõ
+endstream
+endobj
+15 0 obj
+<< /Type /XObject /Subtype /Image /Width 180 /Height 110 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /FlateDecode /Length 278 >>
+stream
+x⁄Ì›±@ EQòA©±µ	tZ3@©—ô  Ñ$‰ìàì‹	^Nˇ÷m_%Ií$Ií$Ií$Ií$Ií$Ií$Ií$IíÙ˝¶ºàÕ§l∞¡l∞!6ƒÜÿbClàç™õ.60ÿ`É6ÿ`É6ÿ`É6ÿ`É6û.m€ÿÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ∏a£Øíÿÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ¯∫ç¨\bcÉ6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6ÿ`É6~bcgI∫îÁIí$Ií$Ií§Û °i‰
+endstream
+endobj
+16 0 obj
 << /Title (PDF Text Editor sample) /Producer (pdfium-editor demo sample generator) >>
 endobj
 xref
-0 8
+0 17
 0000000000 65535 f 
 0000000015 00000 n 
 0000000064 00000 n 
-0000000121 00000 n 
-0000000257 00000 n 
-0000002084 00000 n 
-0000002181 00000 n 
-0000002283 00000 n 
+0000000127 00000 n 
+0000000354 00000 n 
+0000002936 00000 n 
+0000003163 00000 n 
+0000006925 00000 n 
+0000007022 00000 n 
+0000007124 00000 n 
+0000007229 00000 n 
+0000007329 00000 n 
+0000007428 00000 n 
+0000007524 00000 n 
+0000007872 00000 n 
+0000008695 00000 n 
+0000009143 00000 n 
 trailer
-<< /Size 8 /Root 1 0 R /Info 7 0 R >>
+<< /Size 17 /Root 1 0 R /Info 16 0 R >>
 startxref
-2384
+9245
 %%EOF

@@ -81,6 +81,33 @@ const PDFE_CSS = `
 .pdfe-parabox { position: absolute; border: 1px dashed #757575cc; background: #7575751f;
                 pointer-events: none; border-radius: 1px; }
 .pdfe-parabox.pdfe-selected { border-style: solid; border-color: #03a9f4; background: #03a9f426; }
+/* A SELECTED PICTURE. Same sky blue as a selected text box so "this is
+   selected" reads identically, but a POLYGON — a turned picture's outline is
+   still a rectangle geometrically and still needs four arbitrary corners, and a
+   CSS box cannot express that. pointer-events: none for the same reason the
+   paragraph boxes have it: the canvas below owns the tap. */
+.pdfe-imagebox { position: absolute; pointer-events: none; overflow: visible; }
+/* UNSELECTED: the picture's twin of .pdfe-parabox — a grey dashed hairline that
+   says "this is a thing you can grab", drawn for every picture in edit mode. */
+.pdfe-imagebox polygon { fill: none; stroke: #9e9e9e; stroke-width: 1;
+                         stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
+/* SELECTED: solid sky blue + the same wash, matching .pdfe-parabox.pdfe-selected
+   so "selected" reads identically whichever kind it is. Two pixels, not one: a
+   1 px hairline over a busy photograph is genuinely hard to see, which is what
+   the first look at this reported. */
+.pdfe-imagebox-selected polygon { fill: #03a9f426; stroke: #03a9f4; stroke-width: 2;
+                                  stroke-dasharray: none; }
+/* The rotate handle. Sky blue to read as part of the selection, circular so it
+   is obviously a button and not a resize grip — this feature has no resize, and
+   a square corner handle would promise one. 28 px is the smallest comfortable
+   touch target that still sits on a small picture. */
+.pdfe-rotate { position: absolute; z-index: 5; display: none;
+               width: 28px; height: 28px; padding: 0; border-radius: 50%;
+               border: 1px solid #03a9f4; background: #fff; color: #03a9f4;
+               box-shadow: 0 1px 4px #0003; cursor: pointer;
+               align-items: center; justify-content: center; }
+.pdfe-rotate:hover { background: #03a9f4; color: #fff; }
+.pdfe-rotate:active { transform: scale(0.92); }
 /* EXPERIMENTAL (feature/web-block-move): the drag ghost. A box being dragged is
    previewed as an outline that follows the finger; the real text is translated
    ONCE on drop, so a drag costs no engine work per frame. Dashed and washed so
@@ -239,6 +266,10 @@ export class PdfeEditor {
     // it can still be switched back with one flag and no redeploy of this SDK
     // (docs/BLOCK_MOVE.md).
     this._blockMove = opts.blockMove ?? true;
+    // ADD TEXT: armed between armAddText() and the tap that places a box.
+    // Read by _tapWantsKeyboard, which must answer synchronously inside the
+    // gesture for iOS to raise a keyboard at all (S39).
+    this._addingText = false;
 
     // How long a picked typing colour lives (docs/STYLING.md §2). DEFAULT ON:
     // the colour lasts until the user moves the cursor, then the caret's own
@@ -247,6 +278,10 @@ export class PdfeEditor {
     // it, which is the behaviour a form-filling host wants when every field it
     // types into must come out one colour regardless of what was there.
     this._typingColorFollowsCaret = opts.typingColorFollowsCaret ?? true;
+    // THE SAME TWO LIFETIMES FOR THE TYPEFACE (2026-08-20), and the same default. It
+    // covers the family AND bold/italic together, because both are the core's one
+    // typing-font slot — see docs/STYLING.md §2bis.
+    this._typingFontFollowsCaret = opts.typingFontFollowsCaret ?? true;
 
     // ---- document/view state --------------------------------------------------
     this._pages = [];            // [{w,h}] PDF points
@@ -281,6 +316,15 @@ export class PdfeEditor {
     this._pageGroups = new Map();
     this._groupsPending = new Set();
     this._selected = null;            // {page, index, bounds} — the WORKER decides this
+    // A SELECTED PICTURE (docs/IMAGE_EDIT.md). Separate from _selected because
+    // the two are different things to a host: a text box can be opened for
+    // typing and deleted, a picture can be dragged and turned. `selectionKind`
+    // is the one question a host's toolbar branches on.
+    this._selectedImage = null;       // {page, index, bounds, quad, turns, flags}
+    // Per-page picture geometry, the twin of _pageGroups — what the faint
+    // outlines are drawn from, so a picture LOOKS interactive before it is
+    // tapped, exactly as a text box does.
+    this._pageImages = new Map();
     // Mirror of the ENGINE's history state. Never computed here: canUndo is
     // whatever the core says, so a stale local flag can never grey the wrong
     // button (docs/UNDO_REDO.md §1 S1).
@@ -408,6 +452,7 @@ export class PdfeEditor {
     this._dirtyUntracked = false;
     this._painted = new Set();
     this._selected = null;
+    this._selectedImage = null;
     this._history = { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1,
                       recording: false };
     this._closeEditUiState();
@@ -491,7 +536,9 @@ export class PdfeEditor {
       this.getOutOfBoxEditing();
       this._post({ type: "deselect" });
       this._selected = null;
+      this._selectedImage = null;
       this._pageGroups.clear();
+      this._pageImages.clear();
       this._groupsPending.clear();
       this._renderBoxes();
     }
@@ -537,6 +584,50 @@ export class PdfeEditor {
     return this._selected ? { page: this._selected.page, index: this._selected.index } : null;
   }
   /**
+   * WHAT IS SELECTED: "text", "image", or null. The one question a host's
+   * toolbar branches on — turn-left/turn-right belong to a picture, Edit and
+   * Delete to a text box.
+   *
+   * A READABLE state, not only an observable one: the `select` event carries the
+   * same `kind`, but a host that reloads (or a native shell whose web view was
+   * recreated) has no event history to replay, so it must be able to ASK. That
+   * is parity rule 13's requirement, and this is its sixth state.
+   */
+  get selectionKind() {
+    if (this._selectedImage) return "image";
+    if (this._selected) return "text";
+    return null;
+  }
+  /** The selected picture, or null: {page, index, bounds, quad, quarterTurns, clipped}. */
+  get imageSelection() {
+    const im = this._selectedImage;
+    if (!im) return null;
+    return { page: im.page, index: im.index, bounds: im.bounds, quad: im.quad,
+             quarterTurns: im.turns ?? 0, clipped: !!(im.flags & 1) };
+  }
+  /**
+   * Turn the selected PICTURE by |turns| x 90 degrees about its own centre.
+   * Positive is clockwise. A no-op (and harmless) when the selection is text or
+   * empty — a host may wire the buttons unconditionally.
+   *
+   * There is deliberately no free-angle version: the gesture is two buttons
+   * (docs/IMAGE_EDIT.md §1, closed by user decision 2026-08-25).
+   */
+  rotateSelection(turns = 1) {
+    if (!this._selectedImage) return false;
+    this._post({ type: "rotateImage", turns: Math.trunc(Number(turns) || 0) });
+    return true;
+  }
+  /**
+   * Move the selected PICTURE by (dx, dy) PDF points. The drag gesture uses this
+   * too. Clamped by the core so the picture lands on the page.
+   */
+  moveImageSelection(dx, dy) {
+    if (!this._selectedImage) return false;
+    this._post({ type: "moveImage", dx: Number(dx) || 0, dy: Number(dy) || 0 });
+    return true;
+  }
+  /**
    * Open the selected paragraph for typing (the Edit action).
    *
    * THIS is the gesture that asks for a keyboard. Focus here, synchronously,
@@ -558,7 +649,9 @@ export class PdfeEditor {
    */
   deleteSelection() { if (this._selected) this._post({ type: "deleteSelected" }); }
   /** Drop the selection (the tap-on-empty-space gesture). */
-  clearSelection() { if (this._selected) this._post({ type: "deselect" }); }
+  clearSelection() {
+    if (this._selected || this._selectedImage) this._post({ type: "deselect" });
+  }
   /**
    * Move the selected box by (dx, dy) PDF points — the programmatic sibling of
    * the drag gesture, for a host that wants nudge buttons or arrow keys.
@@ -590,6 +683,73 @@ export class PdfeEditor {
     return this._blockMove;
   }
 
+  // ---- ADD TEXT: place a new box where the document has none ---------------
+  // docs/ADD_TEXT.md. An ARMED MODE, never a heuristic on an existing tap:
+  // tap-on-empty already means deselect and tap-outside already means commit, and
+  // both are load-bearing. So the host arms, the next tap places, and the arm is
+  // spent — one box per arming.
+
+  /**
+   * Is Add Text armed right now? True between `armAddText()` and the tap that
+   * places a box (or `cancelAddText()`). Read it rather than mirroring the
+   * `addtextarmed` event into a field of your own — one missed event and the mirror
+   * is wrong forever.
+   */
+  get addingText() { return this._addingText; }
+
+  /**
+   * Arm Add Text: the NEXT tap on the page creates an empty text box there, with
+   * the caret already inside it, and the user types. The arm is consumed by that
+   * tap. Typing, styling, undo, save and dragging then work exactly as they do in
+   * any other box.
+   *
+   * Nothing is created until a character is typed — a box the user places and taps
+   * away from simply evaporates, leaving no object and no undo step.
+   *
+   * The new text's font, size and colour come from `setNewTextStyle()`; with none
+   * set you get Helvetica 12pt black, which resolves identically on every platform.
+   */
+  armAddText() {
+    if (!this._editMode) this.setEditMode(true);   // placing text IS editing
+    this._post({ type: "armAddText" });
+    return true;
+  }
+
+  /** Disarm Add Text without placing anything. Safe to call when not armed. */
+  cancelAddText() { this._post({ type: "cancelAddText" }); }
+
+  /**
+   * The default look for text created by `armAddText()`. Every field is optional and
+   * independent, so setting only `color` leaves the face and size alone.
+   *
+   * @param {{font?: string|null, size?: number, color?: number|string|null}} style
+   *   `font` is a family name you have loaded with `loadFont()` (or a standard-14
+   *   name); a name this document cannot resolve falls back to the built-in
+   *   Helvetica rather than failing. `size` is in points. `color` accepts the same
+   *   forms as `applyTextColor`.
+   */
+  setNewTextStyle(style = {}) {
+    const msg = { type: "setNewTextStyle" };
+    if ("font" in style) msg.fontName = style.font || null;
+    if ("size" in style) msg.sizePt = Number(style.size) || 0;
+    if ("color" in style) {
+      // parseArgb is the ONE colour parser this SDK has (applyTextColor uses it), so a
+      // host's "#c00" means the same thing here as it does there. An unparseable value
+      // is reported rather than silently becoming black, and the seed is left alone.
+      if (style.color == null) msg.colorArgb = 0;
+      else {
+        const argb = parseArgb(style.color);
+        if (argb === null) {
+          this._emit("error",
+            { code: "color-failed", detail: `unparseable colour: ${style.color}` });
+          return;
+        }
+        msg.colorArgb = argb >>> 0;
+      }
+    }
+    this._post(msg);
+  }
+
   // ---- character-level styling: colour ------------------------------------
   // The PALETTE IS THE HOST'S BUSINESS (user directive 2026-08-10: "its on client
   // side, how many color they want to use. they will pass selected color to our
@@ -604,7 +764,13 @@ export class PdfeEditor {
    * `color`: 0xAARRGGBB, or "#rgb" / "#rrggbb" / "#rrggbbaa".
    */
   applyTextColor(color) {
-    if (this._editingPage < 0) return;
+    // ⚠️ A STICKY PICK IS ALLOWED WITH NO RUN OPEN — the same rule applyFont carries, and
+    // reported by the user in the same session (2026-08-20): *"if you are out of a box and
+    // set a colour, then enter a box, it is not writing the new text in the new colour."*
+    // Sticky means "everything I type from now on", which includes the box the host has
+    // not opened yet. In FOLLOW mode the early return stands: an arm with no caret to
+    // follow is meaningless.
+    if (this._editingPage < 0 && this._typingColorFollowsCaret) return;
     const argb = parseArgb(color);
     if (argb === null) {
       this._emit("error", { code: "color-failed", detail: `unparseable colour: ${color}` });
@@ -627,7 +793,10 @@ export class PdfeEditor {
     // index must keep the pick instead of dropping it (the worker's
     // postCaretMoved owns that rule — docs/STYLING.md §2). A range apply sends
     // no index: the painted text needs no revival.
-    this._post({ type: "setTypingColor", argb, set: 1, at: e > s ? -1 : s });
+    // `at` is -1 when there is no run open: a sticky pick made outside a box was armed
+    // at no caret, so there is no same-index revival to remember.
+    this._post({ type: "setTypingColor", argb, set: 1,
+                 at: this._editingPage < 0 || e > s ? -1 : s });
     if (e > s) this._post({ type: "applyColor", argb, start: s, end: e });
   }
 
@@ -644,8 +813,10 @@ export class PdfeEditor {
    * cursor moves, with no sticky mode and no switch, matching the font family (the
    * sticky option is colour-only by user decision — docs/STYLING.md §2).
    *
-   * A non-positive size is REFUSED, not clamped: you get `styleApplied` with
-   * `ok: false` and `reason: "bad-size"`.
+   * A non-positive size is REFUSED, not clamped: nothing changes and the host gets an
+   * `error` event with code `size-failed`. (`styleApplied` is an INTERNAL worker→shell
+   * message and `bad-size` an internal reason string — neither is public surface, and
+   * naming them here sent a client host looking for an event that does not exist.)
    *
    * Bind your dropdown's current value to `textStyle.sizePt`, which arrives with every
    * `styled`/`selection` event and is `null` when the range mixes sizes — so the
@@ -717,6 +888,35 @@ export class PdfeEditor {
   }
   /** Whether a picked typing colour is dropped when the cursor moves. */
   get typingColorFollowsCaret() { return this._typingColorFollowsCaret; }
+
+  /**
+   * Choose how long a picked TYPEFACE lives — the exact twin of
+   * `setTypingColorFollowsCaret`, added 2026-08-20 (docs/STYLING.md §2bis):
+   *
+   * - `true` (default): a family pick or a B/I press at a bare caret applies to what
+   *   you type next and is DROPPED when the cursor moves.
+   * - `false`: it is STICKY — it survives cursor moves AND box changes, until you set
+   *   the mode back or apply `null` (Original). What a form-filling host wants when
+   *   every field it types into must come out in one typeface.
+   *
+   * ⚠️ **It covers the family and bold/italic together**, because both are one slot in
+   * the engine. Sticky bold is sticky bold in whatever family the next box uses — the
+   * intent is replayed there, and silently skipped if that family has no such face.
+   *
+   * ⚠️ **In sticky mode the `styled` event still reports the typeface UNDER the
+   * cursor**, exactly as it does for colour, so a host painting its picker blindly
+   * would show the context font while the next keystroke takes the pick. Read this
+   * getter and skip the repaint — the same guard the reference hosts use for colour.
+   *
+   * Returns the value in force afterwards.
+   */
+  setTypingFontFollowsCaret(on) {
+    this._typingFontFollowsCaret = !!on;
+    this._post({ type: "setTypingFontFollowsCaret", on: this._typingFontFollowsCaret });
+    return this._typingFontFollowsCaret;
+  }
+  /** Whether a picked typeface (family or bold/italic) is dropped when the cursor moves. */
+  get typingFontFollowsCaret() { return this._typingFontFollowsCaret; }
 
   /** Ask the engine for the style at a caret or over a range; answered by `styled`. */
   requestTextStyle(start, end) {
@@ -814,14 +1014,23 @@ export class PdfeEditor {
    * change" sentinel where a colour cannot, since every 32-bit value is a legal
    * colour).
    *
-   * THE TYPING FONT FOLLOWS THE CARET, and that is its ONLY lifetime (user decision
-   * 2026-08-13): it is dropped the moment the cursor moves, and there is deliberately
-   * no sticky mode and no switch. The one exception is the same one colour has — a
-   * click back to the SAME caret index keeps the pick, because picking in your own
-   * control steals focus and the click back is "give me my keyboard", not a move.
+   * THE TYPING FONT FOLLOWS THE CARET by default: it is dropped the moment the cursor
+   * moves. `setTypingFontFollowsCaret(false)` makes the pick STICKY instead — it then
+   * survives caret moves AND box changes, which is the mode a form-filling host wants
+   * (the colour-only rule was reversed 2026-08-20). One exception in FOLLOW mode, the
+   * same one colour has — a click back to the SAME caret index keeps the pick, because
+   * picking in your own control steals focus and the click back is "give me my
+   * keyboard", not a move.
    */
   applyFont(name) {
-    if (this._editingPage < 0) return;
+    // ⚠️ A STICKY PICK IS ALLOWED WITH NO RUN OPEN, and that is the whole point of the
+    // mode (user-reported 2026-08-20): a form-filling host picks the typeface FIRST and
+    // then starts clicking fields. Before this, the call was silently dropped and the
+    // host's picker was left showing a font that would never be applied — "it shows that
+    // font in the UI, but that font is not applying on the new text I am writing".
+    // In FOLLOW mode the early return stands: an arm with no caret to follow is
+    // meaningless, and dropping it is what has always happened.
+    if (this._editingPage < 0 && this._typingFontFollowsCaret) return;
     // Same ownership rule as applyTextColor: styling IS an interaction, so the next
     // Ctrl+Z is ours even though the gesture landed on the host's picker. No focus()
     // — a native <select> popup may still be open.
@@ -836,17 +1045,21 @@ export class PdfeEditor {
    *
    * There is no bold PROPERTY in a PDF — only a different font — so this resolves the
    * bold sibling of the family under the cursor and applies it. When that face does
-   * not exist it REFUSES and changes nothing, reporting `styleApplied` with
-   * `ok: false` and `reason: "no-such-face"`: no synthetic emboldening, and never
-   * another family's bold face (user decision 2026-08-13). Load the variant with
-   * `loadFont` and it works.
+   * not exist it REFUSES and changes nothing, raising `error` with code
+   * `no-such-face`: no synthetic emboldening, and never another family's bold face
+   * (user decision 2026-08-13). Load the variant with `loadFont` and it works.
    *
    * Bind your button's `disabled` to `textStyle.canBold` and its pressed state to
-   * `textStyle.bold` — both come with every `styled`/`selection` event, so the button
-   * is right before the user clicks rather than after.
+   * `textStyle.boldPressed` — NOT to `textStyle.bold`, which is null over a mixed
+   * range and jams the toggle on (that is why boldPressed exists). Both come with
+   * every `styled`/`selection` event, so the button is right before the user clicks
+   * rather than after. `canBold` means "at least one font in the range can take the
+   * face", so an enabled button can still decline with `mixed-fonts`.
    *
-   * Needs a RANGE: with a bare caret it reports `reason: "no-selection"` rather than
-   * quietly restyling the character behind the cursor.
+   * A BARE CARET ARMS the face for what is typed next, exactly as a colour or a
+   * family does — a `styled` event with `what: "typingFace"`, nothing repainted, and
+   * the document NOT marked dirty. It does not refuse, so gate the button on
+   * `canBold` alone and never on having a selection.
    */
   applyBold(on) { this._applyFace(on == null ? true : !!on, null); }
 
@@ -1211,6 +1424,23 @@ export class PdfeEditor {
     this.handleEls = [mk("div", "pdfe-handle"), mk("div", "pdfe-handle")];
     this.caretHandleEl = mk("div", "pdfe-carethandle");
     this.actionsEl = mk("div", "pdfe-actions");
+    // THE ROTATE HANDLE — the second piece of chrome the SDK owns, and it earns
+    // that the same way the action bar does: it is ANCHORED TO AN OBJECT. A host
+    // cannot place a control on a picture's corner without asking for geometry
+    // every frame and re-asking after every turn, drag, scroll and zoom.
+    // rotateSelection() stays public for a host that wants its own button too.
+    this.rotateBtn = mk("button", "pdfe-rotate");
+    this.rotateBtn.type = "button";
+    this.rotateBtn.title = "Rotate 90°";
+    this.rotateBtn.setAttribute("aria-label", "Rotate 90 degrees");
+    // An inline SVG, not a glyph: the emoji rotate arrows render as a different
+    // shape on every platform and several are coloured.
+    this.rotateBtn.innerHTML =
+      '<svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">' +
+      '<path fill="none" stroke="currentColor" stroke-width="2.2" ' +
+      'stroke-linecap="round" stroke-linejoin="round" ' +
+      'd="M20 11a8 8 0 1 0-2.3 5.7"/>' +
+      '<path fill="currentColor" d="M20 4.5v6h-6z"/></svg>';
     this.editBtn = mk("button", "pdfe-act-edit");
     this.deleteBtn = mk("button", "pdfe-act-del");
     this.editBtn.type = "button";
@@ -1225,7 +1455,8 @@ export class PdfeEditor {
     })) this.sink.setAttribute(k, v);
 
     this.strip.append(this.boxesEl, this.editBoxEl, this.moveGhostEl, this.selEl,
-      this.caretEl, ...this.handleEls, this.caretHandleEl, this.actionsEl, this.sink);
+      this.caretEl, ...this.handleEls, this.caretHandleEl, this.actionsEl,
+      this.rotateBtn, this.sink);
     this.root.appendChild(this.strip);
     this.container.appendChild(this.root);
 
@@ -1294,6 +1525,7 @@ export class PdfeEditor {
     // The worker owns the caret sites, so it owns the flag. Posted rather than
     // read from a constructor argument because a host may flip it at runtime.
     this._post({ type: "setTypingColorFollowsCaret", on: this._typingColorFollowsCaret });
+    this._post({ type: "setTypingFontFollowsCaret", on: this._typingFontFollowsCaret });
     // WHERE THE BUNDLED FONT SET LIVES. Default is `./fonts/` relative to the worker,
     // which is the npm layout by construction (the worker ships at
     // dist/assets/pdfe-worker.js, so the set is at dist/assets/fonts/). A host serving a
@@ -1353,7 +1585,8 @@ export class PdfeEditor {
         // the fact is a round trip that lands a frame late — Android's
         // onSelectionChanged has carried the rect from the start, so this is
         // also event parity, not just convenience. PDF points, [l,b,r,t].
-        this._emit("select", { selection: { page: msg.page, index: msg.index,
+        this._emit("select", { selection: { kind: "text",
+                                           page: msg.page, index: msg.index,
                                            blockIndex: msg.blockIndex ?? -1,
                                            bounds: msg.bounds || null } });
         break;
@@ -1361,8 +1594,53 @@ export class PdfeEditor {
         if (!this._selected) break;
         this._selected = null;
         this._renderBoxes();
-        this._emit("select", { selection: null });
+        if (!this._selectedImage) this._emit("select", { selection: null });
         break;
+      // ---- IMAGE EDIT (docs/IMAGE_EDIT.md) ----
+      case "imageSelected":
+        this._selectedImage = { page: msg.page, index: msg.index, bounds: msg.bounds,
+                                quad: msg.quad, turns: msg.turns, flags: msg.flags };
+        this._renderBoxes();
+        // ONE event for both kinds, carrying `kind`. A host that only handles
+        // text reads `kind === "text"` and ignores the rest; one that handles
+        // pictures branches. Two separate events would have let a host wire the
+        // first and silently miss the second — the shape of every parity gap in
+        // CLAUDE.md's list.
+        this._emit("select", { selection: {
+          kind: "image", page: msg.page, index: msg.index, bounds: msg.bounds || null,
+          quad: msg.quad || null, quarterTurns: msg.turns ?? 0,
+          clipped: !!(msg.flags & 1),
+        } });
+        break;
+      case "imageDeselected":
+        if (!this._selectedImage) break;
+        this._selectedImage = null;
+        this._renderBoxes();
+        if (!this._selected) this._emit("select", { selection: null });
+        break;
+      case "imageMoved":
+      case "imageRotated": {
+        this._hideMoveGhost();
+        // Adopt the fresh page list BEFORE re-rendering, or the faint outline of
+        // the picture that just moved is drawn from stale geometry — visibly, at
+        // its old position, as soon as it is deselected.
+        if (msg.images) this._pageImages.set(msg.page, msg.images);
+        // Same dirty rule the other mutations follow: with history recording on,
+        // `dirty` is derived from the journal, so setting it here too would make
+        // it impossible to return to false by undoing (I80's neighbourhood).
+        if (msg.ok && !this._history.recording) this._setDirty(true);
+        // TWO LITERAL EMITS, NOT ONE COMPUTED ONE. The obvious
+        // `_emit(cond ? "moved" : "rotated", …)` works perfectly and is
+        // INVISIBLE to the parity gate, which reads `_emit("name"` statically —
+        // so a brand-new event would have reached web and no other platform with
+        // every check green. The gate says so about itself: "a gate that
+        // silently skips what it cannot parse is worse than one that fails."
+        const detail = { page: msg.page, ok: !!msg.ok, kind: "image",
+                         bounds: msg.bounds || null, quarterTurns: msg.turns ?? null };
+        if (msg.type === "imageMoved") this._emit("moved", detail);
+        else this._emit("rotated", detail);
+        break;
+      }
       case "paraDeleted": {
         // The paragraph is gone from the text layer and the vacated strip has
         // already been repainted by the worker — all that is left is to forget
@@ -1425,6 +1703,7 @@ export class PdfeEditor {
         // (docs/UNDO_REDO.md §1 S8/S12/S14).
         if (msg.blocks) {
           this._pageGroups.set(msg.page, msg.blocks);
+          if (msg.images) this._pageImages.set(msg.page, msg.images);
           this._groupsPending.delete(msg.page);
         }
         if (msg.live) {
@@ -1496,6 +1775,13 @@ export class PdfeEditor {
         this._emit("moved", { page: msg.page, ok: !!msg.ok });
         break;
       }
+      case "addTextArmed":
+        // AN ARM REPORTS ITSELF, BOTH WAYS (parity rule 14). The host paints its
+        // button from this — including the DISARM that the placing tap performs, so a
+        // spent arm cannot leave the button lit.
+        this._addingText = !!msg.armed;
+        this._emit("addtextarmed", { armed: this._addingText });
+        break;
       case "editOpened": {
         // Prime the sink with the run's logical text (a programmatic set fires
         // no 'input', so this cannot echo back as a keystroke).
@@ -1515,7 +1801,10 @@ export class PdfeEditor {
         this._drawSelection([]);
         this._drawHandles(null, null);
         this.scrollCaretIntoView();
-        this._emit("editopen", this.editing);
+        // `created` distinguishes "a NEW box was just placed" from an ordinary open.
+        // Deliberately a flag on this event rather than a second event firing at the
+        // same instant with nothing extra to say (docs/ADD_TEXT.md).
+        this._emit("editopen", { ...this.editing, created: !!msg.created });
         // Opening a run places a cursor, so it reports the style there exactly as
         // a move does — one event for hosts to drive a swatch from, and no reason
         // for a host to ask separately (asking meant guessing an index, and the
@@ -1527,6 +1816,24 @@ export class PdfeEditor {
         });
         break;
       }
+      case "caretStyle":
+        // AN ARM REPORTED ITSELF (I76). A collapsed colour or size pick changes nothing
+        // on the page, so it used to post nothing at all — and a host that paints its
+        // controls from `styled` kept showing the value under the cursor while the SDK
+        // typed the picked one. Reported on the same event a caret move uses, so a host
+        // needs no new binding.
+        //
+        // ⚠️ DELIBERATELY NOT `caretMoved`, and do not "simplify" it into that case: the
+        // caret branch below re-focuses the sink, and focusing right after a picker stole
+        // focus pops the keyboard mid-pick on iOS (S39) — the same reason applyFontSize
+        // and applyTextColor do not call sink.focus() themselves. This case touches
+        // nothing but the reported style.
+        this._textStyle = msg.style || null;
+        this._emit("styled", {
+          what: "caret", page: this._editingPage, style: msg.style || null,
+          caretIndex: msg.index, following: !!msg.following,
+        });
+        break;
       case "caretMoved":
         this.sink.setSelectionRange(msg.index, msg.index);
         // THE CURSOR MOVED, SO THE STYLE UNDER IT IS THE ONE THAT MATTERS NOW.
@@ -1754,6 +2061,7 @@ export class PdfeEditor {
         this._groupsPending.delete(msg.page);
         const blocks = msg.blocks || [];
         this._pageGroups.set(msg.page, blocks);
+        this._pageImages.set(msg.page, msg.images || []);
         this._renderBoxes();
         // `count` stays the PARAGRAPH count (what it always meant, and what a
         // consumer's selection indices are numbered in); `blocks` is additive.
@@ -1815,6 +2123,27 @@ export class PdfeEditor {
         break;
       }
     }
+  }
+
+  /**
+   * Tell the editor the current document has been persisted by the host: clears
+   * the undo/redo history and the dirty flag, exactly as a successful `save()`
+   * does. Emits `history` and (if it changed) `dirty`.
+   *
+   * `save()` already does this, so you only need `markSaved()` when YOU wrote the
+   * document somewhere the SDK cannot see — you uploaded the `File` from `save()`,
+   * or you persisted it through your own storage layer.
+   *
+   * Call it AFTER the write succeeds. Calling it first is the bug it exists to
+   * prevent: if the upload then fails, the undo stack is gone and the document
+   * claims to be saved.
+   *
+   * @since 2.1.0
+   */
+  markSaved() {
+    this._dirtyUntracked = false;
+    this._setDirty(false);
+    this._post({ type: "markSaved" });
   }
 
   /** Default file name for a save, derived from the opened document. */
@@ -1909,8 +2238,10 @@ export class PdfeEditor {
     this._currentPage = 0;
     this._reportedPage = -1;     // a new document re-announces its page 1
     this._pageGroups.clear();
+    this._pageImages.clear();
     this._groupsPending.clear();
     this._selected = null;
+    this._selectedImage = null;
     this._editingParaIndex = -1;
     this._editingBlockIndex = -1;
     this._computeFitScale();
@@ -2065,6 +2396,7 @@ export class PdfeEditor {
   _renderBoxes() {
     this.boxesEl.innerHTML = "";
     this.actionsEl.style.display = "none";
+    this.rotateBtn.style.display = "none";
     if (!this._editMode) return;
     const scaleCss = this._fitScale * this._zoom;
     const sel = this._selected;
@@ -2103,6 +2435,55 @@ export class PdfeEditor {
         && !this._draggingBox) {
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
+    // PICTURES. One faint outline EACH, exactly as every text block gets one:
+    // without it a picture is invisible as an interactive thing until the user
+    // happens to tap it, which is what a first look at this feature reported.
+    //
+    // Drawn from the ROTATED QUAD, not the axis-aligned box — a turned picture
+    // given a rectangle outline gets one that does not fit it. For a quarter
+    // turn the quad IS a rectangle (just a different one), so a polygon is
+    // correct in every case and special-cases none.
+    const selImg = this._selectedImage;
+    const imgSvg = (page, quad, cls) => {
+      const rect = this._pageRect(page);
+      if (!rect || !this._pageCanvases[page] || !quad) return;
+      const pw = this._pages[page].w * scaleCss;
+      const ph = this._pages[page].h * scaleCss;
+      const pts = [];
+      for (let i = 0; i < 8; i += 2) {
+        pts.push(`${quad[i] * scaleCss},${(this._pages[page].h - quad[i + 1]) * scaleCss}`);
+      }
+      const svg = this._doc.createElementNS("http://www.w3.org/2000/svg", "svg");
+      svg.setAttribute("class", cls);
+      svg.style.left = `${rect.left}px`;
+      svg.style.top = `${rect.top}px`;
+      svg.style.width = `${pw}px`;
+      svg.style.height = `${ph}px`;
+      svg.setAttribute("viewBox", `0 0 ${pw} ${ph}`);
+      const poly = this._doc.createElementNS("http://www.w3.org/2000/svg", "polygon");
+      poly.setAttribute("points", pts.join(" "));
+      svg.appendChild(poly);
+      this.boxesEl.appendChild(svg);
+    };
+    for (const [page, imgs] of this._pageImages) {
+      if (!this._pageCanvases[page]) continue;
+      for (const im of imgs) {
+        // The selected one is drawn last, on top, in its own style.
+        if (selImg && selImg.page === page && selImg.index === im.index) continue;
+        imgSvg(page, im.quad, "pdfe-imagebox");
+      }
+    }
+    if (selImg) {
+      imgSvg(selImg.page, selImg.quad, "pdfe-imagebox pdfe-imagebox-selected");
+      // …and the rotate handle on it. Hidden during a drag for the same reason
+      // the action bar is: any re-render mid-drag would strand it on the old rect.
+      if (!this._draggingBox) this._placeRotate(selImg, scaleCss);
+      // NO ACTION BAR. The bar's two actions are Edit and Delete, and neither
+      // exists for a picture: there is nothing to open for typing, and image
+      // deletion is deliberately out of scope. Showing it offered a user two
+      // buttons that could only disappoint. Turning a picture is HOST chrome
+      // (rotateSelection), like every other control except this one bar.
+    }
   }
 
   // ---- block move preview (EXPERIMENTAL, feature/web-block-move) -----------
@@ -2128,6 +2509,17 @@ export class PdfeEditor {
    * SECOND tap on that same selected paragraph is the shortcut into editing.
    */
   _tapWantsKeyboard(page, pt) {
+    // ADD TEXT: an ARMED tap creates a box and puts the caret in it, wherever it
+    // lands — so it always opens an edit and always wants the keyboard. Checked
+    // FIRST because it outranks both branches below: while armed, a tap neither
+    // selects nor merely repositions a caret.
+    //
+    // Only the SHELL can do this. The decision has to be made synchronously inside
+    // the gesture (browsers, iOS strictly, raise a keyboard only for a focus() made
+    // there), and the worker's reply lands long after the gesture is over. Miss it
+    // and placing a box on a phone gives a caret and no keyboard — S39, one gesture
+    // over. Guarded by web/sdk/keyboard_gate_test.mjs.
+    if (this._addingText) return true;
     if (this._editingPage >= 0)
       return this._editingPage === page && this._inBounds(this._lastEditBounds, pt);
     return !!this._selected && this._selected.page === page &&
@@ -2198,12 +2590,45 @@ export class PdfeEditor {
     bar.style.top = `${top}px`;
   }
 
+  // The rotate handle sits just outside the picture's TOP-RIGHT corner, clamped
+  // into the page so a picture at the very edge (monetary.pdf has one starting at
+  // x = -2) still shows it. The corner comes from the QUAD, not the axis-aligned
+  // box: on a turned picture those differ, and anchoring to the box would leave
+  // the handle floating away from the corner it belongs to.
+  _placeRotate(sel, scaleCss) {
+    const rect = this._pageRect(sel.page);
+    if (!rect || !sel.quad) return;
+    const h = this._pages[sel.page].h;
+    let bestX = -Infinity, bestY = Infinity;
+    for (let i = 0; i < 8; i += 2) {
+      const x = sel.quad[i] * scaleCss;
+      const y = (h - sel.quad[i + 1]) * scaleCss;
+      // "top-right" in SCREEN terms: largest x, smallest y, decided together so
+      // a turned picture's handle lands on the corner the user sees as top-right.
+      if (x - y > bestX - bestY) { bestX = x; bestY = y; }
+    }
+    const SIZE = 28, GAP = 6;
+    const btn = this.rotateBtn;
+    btn.style.display = "flex";
+    const left = rect.left + bestX - SIZE / 2 + GAP;
+    const top = rect.top + bestY - SIZE / 2 - GAP;
+    btn.style.left = `${Math.max(rect.left, Math.min(left, rect.left + rect.width - SIZE))}px`;
+    btn.style.top = `${Math.max(rect.top, Math.min(top, rect.top + rect.height - SIZE))}px`;
+  }
+
   // The bar is the one overlay the user can press, so it must swallow its own
   // pointer events: the scroller's commit-on-tap-outside handler and the canvas
   // tap router both sit above it in the tree.
   _wireActions() {
     const swallow = (ev) => { ev.preventDefault(); ev.stopPropagation(); };
     this._listen(this.actionsEl, "pointerdown", swallow);
+    // ONE DIRECTION, PRESSED REPEATEDLY (user decision 2026-08-25): each press is
+    // a quarter turn clockwise, and four presses return the picture exactly to
+    // where it started — the engine's rotation is exact, so this cannot drift.
+    // The pointerdown must be swallowed or the canvas tap router underneath
+    // treats the press as a tap on the page and deselects the picture first.
+    this._listen(this.rotateBtn, "pointerdown", swallow);
+    this._listen(this.rotateBtn, "click", (ev) => { swallow(ev); this.rotateSelection(1); });
     this._listen(this.editBtn, "click", (ev) => { swallow(ev); this.editSelection(); });
     this._listen(this.deleteBtn, "click", (ev) => { swallow(ev); this.deleteSelection(); });
   }
@@ -2425,9 +2850,19 @@ export class PdfeEditor {
       // `_blockMove` first: the feature is EXPERIMENTAL and off by default, and a
       // disabled feature must not even arm the gesture — otherwise a drag would
       // still swallow the pan it is standing in front of.
-      const movable = this._blockMove &&
+      const movableText = this._blockMove &&
         !!this._selected && this._selected.page === page &&
         this._editingPage !== page && this._inBounds(this._selected.bounds, down);
+      // A SELECTED PICTURE DRAGS THE SAME WAY (docs/IMAGE_EDIT.md), and is NOT
+      // gated on `blockMove`: that flag is documented as "box dragging" and a
+      // host that turned it off did so about text boxes. Nothing existing can be
+      // surprised by this — without this build there is no way to select a
+      // picture at all.
+      const movableImage = !!this._selectedImage && this._selectedImage.page === page &&
+        this._editingPage !== page && this._inBounds(this._selectedImage.bounds, down);
+      const movable = movableText || movableImage;
+      const movingBounds = () =>
+        (movableImage ? this._selectedImage.bounds : this._selected.bounds);
       let lpFired = false;
       // Long-press (< 8 px movement) selects the word under the finger, inside
       // the OPEN run only — same as Android. A press on a movable box must not
@@ -2476,7 +2911,7 @@ export class PdfeEditor {
             // One request per drag: the clamp range cannot change while a finger
             // is down, and the ghost is redrawn per pointermove.
             this._moveLimits = null;
-            this._post({ type: "moveLimits" });
+            this._post({ type: movableImage ? "imageMoveLimits" : "moveLimits" });
             try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
           } else {
             if (this._editingPage !== page) { cleanup(); return; }  // no open run: plain pan
@@ -2486,7 +2921,7 @@ export class PdfeEditor {
         }
         if (movingBox) {
           const c = toPt(mv.clientX, mv.clientY);
-          this._showMoveGhost(page, this._selected.bounds,
+          this._showMoveGhost(page, movingBounds(),
                               c.xPt - down.xPt, c.yPt - down.yPt);
           return;
         }
@@ -2511,7 +2946,10 @@ export class PdfeEditor {
           const raw = [drop.xPt - down.xPt, drop.yPt - down.yPt];
           const [dx, dy] = this._ghostDelta || raw;
           this._hideMoveGhost();          // clears the limits for the next drag
-          if (dx || dy) this._post({ type: "moveSelected", dx, dy });
+          if (dx || dy) {
+            this._post(movableImage ? { type: "moveImage", dx, dy }
+                                    : { type: "moveSelected", dx, dy });
+          }
           else this._renderBoxes();       // nothing moved: nothing will restore the bar
           return;
         }

@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=1.7.5-64a86c1-w5f2612a";
+import { PdfeEditor } from "./pdfe-editor.js?v=2.1.0-1eb824e-wa465f26";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -376,7 +376,42 @@ editor.on("editmode", ({ editMode }) => {
     : "View mode — press Edit to enable editing");
   $("colorbox").hidden = !editMode;
   $("fontbox").hidden = !editMode;
+  $("addtext").hidden = !editMode;      // placing text is editing
 });
+
+// ---- ADD TEXT (docs/ADD_TEXT.md) -------------------------------------------
+// A TOGGLE, not an action: the mode is armed until a tap spends it. Three host
+// rules, and they are the same three the Android demo will need:
+//
+//  1. NEVER un-press this button ourselves. The SDK owns the arm's lifetime — the
+//     placing tap disarms it — so the button is painted from `addtextarmed` and
+//     from nothing else. A host that cleared it on click would be lying whenever
+//     the arm survived (a tap that lands off-page, say).
+//  2. Seed the new text from the toolbar the user can see, so what they placed
+//     looks like what the controls said. This is `setNewTextStyle`, the host-side
+//     default the feature is designed around.
+//  3. Escape disarms, because an armed mode with no way out is a trap.
+const addTextBtn = $("addtext");
+addTextBtn.addEventListener("click", () => {
+  if (editor.addingText) { editor.cancelAddText(); return; }
+  // Rule 2: hand over what the toolbar is showing. The family select carries a
+  // familyKey in its value; an empty value means "Original", which for NEW text has
+  // no meaning — there is no original — so we let the SDK use its own floor.
+  const fam = $("fontfamily").value || null;
+  const size = Number($("fontsize").value) || 0;
+  editor.setNewTextStyle({ font: fam, size, color: colorInput.value });
+  editor.armAddText();
+});
+editor.on("addtextarmed", ({ armed }) => {
+  addTextBtn.classList.toggle("active", armed);
+  addTextBtn.setAttribute("aria-pressed", armed ? "true" : "false");
+  if (armed) setHint("Add text", "Tap the page where the new text should go");
+});
+// Rule 3: an armed mode needs an exit that is not "guess".
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && editor.addingText) editor.cancelAddText();
+});
+
 
 // ---- text colour (HOST chrome) ---------------------------------------------
 // The SDK owns no palette: it takes any 0xAARRGGBB (or a hex string) and reports
@@ -394,7 +429,10 @@ function showTextStyle(style) {
   // what the next keystroke takes — so a swatch painted from it would say "black" while
   // typing produces red. The host, which owns the switch, is the one that knows; the
   // Android harness does exactly this in onTextSelectionChanged.
-  if (!editor.typingColorFollowsCaret) return;
+  // …AND WHEN ONE IS ARMED, SHOW IT — the swatch keeps the picked colour through a box
+  // close, for the reason spelled out at stickyFamilyValue above. With sticky merely
+  // ENABLED and nothing picked, the report is still the truth and is painted as usual.
+  if (stickyColour()) { colorInput.value = stickyColorHex; colorMixed.hidden = true; return; }
   const argb = style && style.colorArgb;
   colorMixed.hidden = !(style && style.colorArgb === null);
   if (argb == null) return;
@@ -519,6 +557,12 @@ fontSelect.addEventListener("change", (ev) => {
   const v = ev.target.value;
   if (v.startsWith("__")) return;              // a placeholder is not a choice
   editor.applyFont(v === "" ? null : v);
+  // "" is Original — the END of a sticky pick, not a new one. A family pick at a bare
+  // caret arms the family's REGULAR face (I72, by design), so the B/I memory goes with it.
+  if (!editor.typingFontFollowsCaret) {
+    stickyFamilyValue = v === "" ? null : v;
+    stickyFace = v === "" ? null : { bold: false, italic: false };
+  }
 });
 
 // ---- font SIZE (phase 3) ----------------------------------------------------
@@ -526,6 +570,9 @@ fontSelect.addEventListener("change", (ev) => {
 // property is continuous, so refusing the odd value would make the control lie about
 // what the SDK accepts.
 const SIZE_PRESETS = [6, 7, 8, 9, 10, 10.5, 11, 12, 14, 16, 18, 20, 24, 28, 32, 36, 48, 72];
+// What the size control reads before the user has selected any text — and
+// therefore what NEW text is created at (see buildSizeOptions).
+const DEFAULT_SIZE_PT = 11;
 const sizeSelect = $("fontsize");
 // The engine's most recent answer, kept only so the "Custom…" prompt can put the
 // control back if the user cancels — never as the source of truth for painting.
@@ -554,6 +601,12 @@ function buildSizeOptions() {
   sizeSelect.appendChild(custom);
   sizeSelect.appendChild(sizeMixedOption);
   sizeSelect.appendChild(sizeOtherOption);
+  // START ON A SENSIBLE BODY SIZE, not on whatever happens to be first in the
+  // list. A <select> with no value selects its first <option>, which was 6 —
+  // and that is not cosmetic: the Add-text button SEEDS THE NEW BOX from this
+  // control (rule 2 above), so a new text box was created at 6 pt unless the
+  // user thought to change the picker first.
+  sizeSelect.value = String(DEFAULT_SIZE_PT);
 }
 buildSizeOptions();
 
@@ -593,10 +646,15 @@ function resetSizeControl() {
 // about, where the same version behaves differently depending on which app you open.
 function resetStyleControls() {
   resetSizeControl();
-  otherOption.textContent = "";
-  fontSelect.value = "__other";
-  boldBtn.classList.remove("active");
-  italicBtn.classList.remove("active");
+  // ⚠️ A STICKY PICK SURVIVES THE CLOSE — this reset is what blanked the picker while
+  // the pick was still applying to new text (user-reported 2026-08-20). Size is never
+  // sticky (it has one lifetime), so it resets above regardless.
+  if (!stickyTypeface()) {
+    otherOption.textContent = "";
+    fontSelect.value = "__other";
+    boldBtn.classList.remove("active");
+    italicBtn.classList.remove("active");
+  }
   // Disabled, because with no run open pressing them would do nothing — the same
   // "would this change anything" question `canBold`/`canItalic` answer while editing.
   boldBtn.disabled = true;
@@ -621,16 +679,71 @@ function showSizeStyle(style) {
   sizeOtherOption.textContent = `${Math.round(pt * 100) / 100}`;
   sizeSelect.value = "__other";
 }
-boldBtn.addEventListener("click", () => editor.applyBold(!boldBtn.classList.contains("active")));
-italicBtn.addEventListener("click", () =>
-  editor.applyItalic(!italicBtn.classList.contains("active")));
+boldBtn.addEventListener("click", () => {
+  const on = !boldBtn.classList.contains("active");
+  editor.applyBold(on);
+  if (!editor.typingFontFollowsCaret)
+    stickyFace = { bold: on, italic: !!(stickyFace && stickyFace.italic) };
+});
+italicBtn.addEventListener("click", () => {
+  const on = !italicBtn.classList.contains("active");
+  editor.applyItalic(on);
+  if (!editor.typingFontFollowsCaret)
+    stickyFace = { bold: !!(stickyFace && stickyFace.bold), italic: on };
+});
 
 // Paint the font controls from the ENGINE's answer — never from what we last sent.
 // Three separate MIXED cases, and they are independent: the FAMILY can be uniform
 // while bold-ness is not (Arial + Arial-Bold), which is exactly why the SDK reports
 // them as separate fields.
+// ---- WHAT THIS HOST HAS ARMED, AND WHY IT HAS TO REMEMBER (user-reported twice,
+// 2026-08-20) ------------------------------------------------------------------------
+//
+// A STICKY PICK MUST STAY VISIBLE UNTIL THE HOST TURNS STICKY OFF. That is the user's
+// rule, in their words: *"a sticky font and colour will always show after the user
+// selects one, and it should still show if we re-enter a box."*
+//
+// Two things stood in the way, and both are the HOST's, which is why they are fixed
+// here and not in the SDK (docs/STYLING.md §2 settled that ownership):
+//   1. the style report describes the character UNDER the cursor, which is not what the
+//      next keystroke takes while a pick is armed — so painting from it would lie;
+//   2. `resetStyleControls()` blanks the controls when the box closes, and *nothing was
+//      allowed to fill them in again* — the reported symptom exactly: the pick kept
+//      applying to new text while the picker showed nothing.
+//
+// So the rule is not "do not repaint" but **"repaint from the PICK"**, and the pick
+// survives a box close. Null means nothing is armed, and then the report is the truth.
+let stickyFamilyValue = null;   // the <select> value the host applied ("" = Original)
+let stickyFace = null;          // { bold, italic } once B or I armed one
+const stickyTypeface = () => !editor.typingFontFollowsCaret &&
+                             (stickyFamilyValue !== null || stickyFace !== null);
+let stickyColorHex = null;      // the swatch value the host applied
+const stickyColour = () => !editor.typingColorFollowsCaret && stickyColorHex !== null;
+
+// Paint the font controls from what the HOST armed. Only ever called while
+// stickyTypeface() — the report is ignored on purpose, except for the two ENABLED flags,
+// which are about the caret's family and not about the pick.
+function showStickyTypeface(style) {
+  if (stickyFamilyValue !== null) fontSelect.value = stickyFamilyValue || "__other";
+  boldBtn.classList.toggle("active", !!(stickyFace && stickyFace.bold));
+  italicBtn.classList.toggle("active", !!(stickyFace && stickyFace.italic));
+  if (style) {
+    boldBtn.disabled = !style.canBold;
+    italicBtn.disabled = !style.canItalic;
+  }
+}
+
 function showFontStyle(style) {
   if (!style) return;
+  // STICKY MODE, WHILE A PICK IS ARMED: show the PICK, not the report. The report
+  // describes the character under the cursor, which is not what the next keystroke takes
+  // while a pick is armed (docs/STYLING.md §2bis).
+  //
+  // ⚠️ TWO HALVES ARE LOAD-BEARING, and each was reported by the user in turn: it fires
+  // only while a pick is ARMED (with sticky merely enabled and nothing picked, the report
+  // IS the truth), and it PAINTS THE PICK rather than skipping the repaint — skipping left
+  // the picker blank after a box close while the pick kept applying.
+  if (stickyTypeface()) { showStickyTypeface(style); return; }
   // The picker matches on the FAMILY KEY, not on the display name: the text under the
   // cursor reads "Helvetica-Bold" while the family the user picked is "Helvetica".
   const fam = style.fontFamily;
@@ -723,7 +836,10 @@ function applyColorThrottled(value) {
 colorInput.addEventListener("input", (ev) => applyColorThrottled(ev.target.value));
 // The authoritative final value when the picker closes — the throttle may have
 // dropped the last `input`, and this is the colour the user committed to.
-colorInput.addEventListener("change", (ev) => editor.applyTextColor(ev.target.value));
+colorInput.addEventListener("change", (ev) => {
+  editor.applyTextColor(ev.target.value);
+  if (!editor.typingColorFollowsCaret) stickyColorHex = ev.target.value;
+});
 
 // STICKY vs FOLLOW-THE-CARET — host chrome for the SDK's own switch (§2). Checked means
 // the pick is fixed until cleared; unchecked (default) means the caret decides.
@@ -731,9 +847,25 @@ const stickyColor = $("stickycolor");
 stickyColor.addEventListener("change", () => {
   const sticky = stickyColor.checked;
   editor.setTypingColorFollowsCaret(!sticky);
+  stickyColorHex = null;      // nothing armed yet in either direction
   setHint("Typing", sticky
     ? "Sticky colour ON — the picked colour survives cursor moves; the swatch stops following"
     : "Sticky colour OFF — the picked colour is dropped when the cursor moves");
+});
+
+// The TYPEFACE twin of the switch above (docs/STYLING.md §2bis). Checked means a family
+// pick or a B/I press survives cursor moves and box changes until it is turned back off.
+const stickyFont = $("stickyfont");
+stickyFont.addEventListener("change", () => {
+  const sticky = stickyFont.checked;
+  editor.setTypingFontFollowsCaret(!sticky);
+  // Either direction starts with nothing armed — and turning sticky OFF is the "stop"
+  // switch the client asked for: from here everything follows the caret again.
+  stickyFamilyValue = null;
+  stickyFace = null;
+  setHint("Typing", sticky
+    ? "Sticky typeface ON — the picked font and bold/italic survive cursor moves and box changes; the picker stops following"
+    : "Sticky typeface OFF — the pick is dropped when the cursor moves");
 });
 
 // The cursor moved or the range changed — the engine reports the colour there, and
@@ -793,10 +925,27 @@ editor.on("editclose", () => resetStyleControls());
 // Select-then-act: the SDK draws the selected box and its Edit/Delete bar; the
 // host only reports it (and could drive the same actions from its own chrome).
 editor.on("select", ({ selection }) => {
-  setHint(selection ? "Selected" : "Edit", selection
-    ? `Selected p${selection.page + 1} box #${selection.index} — Edit, Delete, ` +
-      "or tap it again to type"
-    : "Edit mode — tap a paragraph to select it, then Edit or Delete");
+  if (!selection) {
+    setHint("Edit", "Edit mode — tap a paragraph or a picture to select it");
+    return;
+  }
+  // A PICTURE IS NOT A PARAGRAPH, and the hint must not offer what it cannot do:
+  // neither Edit nor Delete applies to one, and the rotate control is the handle
+  // the SDK draws on the picture itself.
+  if (selection.kind === "image") {
+    setHint("Selected", `Selected a picture on p${selection.page + 1}` +
+      (selection.quarterTurns ? ` (turned ${selection.quarterTurns * 90}°)` : "") +
+      " — drag it, or use the round button on its corner to rotate");
+    return;
+  }
+  setHint("Selected",
+    `Selected p${selection.page + 1} box #${selection.index} — Edit, Delete, ` +
+    "or tap it again to type");
+});
+editor.on("rotated", ({ page, ok, quarterTurns }) => {
+  setHint("Selected", ok
+    ? `Rotated the picture on p${page + 1} to ${(quarterTurns ?? 0) * 90}°`
+    : `Could not rotate that picture on p${page + 1}`);
 });
 editor.on("deleted", ({ page, ok }) => {
   setHint("Edit", `Deleted a paragraph on p${page + 1} (${ok ? "ok" : "FAILED"})`);
@@ -811,6 +960,16 @@ editor.on("deleted", ({ page, ok }) => {
 // against it; only this page's button is gone.
 
 editor.on("editopen", (ed) => {
+  // A NEW box says so, because the advice differs: an empty one is discarded rather
+  // than committed, which is the opposite of what "tap outside to commit" implies.
+  // Handled HERE and not in a second listener — there was one, registered earlier,
+  // and this handler silently overwrote its message every time.
+  if (ed.created) {
+    setHint("Typing",
+      `New text box on p${ed.page + 1} — type here. Tap outside to keep it; ` +
+      "leave it empty and it is discarded.");
+    return;
+  }
   setHint("Typing",
     `Editing p${ed.page + 1} (${ed.isParagraph
       ? (ed.linePreserve ? "paragraph, lines kept" : "paragraph, reflow")

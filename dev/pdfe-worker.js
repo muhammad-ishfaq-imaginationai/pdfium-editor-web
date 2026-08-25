@@ -76,6 +76,12 @@ const dirtyPages = new Set();
 // PARAGRAPHS (the edit units, with the core paragraph index the editor takes):
 //   pageIndex -> [{ index, bounds:[l,b,r,t], paras:[{index, bounds}] }]
 const groupCache = new Map();
+// THE PAGE'S PICTURES, cached the same way and for the same reason (a tap must
+// not cost a core call). A SEPARATE map, mirroring the core's separate list —
+// see docs/IMAGE_EDIT.md §3. Same lifetime as groupCache: filled by groupPage,
+// dropped by noteMutation, evicted with it.
+//   pageIndex -> [{ index, bounds:[l,b,r,t], quad:[x1,y1..x4,y4], turns, flags }]
+const imageCache = new Map();
 const MAX_GROUP_CACHE = 300;      // bounds are tiny; this only caps pathology
 let coreGroupedPage = -1;         // page the CORE's one-slot grouping holds
 let coreGroupFresh = false;       // no object mutation since that grouping
@@ -121,6 +127,16 @@ const ready = createPdfe({
     ["number", "number", "number", "number", "number"]);
   F.moveBlock     = m.cwrap("pdfe_move_block", "number",
     ["number", "number", "number", "number", "number", "number"]);
+  // IMAGE EDIT (docs/IMAGE_EDIT.md)
+  F.imageCount    = m.cwrap("pdfe_image_count", "number", ["number"]);
+  F.imageInfo     = m.cwrap("pdfe_image_info", "number",
+    ["number", "number", "number", "number", "number", "number", "number"]);
+  F.moveImage     = m.cwrap("pdfe_move_image", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.imageMoveLimits = m.cwrap("pdfe_image_move_limits", "number",
+    ["number", "number", "number", "number"]);
+  F.rotateImage   = m.cwrap("pdfe_rotate_image", "number",
+    ["number", "number", "number", "number", "number"]);
   F.blockMoveLimits = m.cwrap("pdfe_block_move_limits", "number",
     ["number", "number", "number", "number"]);
   // Undo/redo. The journal lives in the CORE (docs/UNDO_REDO.md) — this shell
@@ -150,6 +166,8 @@ const ready = createPdfe({
     ["number", "number", "number", "number"]);
   F.editBeginEx   = m.cwrap("pdfe_edit_begin_ex", "number",
     ["number", "number", "number", "number", "number"]);
+  F.editBeginNew  = m.cwrap("pdfe_edit_begin_new", "number",
+                            ["number", "number", "number", "number"]);
   F.editBeginBlock = m.cwrap("pdfe_edit_begin_block", "number",
     ["number", "number", "number", "number", "number"]);
   F.editLineMode  = m.cwrap("pdfe_edit_line_mode", "number", ["number"]);
@@ -534,10 +552,20 @@ let typingColorArmedArgb = 0;
 // The STICKY pick, which outlives an edit session (null = none). See the
 // setTypingColor handler for why, and openEditorAt for where it is re-armed.
 let stickyColorArgb = null;
-// THE TYPING FONT HAS EXACTLY ONE LIFETIME — follow-the-caret (user decision
-// 2026-08-13: "no sticky mode for fonts"). So there is deliberately NO
-// typingFontFollowsCaret switch, and no cross-session sticky face: a font pick at a
-// bare caret is dropped by the very next cursor move, full stop.
+// THE TYPING FONT NOW HAS TWO LIFETIMES TOO — the colour switch, transcribed
+// (user decision 2026-08-20, reversing the 2026-08-13 "colour-only" one). Same two
+// answers, same default, same opt-in:
+//   ON  (default) — the pick is dropped by the very next cursor move.
+//   OFF (sticky)  — it lasts until the host clears it, across cursor moves AND across
+//                   boxes, so a form-filling host types one typeface everywhere.
+//
+// ⚠️ STICKY COVERS THE FAMILY *AND* BOLD/ITALIC, deliberately (user decision): both
+// land on the core's ONE `currentFontId`, so one gate keeps both alive — and a sticky
+// family that silently dropped bold would be the half-answer that gets reported as a
+// bug. The two are remembered separately only because they are RE-ARMED differently
+// across boxes (see openEditorAt): a family is a host-named face this shell can
+// resolve, while a face is the core resolving bold/italic against whatever family the
+// new caret sits in — which is what "keep typing bold" means in a different box.
 //
 // The SAME-INDEX EXCEPTION still applies, for the same measured reason colour needed
 // it (docs/STYLING.md §2): picking in a host control — a <select> is the obvious font
@@ -546,6 +574,13 @@ let stickyColorArgb = null;
 // typing font at all.
 let typingFontArmedAt = -1;
 let typingFontArmedName = null;
+let typingFontFollowsCaret = true;
+// The STICKY pick, which outlives an edit session (null = none) — the twin of
+// stickyColorArgb. `stickyFontName` is a host-named family (or "" / null = Original);
+// `stickyFace` is {bold, italic} when B/I armed it. Only one of the two is ever set:
+// whichever gesture armed last is the one a new box re-arms.
+let stickyFontName = null;
+let stickyFace = null;
 // THE TYPING SIZE HAS THE SAME ONE LIFETIME AS THE FONT — follow-the-caret, no sticky
 // mode, no switch (pdfe.h is explicit that the sticky option is colour-only). The
 // same-index exception matters here more than anywhere: a size dropdown is a <select>,
@@ -553,28 +588,19 @@ let typingFontArmedName = null;
 // collapsed pick could never survive the click back into the box.
 let typingSizeArmedAt = -1;
 let typingSizeArmedPt = 0;
-function postCaretMoved(index) {
+// THE STYLE THE NEXT KEYSTROKE WILL TAKE AT |index| — the character's own, with any
+// SURVIVING arm restated over it. Extracted 2026-08-19 (I76) so the caret-move report
+// and the ARM report are literally the same answer: an arm used to emit nothing at all,
+// so a host painting from the event kept showing the size under the cursor while the
+// SDK typed the picked one ("the UI is not showing it, but inside the SDK it applies").
+//
+// Call it BEFORE dropping arms (postCaretMoved's order) or after — the flags recompute
+// from `…ArmedAt`, which a drop sets to -1, so a dropped arm is never restated.
+function armedStyleAt(index) {
   const keepPick = typingColorFollowsCaret && typingColorArmedAt >= 0 &&
                    index === typingColorArmedAt;
-  if (typingColorFollowsCaret && editor && !keepPick) {
-    F.editSetTypingColor(editor, 0, 0);
-    typingColorArmedAt = -1;
-  }
   const keepFont = typingFontArmedAt >= 0 && index === typingFontArmedAt;
-  if (editor && !keepFont && typingFontArmedAt >= 0) {
-    F.editSetTypingFont(editor, 0);   // 0 = back to each segment's Original font
-    typingFontArmedAt = -1;
-    typingFontArmedName = null;
-  }
   const keepSize = typingSizeArmedAt >= 0 && index === typingSizeArmedAt;
-  if (editor && !keepSize && typingSizeArmedAt >= 0) {
-    F.editSetTypingSize(editor, 0, 0);   // clear: inherit from the character on the left
-    typingSizeArmedAt = -1;
-    typingSizeArmedPt = 0;
-  }
-  // A deliberate caret move finishes the word (Phase 5): the next keystroke
-  // must start a fresh undo entry, not merge into text typed somewhere else.
-  if (doc) F.historySeal(doc);
   // Collapsed range: readRangeStyle reads the character BEFORE the cursor —
   // the same inherit-from-the-left rule a typed character follows, so this IS
   // the colour the next keystroke gets. When the pick SURVIVES, the next
@@ -597,9 +623,52 @@ function postCaretMoved(index) {
   // actually take, or the host's dropdown snaps back to the size under the cursor and
   // the user's pick looks like it was ignored.
   if (keepSize && style && typingSizeArmedPt > 0) style.sizePt = typingSizeArmedPt;
+  return style;
+}
+
+// AN ARM IS A STYLE CHANGE, SO IT IS REPORTED (I76). A RANGE apply already force-posts
+// its own `styleApplied` for exactly this reason; a collapsed pick changes nothing on
+// the page and so posted nothing, which left every host that paints from the event
+// showing the OLD value while the pick was live. Deliberately NOT `caretMoved`: that
+// message re-focuses the sink on arrival, and focusing right after a picker stole focus
+// pops the keyboard mid-pick on iOS (S39). This one only reports.
+function postArmedStyle(index) {
+  postMessage({
+    type: "caretStyle", index,
+    style: armedStyleAt(index),
+    following: typingColorFollowsCaret,
+  });
+}
+
+function postCaretMoved(index) {
+  const keepPick = typingColorFollowsCaret && typingColorArmedAt >= 0 &&
+                   index === typingColorArmedAt;
+  if (typingColorFollowsCaret && editor && !keepPick) {
+    F.editSetTypingColor(editor, 0, 0);
+    typingColorArmedAt = -1;
+  }
+  const keepFont = typingFontArmedAt >= 0 && index === typingFontArmedAt;
+  // …unless the host asked for the STICKY lifetime, in which case a cursor move is
+  // not the end of the pick — the same gate colour has one branch up.
+  if (typingFontFollowsCaret && editor && !keepFont && typingFontArmedAt >= 0) {
+    F.editSetTypingFont(editor, 0);   // 0 = back to each segment's Original font
+    typingFontArmedAt = -1;
+    typingFontArmedName = null;
+  }
+  const keepSize = typingSizeArmedAt >= 0 && index === typingSizeArmedAt;
+  if (editor && !keepSize && typingSizeArmedAt >= 0) {
+    F.editSetTypingSize(editor, 0, 0);   // clear: inherit from the character on the left
+    typingSizeArmedAt = -1;
+    typingSizeArmedPt = 0;
+  }
+  // A deliberate caret move finishes the word (Phase 5): the next keystroke
+  // must start a fresh undo entry, not merge into text typed somewhere else.
+  if (doc) F.historySeal(doc);
   postMessage({
     type: "caretMoved", index, caret: readCaret(index),
-    style,
+    // The arms this move KEPT are restated by armedStyleAt — one answer, shared with
+    // the arm report (I76). The drops above already zeroed the ones it did not keep.
+    style: armedStyleAt(index),
     following: typingColorFollowsCaret,
   });
 }
@@ -738,10 +807,33 @@ function groupPage(page) {
       }
     }
   }
+  // The page's images, from the same core pass.
+  const imageList = [];
+  {
+    const bp = mod._malloc(16), qp = mod._malloc(32), ip = mod._malloc(12);
+    const ni = F.imageCount(doc);
+    for (let i = 0; i < ni; i++) {
+      if (!F.imageInfo(doc, i, bp, qp, ip, ip + 4, ip + 8)) continue;
+      imageList.push({
+        index: i,
+        bounds: readF32(bp, 4),
+        quad: readF32(qp, 8),
+        objIndex: mod.HEAP32[ip >> 2],
+        turns: mod.HEAP32[(ip + 4) >> 2],
+        flags: mod.HEAP32[(ip + 8) >> 2],
+      });
+    }
+    mod._free(ip); mod._free(qp); mod._free(bp);
+  }
+
   groupCache.delete(page);
   groupCache.set(page, blockList);   // Map order == age
+  imageCache.delete(page);
+  imageCache.set(page, imageList);
   if (groupCache.size > MAX_GROUP_CACHE) {
-    groupCache.delete(groupCache.keys().next().value);
+    const oldest = groupCache.keys().next().value;
+    groupCache.delete(oldest);
+    imageCache.delete(oldest);       // one lifetime, two maps
   }
   return blockList;
 }
@@ -758,6 +850,7 @@ function cachedGroups(page) {
 function noteMutation(page) {
   coreGroupFresh = false;
   groupCache.delete(page);
+  imageCache.delete(page);
 }
 
 // Satisfy the fresh-open gate: pdfe_edit_begin_ex needs the core's one-slot
@@ -788,6 +881,51 @@ function hitParagraph(page, xPt, yPt) {
   if (!hit) return null;
   return { index: hit.index, bounds: hit.bounds,
            blockIndex: block.b.index, blockBounds: block.b.bounds };
+}
+
+// ONE TAP, TWO KINDS — and TEXT WINS. The core has this rule too
+// (pdfe_hit_item), and this is deliberately a SECOND copy rather than a call
+// into it: taps are served from the JS cache precisely so they cost no core
+// pass (§ the groupCache comment). The two must agree, and wasm/image_test.mjs
+// pins the core half.
+//
+// Text first is not a preference. A full-page scanned background is ONE image
+// covering the page with the text drawn on top (aasdshsl19.pdf p0: 103.6% of
+// the page under 719 text objects), so topmost-wins makes such a page
+// uneditable. Among images, later in the list is drawn later, so the topmost
+// wins — a logo on a panel beats the panel.
+function hitItem(page, xPt, yPt) {
+  const para = hitParagraph(page, xPt, yPt);
+  if (para) return { kind: "text", para };
+  const imgs = cachedImages(page);
+  for (let i = imgs.length - 1; i >= 0; i--) {
+    const r = imgs[i].bounds;
+    if (xPt >= r[0] && xPt <= r[2] && yPt >= r[1] && yPt <= r[3]) {
+      return { kind: "image", image: imgs[i] };
+    }
+  }
+  return null;
+}
+
+function cachedImages(page) {
+  const hit = imageCache.get(page);
+  if (hit) return hit;
+  groupPage(page);                       // fills both maps
+  return imageCache.get(page) || [];
+}
+
+// The picture whose bounds match |want| most closely — the image twin of
+// findMovedBlock, and needed for the same reason: after a move the LIST INDEX
+// may have changed, and re-resolving by the rect we just created is what keeps
+// the dragged picture selected instead of a neighbour.
+function findMovedImage(imgs, want) {
+  let best = null, bestD = Infinity;
+  for (const im of imgs) {
+    const d = Math.abs(im.bounds[0] - want[0]) + Math.abs(im.bounds[1] - want[1]) +
+              Math.abs(im.bounds[2] - want[2]) + Math.abs(im.bounds[3] - want[3]);
+    if (d < bestD) { bestD = d; best = im; }
+  }
+  return bestD <= 1.0 ? best : null;
 }
 
 // Which paragraph of a KNOWN block a point means: the smallest one containing it,
@@ -993,7 +1131,23 @@ function applyHistory(kind) {
   // of what changed. Never by index: a step renumbers blocks.
   const blocks = groupPage(page);
   let selection = null;
-  if (!live && focus[2] > focus[0] && focus[3] > focus[1]) {
+  // AN IMAGE STEP FIRST. Its focus rect is the PICTURE's, and hit-testing that
+  // for a paragraph is not merely useless — a picture usually has text near or
+  // over it, so the paragraph branch below would hand the selection to an
+  // unrelated text box on every image undo. The list index is stable (nothing
+  // adds or removes image objects), so the picture is re-read, not re-found.
+  let imageStep = false;
+  if (selectedImage && selectedImage.page === page) {
+    const fresh = cachedImages(page).find((im) => im.index === selectedImage.index);
+    if (fresh) {
+      imageStep = true;
+      selectedImage = { page, index: fresh.index, bounds: fresh.bounds, quad: fresh.quad,
+                        turns: fresh.turns, flags: fresh.flags };
+      postMessage({ type: "imageSelected", page, index: fresh.index, bounds: fresh.bounds,
+                    quad: fresh.quad, turns: fresh.turns, flags: fresh.flags });
+    }
+  }
+  if (!imageStep && !live && focus[2] > focus[0] && focus[3] > focus[1]) {
     const cx = 0.5 * (focus[0] + focus[2]);
     const cy = 0.5 * (focus[1] + focus[3]);
     const hit = hitParagraph(page, cx, cy);
@@ -1007,7 +1161,8 @@ function applyHistory(kind) {
   }
 
   postMessage({
-    type: "historyApplied", kind, page, ok: true, code, live, blocks, selection,
+    type: "historyApplied", kind, page, ok: true, code, live, blocks,
+    images: imageCache.get(page) || [], selection,
     dirty, focus,
     // Present only on the live path — the shell re-seeds its sink from these.
     ...(liveState || {}),
@@ -1029,7 +1184,24 @@ function selectPara(page, hit, xPt, yPt) {
                 blockIndex: hit.blockIndex, blockBounds: hit.blockBounds });
 }
 
+// A SELECTED PICTURE. Held beside selectedPara rather than folded into it: the
+// two answer different questions (a paragraph can be OPENED for typing, a
+// picture never can), and every existing test of `selectedPara` means "is there
+// a text box selected" and must keep meaning exactly that.
+let selectedImage = null;   // { page, index, bounds, quad, turns, flags }
+
+function selectImage(page, im) {
+  selectedImage = { page, index: im.index, bounds: im.bounds, quad: im.quad,
+                    turns: im.turns, flags: im.flags };
+  postMessage({ type: "imageSelected", page, index: im.index,
+                bounds: im.bounds, quad: im.quad, turns: im.turns, flags: im.flags });
+}
+
 function clearSelection() {
+  if (selectedImage) {
+    selectedImage = null;
+    postMessage({ type: "imageDeselected" });
+  }
   if (!selectedPara) return;
   selectedPara = null;
   postMessage({ type: "paraDeselected" });
@@ -1075,6 +1247,79 @@ function deleteParagraphAt(page, xPt, yPt) {
   renderDirtyStrip(page, strip);
   postMessage({ type: "paraDeleted", page, ok: true });
   postHistory();
+}
+
+// ---- image move + rotate (docs/IMAGE_EDIT.md) -------------------------------
+//
+// Simpler than the block path below, and worth saying why rather than leaving
+// the asymmetry looking like an oversight: a picture IS one object, so there is
+// no membership to re-resolve and no identity to pin before touching it. What
+// the two share is the rule that the SELECTION decides which thing moves, never
+// a point test — after a drop, an anchor point can sit inside several things at
+// once, and the point test then hands the next nudge to a neighbour.
+
+// The shared tail: repaint, re-group, and re-find the picture we just changed so
+// it stays selected. |before| is its rect before the change.
+function afterImageChange(page, before, kind) {
+  dirtyPages.add(page);
+  noteMutation(page);
+  const imgs = cachedImages(page);          // re-groups; restores the fresh-open gate
+  // Re-find by the rect the core reports NOW for the same list slot, then widen
+  // the repaint over both. Doing it from the fresh list rather than from our own
+  // arithmetic means a clamped move repaints where the picture actually landed.
+  const now = imgs.find((im) => im.index === selectedImage.index) || null;
+  const after = now ? now.bounds : before;
+  renderDirtyStrip(page, [
+    Math.min(before[0], after[0]), Math.min(before[1], after[1]),
+    Math.max(before[2], after[2]), Math.max(before[3], after[3]),
+  ]);
+  if (now) {
+    selectedImage = { page, index: now.index, bounds: now.bounds, quad: now.quad,
+                      turns: now.turns, flags: now.flags };
+    postMessage({ type: "imageSelected", page, index: now.index, bounds: now.bounds,
+                  quad: now.quad, turns: now.turns, flags: now.flags });
+  }
+  // The DIRTY flag is the editor's to set when this result lands — the same
+  // split every other mutation follows (see "blockMoved" in pdfe-editor.js).
+  //
+  // THE WHOLE PAGE'S PICTURE LIST TRAVELS WITH THE RESULT, not just the one that
+  // moved. The shell draws a faint outline per picture from its own cached copy,
+  // and that copy is otherwise only refreshed by the `groups` message — so after
+  // a drag the moved picture's outline stayed at its ORIGINAL position, showing
+  // up the moment the user deselected (user-reported). Sending the fresh list is
+  // what `blockMoved` already does with `blocks`, and for exactly this reason.
+  postMessage({ type: kind, page, ok: true, images: imgs,
+                bounds: now ? now.bounds : null, turns: now ? now.turns : null });
+  // AND TELL THE HOST ITS UNDO BUTTON CHANGED. The core records the step itself
+  // — a shell cannot forget that — but nothing pushes the new can-undo state to
+  // the editor except this call, and without it the engine holds a perfectly
+  // good undo entry that no button is lit for. Every other recordable mutation
+  // in this file ends the same way.
+  postHistory(true);
+}
+
+function moveSelectedImage(dx, dy) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.moveImage(doc, acquirePage(page), selectedImage.index, dx, dy, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageMoved", page, ok: false }); return; }
+  afterImageChange(page, before, "imageMoved");
+}
+
+function rotateSelectedImage(turns) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.rotateImage(doc, acquirePage(page), selectedImage.index, turns, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageRotated", page, ok: false }); return; }
+  afterImageChange(page, before, "imageRotated");
 }
 
 // ---- block move (drag a text box to a new position) -------------------------
@@ -1197,6 +1442,94 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
 // line-preserving), 0 force reflow, 1 force line-preserving. Re-groups only
 // when the fresh-open gate demands it, then hit-tests the refreshed cache so
 // the index it opens always matches the core's own grouping slot.
+// ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------------
+//
+// An ARMED mode, never a heuristic on an existing tap. tap-on-empty = deselect and
+// tap-outside = commit are both load-bearing, so the arm sits in FRONT of the tap
+// routing and is CONSUMED by the tap it serves — one placement per arming, which is
+// also what makes the host's button state unambiguous.
+let addTextArmed = false;
+// The host's default look for new text (user decision 2026-08-24: "it will be on host
+// how he will provide this data"). Held here rather than passed per placement because
+// there is no placement CALL from the host — the gesture is a tap.
+let newTextStyle = { fontName: null, sizePt: 0, colorArgb: 0 };
+
+// AN ARM REPORTS ITSELF, ON ARM *AND* ON DISARM (parity rule 14 / I76). A host paints
+// its button from this; a spent arm that never reported would leave the button lit and
+// the next tap would do something the user did not ask for.
+function setAddTextArmed(on) {
+  const next = !!on;
+  if (next === addTextArmed) return;
+  addTextArmed = next;
+  postMessage({ type: "addTextArmed", armed: addTextArmed });
+}
+
+const SPEC_BYTES = 32;   // PdfeNewBoxSpec: 2 x u32, 3 x f32, ptr, f32, u32
+
+// Place a NEW box at (xPt, yPt) and open it for typing. The shell then behaves exactly
+// as it does for any open run — same "editOpened" message, same caret, same blue box —
+// because after this call the session IS an ordinary session.
+function placeNewBoxAt(page, xPt, yPt) {
+  // The core's fresh-open gate wants a current grouping, and its page pin reads it.
+  ensureCoreGroup(page);
+  const sp = mod._malloc(SPEC_BYTES);
+  try {
+    const u32v = new Uint32Array(mod.HEAPU8.buffer, sp, 2);
+    u32v[0] = SPEC_BYTES;
+    u32v[1] = 1;                                   // PDFE_NEW_TEXT
+    const f32v = new Float32Array(mod.HEAPU8.buffer, sp + 8, 3);
+    f32v[0] = xPt; f32v[1] = yPt;
+    f32v[2] = 0;                                   // page-bounded wrap (tap-to-place)
+    // The seed FACE resolves through this document's handle map, exactly as a sticky
+    // typeface pick does. A name with nothing to resolve to here is not an error — the
+    // core falls back to its standard-14 floor, which is the same face on every
+    // platform, so the host still gets a predictable result rather than a refusal.
+    const h = newTextStyle.fontName
+      ? (fontHandles.get(newTextStyle.fontName) || 0) : 0;
+    new Uint32Array(mod.HEAPU8.buffer, sp + 20, 1)[0] = h;
+    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] = newTextStyle.sizePt || 0;
+    new Uint32Array(mod.HEAPU8.buffer, sp + 28, 1)[0] = (newTextStyle.colorArgb || 0) >>> 0;
+    const ed = F.editBeginNew(doc, acquirePage(page), textPageOf(page), sp);
+    if (!ed) {
+      // The core refuses an off-page point (and a stale grouping). Say so rather than
+      // leaving the host wondering why its armed tap did nothing.
+      postMessage({ type: "error", code: "add-text-refused", page, xPt, yPt });
+      return;
+    }
+    editor = ed;
+    editPage = page;
+    // The "am I inside the open run" rect the tap router uses. At zero characters this
+    // is the caret's own zero-width box (S66) — a later tap is therefore outside it and
+    // commits, which is right: an empty box the user taps away from evaporates.
+    const c0 = readCaret(-1);
+    editParaBounds = c0 ? [c0[0], c0[2], c0[0], c0[1]] : [xPt, yPt, xPt, yPt];
+    // A fresh session carries no pick in flight, for the same reason openEditorAt
+    // clears these: an armed index names a spot in a run that no longer exists.
+    typingColorArmedAt = -1;
+    typingFontArmedAt = -1;
+    typingFontArmedName = null;
+    postMessage({
+      type: "editOpened",
+      page,
+      paraIndex: -1,          // it owns no paragraph in the cached grouping yet…
+      blockIndex: -1,         // …and no block, so there is no faint box to hide
+      // CREATED, rather than a second event firing at the same moment as this one and
+      // carrying nothing it lacks. A host that wants to know "this is a NEW box" reads
+      // the flag; everything else about entering edit mode is already this message.
+      created: true,
+      text: "",
+      caretIndex: 0,
+      caret: readCaret(0),
+      runBounds: readRunBounds(0),
+      isParagraph: F.editIsPara(editor) === 1,
+      linePreserve: F.editLineMode(editor) === 1,
+      style: readRangeStyle(0, 0),
+    });
+  } finally {
+    mod._free(sp);
+  }
+}
+
 function openEditorAt(page, xPt, yPt, lineMode) {
   ensureCoreGroup(page);
   const hit = hitParagraph(page, xPt, yPt);
@@ -1217,9 +1550,8 @@ function openEditorAt(page, xPt, yPt, lineMode) {
   // revival must never leak across sessions (the index would name a spot in a
   // different run).
   typingColorArmedAt = -1;
-  // The FONT pick is session-scoped in BOTH senses, because font has only the
-  // follow-the-caret lifetime (user decision 2026-08-13: no sticky mode). There is
-  // nothing to re-arm here, and that absence is the decision, not an omission.
+  // A FOLLOW-mode font pick is session-scoped, for the same reason colour's is: the
+  // armed INDEX names a spot in a run that no longer exists.
   typingFontArmedAt = -1;
   typingFontArmedName = null;
   // ...but a STICKY pick is deliberately NOT session-scoped: re-arm it on the new
@@ -1228,6 +1560,27 @@ function openEditorAt(page, xPt, yPt, lineMode) {
     F.editSetTypingColor(editor, stickyColorArgb >>> 0, 1);
   const text = readEditorText();
   const caretIdx = F.editBoundary(editor, xPt, yPt);
+  // THE SAME FOR A STICKY TYPEFACE, and the two halves re-arm differently on purpose:
+  //   * a FAMILY is a host-named face, so it resolves through this document's handle
+  //     map exactly as the original pick did. A name with no handle in THIS document
+  //     is skipped rather than errored — the host's pick is not wrong, it just has
+  //     nothing to resolve to here, and the style report will tell the truth.
+  //   * a FACE (B/I) has no name to resolve: the core picks bold/italic against the
+  //     family the caret is in, which differs per box. So the INTENT is replayed
+  //     through the same collapsed apply_face the button uses, and a family with no
+  //     such face is skipped SILENTLY — a refusal here belongs to no gesture the user
+  //     just made, and emitting one on box-open would be noise (docs/STYLING.md §2bis).
+  if (!typingFontFollowsCaret) {
+    if (stickyFontName !== null) {
+      const h = stickyFontName ? (fontHandles.get(stickyFontName) || 0) : 0;
+      if (h || !stickyFontName) F.editSetTypingFont(editor, h);
+    } else if (stickyFace) {
+      const dPtr = mod._malloc(16);
+      F.editApplyFace(editor, caretIdx, caretIdx,
+                      stickyFace.bold ? 1 : 0, stickyFace.italic ? 1 : 0, dPtr);
+      mod._free(dPtr);
+    }
+  }
   postMessage({
     type: "editOpened",
     page,
@@ -1598,7 +1951,8 @@ function drainLatch() {
     const page = groupQueue.shift();
     groupQueued.delete(page);
     if (doc && canvases.has(page)) {
-      postMessage({ type: "groups", page, blocks: cachedGroups(page) });
+      postMessage({ type: "groups", page, blocks: cachedGroups(page),
+                    images: cachedImages(page) });
     }
   }
   if (tileQueue.length || paintQueue.length || groupQueue.length || pendingEdit) {
@@ -1668,7 +2022,7 @@ onmessage = async (e) => {
       for (const p of pageHandles.values()) F.closePage(p);
       pageHandles.clear(); canvases.clear(); paintGen.clear(); pageScale.clear();
       tileQueue.length = 0; paintQueue.length = 0; pendingEdit = null;
-      groupQueue.length = 0; groupQueued.clear(); groupCache.clear();
+      groupQueue.length = 0; groupQueued.clear(); groupCache.clear(); imageCache.clear();
       coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
       // Font handles are DOCUMENT-owned (pdfe_close_doc frees them), so the registry
       // must not outlive the doc — a stale handle applied to the next file is a
@@ -1842,6 +2196,16 @@ onmessage = async (e) => {
     // SELECTED (not opened — select-then-act). Tapping the already-selected
     // paragraph a second time is the shortcut into editing.
     if (!doc) return;
+    // ADD TEXT: the arm outranks every branch below and is CONSUMED here. Placed
+    // before the "inside the open run" test on purpose — while armed, a tap means
+    // "put a box here", even if it lands inside the box being edited.
+    if (addTextArmed) {
+      setAddTextArmed(false);            // spent, and reported spent
+      if (editor) commitEditor();        // tap-outside-commits still holds
+      clearSelection();
+      placeNewBoxAt(msg.page, msg.xPt, msg.yPt);
+      return;
+    }
     if (editor && msg.page === editPage && editParaBounds &&
         msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
         msg.yPt >= editParaBounds[1] && msg.yPt <= editParaBounds[3]) {
@@ -1850,8 +2214,17 @@ onmessage = async (e) => {
       return;
     }
     if (editor) commitEditor();   // tap outside / another paragraph: commit first
-    const hit = hitParagraph(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
-    if (!hit) { clearSelection(); return; }   // empty space: just deselect
+    const item = hitItem(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
+    if (!item) { clearSelection(); return; }   // empty space: just deselect
+    if (item.kind === "image") {
+      // A picture has no second-tap-to-edit: there is nothing to open. Tapping
+      // the selected one again simply keeps it selected.
+      const same = selectedImage && selectedImage.page === msg.page &&
+                   selectedImage.index === item.image.index;
+      if (!same) { clearSelection(); selectImage(msg.page, item.image); }
+      return;
+    }
+    const hit = item.para;
     const again = selectedPara &&
       selectedPara.page === msg.page && selectedPara.index === hit.index;
     clearSelection();
@@ -1891,6 +2264,42 @@ onmessage = async (e) => {
     return;
   }
 
+  // ---- IMAGE EDIT (docs/IMAGE_EDIT.md) -------------------------------------
+  if (msg.type === "moveImage") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageMoved", ok: false }); return; }
+    moveSelectedImage(Number(msg.dx) || 0, Number(msg.dy) || 0);
+    return;
+  }
+  if (msg.type === "rotateImage") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
+    rotateSelectedImage(Number(msg.turns) || 0);
+    return;
+  }
+  if (msg.type === "imageMoveLimits") {
+    if (!doc || !selectedImage) return;
+    ensureCoreGroup(selectedImage.page);
+    const lp = mod._malloc(16);
+    const ok = F.imageMoveLimits(doc, acquirePage(selectedImage.page),
+                                 selectedImage.index, lp);
+    const limits = ok ? readF32(lp, 4) : null;
+    mod._free(lp);
+    if (limits) postMessage({ type: "moveLimits", limits });
+    return;
+  }
+
+  // ---- ADD TEXT ------------------------------------------------------------
+  if (msg.type === "armAddText") { setAddTextArmed(true); return; }
+  if (msg.type === "cancelAddText") { setAddTextArmed(false); return; }
+  if (msg.type === "setNewTextStyle") {
+    // Every field is optional and independent, so a host can set only the colour and
+    // leave the face and size on the core's floor. null/0 means "not specified".
+    if ("fontName" in msg) newTextStyle.fontName = msg.fontName || null;
+    if ("sizePt" in msg) newTextStyle.sizePt = Number(msg.sizePt) || 0;
+    if ("colorArgb" in msg)
+      newTextStyle.colorArgb = msg.colorArgb == null ? 0 : (msg.colorArgb >>> 0);
+    return;
+  }
+
   // Undo/redo take NO arguments: the core knows which page each step belongs
   // to, and a shell that passed one could pass a stale one.
   if (msg.type === "undo") { applyHistory("undo"); return; }
@@ -1898,6 +2307,16 @@ onmessage = async (e) => {
   // Phase 5: the SDK's ~300 ms idle debounce (and blur) says "the pause
   // happened" — the next keystroke starts a fresh word-level undo entry.
   if (msg.type === "sealHistory") { if (doc) F.historySeal(doc); return; }
+
+  // The host persisted the document itself (an upload, its own storage) and is
+  // declaring it — same bookkeeping a save does, without producing bytes. Added
+  // 2026-08-24 with Android's markSaved(): the SDK cannot see where a host puts
+  // the bytes, so only the host can say a save happened (I78).
+  if (msg.type === "markSaved") {
+    if (doc) { F.historyClear(doc); postHistory(true); }
+    postMessage({ type: "markedSaved" });
+    return;
+  }
 
   if (msg.type === "history") { postHistory(true); return; }
 
@@ -1984,7 +2403,11 @@ onmessage = async (e) => {
     // front of paints, tiles, or a tap.
     if (!doc) return;
     const cached = groupCache.get(msg.page);
-    if (cached) { postMessage({ type: "groups", page: msg.page, blocks: cached }); return; }
+    if (cached) {
+      postMessage({ type: "groups", page: msg.page, blocks: cached,
+                    images: imageCache.get(msg.page) || [] });
+      return;
+    }
     requestGroupJob(msg.page);
     return;
   }
@@ -2182,6 +2605,10 @@ onmessage = async (e) => {
     // — see postCaretMoved.
     typingColorArmedAt = msg.set && msg.at != null && msg.at >= 0 ? msg.at : -1;
     typingColorArmedArgb = msg.set ? (msg.argb >>> 0) : 0;
+    // …and the arm reports itself (I76) — but only when there IS a run to read a style
+    // from: a STICKY pick made with no box open has nothing to report yet, and the box
+    // that opens next reports its own style anyway.
+    if (editor && typingColorArmedAt >= 0) postArmedStyle(typingColorArmedAt);
     return;
   }
 
@@ -2195,6 +2622,24 @@ onmessage = async (e) => {
     // Back to follow-the-caret: the cross-session pick retires with the mode, or the
     // next box would silently type in a colour whose lifetime rule no longer exists.
     if (typingColorFollowsCaret) stickyColorArgb = null;
+    return;
+  }
+
+  // The same switch for the TYPEFACE — family AND bold/italic together, because both
+  // are the core's one `currentFontId` (2026-08-20). Same two lifetimes, same default,
+  // same retirement rule as colour's above.
+  if (msg.type === "setTypingFontFollowsCaret") {
+    typingFontFollowsCaret = !!msg.on;
+    if (typingFontFollowsCaret) {
+      stickyFontName = null;
+      stickyFace = null;
+      // A pick made under the STICKY rule has no index to revive from, so leaving it
+      // armed would outlive the rule that justified it. Drop it now rather than at the
+      // next cursor move, which is what the host just asked for.
+      if (editor) F.editSetTypingFont(editor, 0);
+      typingFontArmedAt = -1;
+      typingFontArmedName = null;
+    }
     return;
   }
 
@@ -2305,6 +2750,7 @@ onmessage = async (e) => {
     if (on && typeof msg.at === "number" && msg.at >= 0) {
       typingSizeArmedAt = msg.at;
       typingSizeArmedPt = pt;
+      postArmedStyle(msg.at);   // the arm is a style change: TELL the host (I76)
     } else if (!on) {
       typingSizeArmedAt = -1;
       typingSizeArmedPt = 0;
@@ -2359,6 +2805,15 @@ onmessage = async (e) => {
   // APPLY A FAMILY. Two verbs over one gesture, the same shape as colour: a RANGE is
   // restyled now, a BARE CARET arms what the next keystroke takes.
   if (msg.type === "applyFont") {
+    // STICKY IS REMEMBERED EVEN WITH NO RUN OPEN, before the early return below: the
+    // host picked a typeface for what it is about to type, and openEditorAt arms it on
+    // the next box. Recorded here rather than in the collapsed branch, so a pick made
+    // over a RANGE is also remembered — the painted characters keep it, and so does the
+    // next thing typed, which is what "sticky" says on the tin.
+    if (!typingFontFollowsCaret) {
+      stickyFontName = msg.name == null ? "" : String(msg.name);
+      stickyFace = null;
+    }
     if (!editor) return;                       // no run open: silent, like applyColor
     if (pendingEdit) drainLatch();             // indices were computed against the sink
     const name = msg.name == null ? null : String(msg.name);
@@ -2424,7 +2879,17 @@ onmessage = async (e) => {
     // typingFontArmedName — the CORE now reports the armed face's own name, family and
     // bold/italic at a bare caret, so overriding the name here would be a second, rival
     // answer to the same question.
-    if (rc === PDFE_FACE_ARMED) typingFontArmedAt = s;
+    if (rc === PDFE_FACE_ARMED) {
+      typingFontArmedAt = s;
+      // STICKY: the INTENT, not a face handle — a new box resolves bold/italic against
+      // its own family (openEditorAt). Read from the reply's own truth, since msg.bold /
+      // msg.italic may be null meaning "leave that axis alone".
+      if (!typingFontFollowsCaret) {
+        const f = readRangeStyle(s, s) || {};
+        stickyFace = { bold: !!f.bold, italic: !!f.italic };
+        stickyFontName = null;
+      }
+    }
     // rc 0 is "already that face" — a success with nothing repainted, and the host
     // still gets a fresh style read so its buttons settle. rc 2 is an arm: also a
     // success, and also nothing repainted.

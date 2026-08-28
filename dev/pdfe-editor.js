@@ -658,7 +658,9 @@ export class PdfeEditor {
    * layer and the page repaints in place — no dialog, no confirmation (the host
    * owns confirm policy, as it owns save). It IS undoable — see `undo()`.
    */
-  deleteSelection() { if (this._selected) this._post({ type: "deleteSelected" }); }
+  deleteSelection() {
+    if (this._selected || this._selectedImage) this._post({ type: "deleteSelected" });
+  }
   /** Drop the selection (the tap-on-empty-space gesture). */
   clearSelection() {
     if (this._selected || this._selectedImage) this._post({ type: "deselect" });
@@ -1647,6 +1649,21 @@ export class PdfeEditor {
           clipped: !!(msg.flags & 1),
         } });
         break;
+      case "imageDeleted": {
+        // The picture is gone and the strip it occupied has already been
+        // repainted by the worker. Adopt the fresh list BEFORE re-rendering, or
+        // the deleted picture keeps its faint outline (the same trap
+        // imageMoved/imageRotated document below).
+        if (Array.isArray(msg.images)) this._pageImages.set(msg.page, msg.images);
+        this._selectedImage = null;
+        this._renderBoxes();
+        if (msg.ok) this._setDirty(true);
+        // THE SAME `deleted` EVENT AS A PARAGRAPH, carrying `kind` — the pattern
+        // `select` already set for both selection kinds. A host that only knows
+        // about text keeps working unchanged.
+        this._emit("deleted", { page: msg.page, ok: !!msg.ok, kind: "image" });
+        break;
+      }
       case "imageDeselected":
         if (!this._selectedImage) break;
         this._selectedImage = null;
@@ -1686,7 +1703,7 @@ export class PdfeEditor {
         this._renderBoxes();
         this._requestGroups(msg.page);
         if (msg.ok) this._setDirty(true);
-        this._emit("deleted", { page: msg.page, ok: !!msg.ok });
+        this._emit("deleted", { page: msg.page, ok: !!msg.ok, kind: "text" });
         break;
       }
       case "history":
@@ -2468,6 +2485,7 @@ export class PdfeEditor {
     // during a drag (a scroll, a zoom) would otherwise put it back on the old rect.
     if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")
         && !this._draggingBox) {
+      this.editBtn.style.display = "";     // restored: a picture's bar hides it
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
     // PICTURES. One faint outline EACH, exactly as every text block gets one:
@@ -2513,11 +2531,16 @@ export class PdfeEditor {
       // …and the rotate handle on it. Hidden during a drag for the same reason
       // the action bar is: any re-render mid-drag would strand it on the old rect.
       if (!this._draggingBox) this._placeRotate(selImg, scaleCss);
-      // NO ACTION BAR. The bar's two actions are Edit and Delete, and neither
-      // exists for a picture: there is nothing to open for typing, and image
-      // deletion is deliberately out of scope. Showing it offered a user two
-      // buttons that could only disappoint. Turning a picture is HOST chrome
-      // (rotateSelection), like every other control except this one bar.
+      // A DELETE-ONLY ACTION BAR (user, 2026-08-28). The first image-edit pass
+      // hid this bar entirely, because NEITHER of its actions existed for a
+      // picture. Delete now does, so the bar is back with Edit hidden — there
+      // is still nothing to open for typing. Hidden mid-drag for the same
+      // reason it is for a text box: a re-render would strand it on the old
+      // rect. Turning a picture stays HOST chrome (rotateSelection).
+      if (!this._draggingBox) {
+        this.editBtn.style.display = "none";
+        this._placeActions(selImg.page, selImg.bounds, scaleCss);
+      }
     }
   }
 

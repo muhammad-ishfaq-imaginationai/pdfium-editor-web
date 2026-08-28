@@ -137,6 +137,8 @@ const ready = createPdfe({
     ["number", "number", "number", "number"]);
   F.rotateImage   = m.cwrap("pdfe_rotate_image", "number",
     ["number", "number", "number", "number", "number"]);
+  F.deleteImage   = m.cwrap("pdfe_delete_image", "number",
+    ["number", "number", "number", "number"]);
   F.blockMoveLimits = m.cwrap("pdfe_block_move_limits", "number",
     ["number", "number", "number", "number"]);
   // Undo/redo. The journal lives in the CORE (docs/UNDO_REDO.md) — this shell
@@ -1667,6 +1669,36 @@ function rotateSelectedImage(turns) {
   afterImageChange(page, before, "imageRotated");
 }
 
+// DELETE THE SELECTED PICTURE (user, 2026-08-28 — this reverses the 2026-08-25
+// "image deletion is out of scope" decision; see docs/IMAGE_EDIT.md §1).
+//
+// NOT a call to afterImageChange, and the difference is the whole point: that
+// helper's job is to re-find the picture and keep it selected, and after a
+// delete there is nothing to re-find. Getting this wrong would leave the
+// selection outline and the rotate handle floating over a picture that is no
+// longer there — which is exactly defect #3 of the first image-edit pass.
+function deleteSelectedImage() {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  const index = selectedImage.index;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.deleteImage(doc, acquirePage(page), index, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageDeleted", page, ok: false }); return; }
+  clearSelection();                       // the picture is gone: nothing is selected
+  dirtyPages.add(page);
+  noteMutation(page);
+  const imgs = cachedImages(page);        // re-groups; the deleted one is now absent
+  renderDirtyStrip(page, before);         // repaint exactly where it was
+  // The whole page's picture list travels with the result, for the same reason
+  // afterImageChange sends it: the shell draws its faint outlines from a cached
+  // copy, and without a fresh list the deleted picture keeps its outline.
+  postMessage({ type: "imageDeleted", page, ok: true, images: imgs });
+  postHistory(true);                      // …and light the undo button
+}
+
 // ---- block move (drag a text box to a new position) -------------------------
 // EXPERIMENTAL, web only (branch feature/web-block-move).
 //
@@ -2616,7 +2648,14 @@ onmessage = async (e) => {
   }
 
   if (msg.type === "deleteSelected") {
-    if (!doc || !selectedPara) return;
+    if (!doc) return;
+    // ROUTED BY WHAT IS SELECTED, deliberately reusing the ONE message rather
+    // than adding a second: "delete what I picked" is the same host intent
+    // either way, and a new bridge command would be surface every shell has to
+    // learn for no gain. A picture and a paragraph can never both be selected
+    // (selecting either clears the other), so there is no ambiguity to resolve.
+    if (selectedImage) { deleteSelectedImage(); return; }
+    if (!selectedPara) return;
     const { page, xPt, yPt } = selectedPara;
     clearSelection();
     deleteParagraphAt(page, xPt, yPt);

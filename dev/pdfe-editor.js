@@ -266,6 +266,13 @@ export class PdfeEditor {
     // it can still be switched back with one flag and no redeploy of this SDK
     // (docs/BLOCK_MOVE.md).
     this._blockMove = opts.blockMove ?? true;
+    /* DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md) — EXPERIMENTAL, default OFF.
+     * The name is `documentReflow`, never `reflow`: that word already means the
+     * line-mode wrap inside one paragraph, and one word with two meanings in one API
+     * is a support ticket waiting to happen. When on, committing an edit re-settles the
+     * page — content below a grown paragraph moves down, and overflow migrates to the
+     * next page, appending one if there is nowhere to put it. */
+    this._documentReflow = opts.documentReflow ?? false;
     // ADD TEXT: armed between armAddText() and the tap that places a box.
     // Read by _tapWantsKeyboard, which must answer synchronously inside the
     // gesture for iOS to raise a keyboard at all (S39).
@@ -457,8 +464,12 @@ export class PdfeEditor {
                       recording: false };
     this._closeEditUiState();
     const p = this._promiseFor("open");
+    // documentReflow is decided PER OPEN as well as per instance: enabling it builds a
+    // model over every page, which is work a host may not want on every document.
+    const wantFlow = opts.documentReflow ?? this._documentReflow;
+    this._documentReflow = wantFlow;
     this._post({ type: "open", blob, tier: opts.tier || 0, blockKB: opts.blockKB || 0,
-                 password: opts.password || "" });
+                 password: opts.password || "", documentReflow: !!wantFlow });
     return p;
   }
 
@@ -1565,6 +1576,30 @@ export class PdfeEditor {
         };
         this._settle("open", true, info);
         this._emit("opened", info);
+        break;
+      }
+      case "documentReflowed": {
+        // The page was re-settled after a commit. Two things may have changed: the
+        // GEOMETRY on this page and the next (content moved), and the PAGE COUNT.
+        //
+        // ⚠️ A FULL STRIP REBUILD, and it is a deliberate deviation from
+        // DOCUMENT_REFLOW.md §4, which specifies incremental tail-only growth and says
+        // never to call _buildStrip mid-session. This is the experimental path: the
+        // rebuild is correct but it repaints everything and drops the visual selection,
+        // and on a 7000-page document it would be unacceptable. It is safe HERE only
+        // because the commit has already closed the edit session, so there is no live
+        // caret or open run to lose. Incremental growth is the Phase-7 job.
+        this._pages = msg.pages;
+        this._buildStrip();
+        this._emit("documentReflowed", {
+          page: msg.page, nudged: msg.nudged, linesMigrated: msg.linesMigrated,
+          itemsMigrated: msg.itemsMigrated, pagesAdded: msg.pagesAdded,
+          cascadedPages: msg.cascadedPages || [msg.page], pages: msg.pages.length,
+          undone: !!msg.undone,
+          redone: !!msg.redone,
+        });
+        if (msg.pagesChanged)
+          this._emit("pagesChanged", { pages: msg.pages.length, pageSizes: this.pages });
         break;
       }
       case "painted":

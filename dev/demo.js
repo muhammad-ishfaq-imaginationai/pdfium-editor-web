@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=2.1.0-9eab270-wa465f26";
+import { PdfeEditor } from "./pdfe-editor.js?v=2.1.0-364d0e6-w7a5ee33";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -104,6 +104,13 @@ const BLOCK_MOVE_DEFAULT = true;
 // ?move=1 opt-in, which existed while the default was off.)
 const blockMoveOn = params.get("move") === "0" ? false : BLOCK_MOVE_DEFAULT;
 
+// DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md) — EXPERIMENTAL, off unless asked for.
+// ?documentReflow=1 turns it on for a load. Off by default because enabling it builds a
+// model over EVERY page at open time, and because it is not finished: the destination
+// page is not itself re-settled, so a big enough insertion can hang past the bottom of
+// the page it lands on.
+const documentReflowOn = params.get("documentReflow") === "1" || params.get("flow") === "1";
+
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
@@ -111,7 +118,28 @@ const editor = new PdfeEditor({
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
   blockMove: blockMoveOn,
+  documentReflow: documentReflowOn,
 });
+if (documentReflowOn) {
+  // The host's own readout, so what the feature did is visible rather than inferred
+  // from the pixels — which is the whole reason this page exists.
+  editor.on("documentReflowed", (e) => {
+    const bits = [];
+    if (e.nudged) bits.push(`${e.nudged} item(s) nudged`);
+    if (e.linesMigrated) bits.push(`${e.linesMigrated} line(s) moved to the next page`);
+    if (e.itemsMigrated) bits.push(`${e.itemsMigrated} whole item(s) moved`);
+    if (e.pagesAdded) bits.push(`${e.pagesAdded} page(s) added`);
+    if (e.cascadedPages && e.cascadedPages.length > 1)
+      bits.push(`rippled across pages ${e.cascadedPages.map((p) => p + 1).join(", ")}`);
+    setStatus(e.undone
+      ? `documentReflow: UNDONE — the reflow was reversed (now ${e.pages} pages)`
+      : e.redone
+      ? `documentReflow: REDONE — the reflow was replayed (now ${e.pages} pages)`
+      : `documentReflow: ${bits.join(", ") || "nothing to do"} (now ${e.pages} pages)`);
+    console.log("[demo] documentReflowed", e);
+  });
+  editor.on("pagesChanged", (e) => console.log("[demo] pagesChanged", e));
+}
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
 window.latencySamples = editor.latencySamples; // the latency-gate harness reads this

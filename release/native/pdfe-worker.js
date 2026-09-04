@@ -76,6 +76,12 @@ const dirtyPages = new Set();
 // PARAGRAPHS (the edit units, with the core paragraph index the editor takes):
 //   pageIndex -> [{ index, bounds:[l,b,r,t], paras:[{index, bounds}] }]
 const groupCache = new Map();
+// THE PAGE'S PICTURES, cached the same way and for the same reason (a tap must
+// not cost a core call). A SEPARATE map, mirroring the core's separate list —
+// see docs/IMAGE_EDIT.md §3. Same lifetime as groupCache: filled by groupPage,
+// dropped by noteMutation, evicted with it.
+//   pageIndex -> [{ index, bounds:[l,b,r,t], quad:[x1,y1..x4,y4], turns, flags }]
+const imageCache = new Map();
 const MAX_GROUP_CACHE = 300;      // bounds are tiny; this only caps pathology
 let coreGroupedPage = -1;         // page the CORE's one-slot grouping holds
 let coreGroupFresh = false;       // no object mutation since that grouping
@@ -121,6 +127,18 @@ const ready = createPdfe({
     ["number", "number", "number", "number", "number"]);
   F.moveBlock     = m.cwrap("pdfe_move_block", "number",
     ["number", "number", "number", "number", "number", "number"]);
+  // IMAGE EDIT (docs/IMAGE_EDIT.md)
+  F.imageCount    = m.cwrap("pdfe_image_count", "number", ["number"]);
+  F.imageInfo     = m.cwrap("pdfe_image_info", "number",
+    ["number", "number", "number", "number", "number", "number", "number"]);
+  F.moveImage     = m.cwrap("pdfe_move_image", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.imageMoveLimits = m.cwrap("pdfe_image_move_limits", "number",
+    ["number", "number", "number", "number"]);
+  F.rotateImage   = m.cwrap("pdfe_rotate_image", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.deleteImage   = m.cwrap("pdfe_delete_image", "number",
+    ["number", "number", "number", "number"]);
   F.blockMoveLimits = m.cwrap("pdfe_block_move_limits", "number",
     ["number", "number", "number", "number"]);
   // Undo/redo. The journal lives in the CORE (docs/UNDO_REDO.md) — this shell
@@ -150,6 +168,8 @@ const ready = createPdfe({
     ["number", "number", "number", "number"]);
   F.editBeginEx   = m.cwrap("pdfe_edit_begin_ex", "number",
     ["number", "number", "number", "number", "number"]);
+  F.editBeginNew  = m.cwrap("pdfe_edit_begin_new", "number",
+                            ["number", "number", "number", "number"]);
   F.editBeginBlock = m.cwrap("pdfe_edit_begin_block", "number",
     ["number", "number", "number", "number", "number"]);
   F.editLineMode  = m.cwrap("pdfe_edit_line_mode", "number", ["number"]);
@@ -193,6 +213,30 @@ const ready = createPdfe({
   F.loadStandardFont = m.cwrap("pdfe_load_standard_font", "number", ["number", "number"]);
   F.registerFace  = m.cwrap("pdfe_register_face", "number", ["number", "number"]);
   F.editCommit    = m.cwrap("pdfe_edit_commit", "number", ["number", "number"]);
+  // DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md). The public name on this surface is
+  // `documentReflow`, never "reflow" — that word already means the LINE-mode wrap
+  // inside a paragraph, and two meanings for one word in one API is a support ticket.
+  F.flowEnable    = m.cwrap("pdfe_flow_enable", "number", ["number", "number"]);
+  F.flowSettle    = m.cwrap("pdfe_flow_settle", "number", ["number", "number", "number", "number"]);
+  F.flowRefresh   = m.cwrap("pdfe_flow_refresh_page", "number", ["number", "number", "number"]);
+  F.flowFrame     = m.cwrap("pdfe_flow_page_frame", "number", ["number", "number", "number"]);
+  F.flowUndo      = m.cwrap("pdfe_flow_undo", "number", ["number", "number", "number"]);
+  F.flowUndoPage  = m.cwrap("pdfe_flow_undo_page", "number", ["number"]);
+  F.flowCanUndo   = m.cwrap("pdfe_flow_can_undo", "number", ["number"]);
+  F.flowRedo      = m.cwrap("pdfe_flow_redo", "number", ["number", "number", "number"]);
+  F.flowRedoPage  = m.cwrap("pdfe_flow_redo_page", "number", ["number"]);
+  F.flowCanRedo   = m.cwrap("pdfe_flow_can_redo", "number", ["number"]);
+  // THE SHARED CASCADE (2026-09-03): the walk moved into the core. begin/step/end is an
+  // iterator so the per-page progress event stays natural; the group verbs own the count
+  // that makes one undo reverse one whole cascade (pdfe.h has the contract).
+  F.flowCascadeBegin = m.cwrap("pdfe_flow_cascade_begin", "number", ["number", "number", "number"]);
+  F.flowCascadeStep  = m.cwrap("pdfe_flow_cascade_step", "number", ["number", "number"]);
+  F.flowCascadeEnd   = m.cwrap("pdfe_flow_cascade_end", "number", ["number", "number", "number", "number"]);
+  F.flowUndoGroup    = m.cwrap("pdfe_flow_undo_group", "number", ["number", "number", "number", "number"]);
+  F.flowRedoGroup    = m.cwrap("pdfe_flow_redo_group", "number", ["number", "number", "number", "number"]);
+  F.flowGroupCount   = m.cwrap("pdfe_flow_group_count", "number", ["number"]);
+  F.flowRedoGroupCount = m.cwrap("pdfe_flow_redo_group_count", "number", ["number"]);
+  F.pageAdopt     = m.cwrap("pdfe_page_adopt", "number", ["number", "number", "number"]);
   F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
   F.generateContent = m.cwrap("pdfe_generate_content", "number", ["number"]);
   F.wasmSave      = m.cwrap("pdfe_wasm_save", "number", ["number"]);
@@ -211,6 +255,9 @@ function closePageHandles(i) {
   const tp = textPages.get(i);
   if (tp) { F.closeTextPage(tp); textPages.delete(i); }
   const p = pageHandles.get(i);
+  // NOTHING TO UN-ADOPT: pdfe_close_page drops any adopted registry entry naming this
+  // handle, refcount or not — the handle is going away, so an entry pointing at it must go
+  // with it, which is exactly the stale view adoption exists to prevent.
   if (p) { F.closePage(p); pageHandles.delete(i); }
 }
 
@@ -219,6 +266,14 @@ function acquirePage(i) {
   if (p) { pageHandles.delete(i); pageHandles.set(i, p); return p; } // LRU touch
   p = F.loadPage(doc, i);
   pageHandles.set(i, p);
+  // ADOPT IT INTO THE CORE'S PAGE REGISTRY, so the flow layer resolves this index to THIS
+  // handle instead of opening a second view of the page. pdfe_load_page does not cache, and
+  // two views of one page are two independent object lists — the measured 3600-vs-3578
+  // divergence, and the direct cause of three separate flow bugs (the cascade stopping at
+  // its first destination, an undo restoring onto a view nobody was watching, and a page
+  // that could not be deleted). Adoption makes those unconstructible rather than guarded
+  // against. Dropped again by closePageHandles below; harmless when flow is off.
+  if (p && F.pageAdopt) F.pageAdopt(doc, i, p);
   // LRU backstop: evict the oldest evictable handle. Queued tile/paint jobs
   // for an evicted page just re-acquire it — a reload cost, never a bug.
   if (pageHandles.size > MAX_OPEN_PAGES) {
@@ -789,10 +844,33 @@ function groupPage(page) {
       }
     }
   }
+  // The page's images, from the same core pass.
+  const imageList = [];
+  {
+    const bp = mod._malloc(16), qp = mod._malloc(32), ip = mod._malloc(12);
+    const ni = F.imageCount(doc);
+    for (let i = 0; i < ni; i++) {
+      if (!F.imageInfo(doc, i, bp, qp, ip, ip + 4, ip + 8)) continue;
+      imageList.push({
+        index: i,
+        bounds: readF32(bp, 4),
+        quad: readF32(qp, 8),
+        objIndex: mod.HEAP32[ip >> 2],
+        turns: mod.HEAP32[(ip + 4) >> 2],
+        flags: mod.HEAP32[(ip + 8) >> 2],
+      });
+    }
+    mod._free(ip); mod._free(qp); mod._free(bp);
+  }
+
   groupCache.delete(page);
   groupCache.set(page, blockList);   // Map order == age
+  imageCache.delete(page);
+  imageCache.set(page, imageList);
   if (groupCache.size > MAX_GROUP_CACHE) {
-    groupCache.delete(groupCache.keys().next().value);
+    const oldest = groupCache.keys().next().value;
+    groupCache.delete(oldest);
+    imageCache.delete(oldest);       // one lifetime, two maps
   }
   return blockList;
 }
@@ -809,6 +887,7 @@ function cachedGroups(page) {
 function noteMutation(page) {
   coreGroupFresh = false;
   groupCache.delete(page);
+  imageCache.delete(page);
 }
 
 // Satisfy the fresh-open gate: pdfe_edit_begin_ex needs the core's one-slot
@@ -839,6 +918,51 @@ function hitParagraph(page, xPt, yPt) {
   if (!hit) return null;
   return { index: hit.index, bounds: hit.bounds,
            blockIndex: block.b.index, blockBounds: block.b.bounds };
+}
+
+// ONE TAP, TWO KINDS — and TEXT WINS. The core has this rule too
+// (pdfe_hit_item), and this is deliberately a SECOND copy rather than a call
+// into it: taps are served from the JS cache precisely so they cost no core
+// pass (§ the groupCache comment). The two must agree, and wasm/image_test.mjs
+// pins the core half.
+//
+// Text first is not a preference. A full-page scanned background is ONE image
+// covering the page with the text drawn on top (aasdshsl19.pdf p0: 103.6% of
+// the page under 719 text objects), so topmost-wins makes such a page
+// uneditable. Among images, later in the list is drawn later, so the topmost
+// wins — a logo on a panel beats the panel.
+function hitItem(page, xPt, yPt) {
+  const para = hitParagraph(page, xPt, yPt);
+  if (para) return { kind: "text", para };
+  const imgs = cachedImages(page);
+  for (let i = imgs.length - 1; i >= 0; i--) {
+    const r = imgs[i].bounds;
+    if (xPt >= r[0] && xPt <= r[2] && yPt >= r[1] && yPt <= r[3]) {
+      return { kind: "image", image: imgs[i] };
+    }
+  }
+  return null;
+}
+
+function cachedImages(page) {
+  const hit = imageCache.get(page);
+  if (hit) return hit;
+  groupPage(page);                       // fills both maps
+  return imageCache.get(page) || [];
+}
+
+// The picture whose bounds match |want| most closely — the image twin of
+// findMovedBlock, and needed for the same reason: after a move the LIST INDEX
+// may have changed, and re-resolving by the rect we just created is what keeps
+// the dragged picture selected instead of a neighbour.
+function findMovedImage(imgs, want) {
+  let best = null, bestD = Infinity;
+  for (const im of imgs) {
+    const d = Math.abs(im.bounds[0] - want[0]) + Math.abs(im.bounds[1] - want[1]) +
+              Math.abs(im.bounds[2] - want[2]) + Math.abs(im.bounds[3] - want[3]);
+    if (d < bestD) { bestD = d; best = im; }
+  }
+  return bestD <= 1.0 ? best : null;
 }
 
 // Which paragraph of a KNOWN block a point means: the smallest one containing it,
@@ -924,6 +1048,18 @@ function commitEditor() {
   if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
   noteMutation(page);                      // indices/bounds may have shifted
   editor = 0; editPage = -1; editParaBounds = null;
+  // DOCUMENT REFLOW runs HERE — after the commit, before the shell is told the box
+  // closed. §2.2's rule is that the editor never sees a split paragraph: the live
+  // preview may legally hang past the page bottom while the user types, and the page
+  // is re-settled at commit. This is that commit.
+  // GUARDED, because a throw here would swallow the editClosed message below and leave
+  // the shell's overlays up with no way to recover. An experimental layer must not be
+  // able to wedge the editor.
+  let flowed = null;
+  if (flowOn) {
+    try { flowed = settleAfterCommit(page); }
+    catch (err) { console.error("[pdfe] documentReflow: settle threw —", err); }
+  }
   postMessage({ type: "editClosed", page, ok: ok === 1 });
   // FORCED, not deduped. Entering a box and leaving it without typing changes
   // neither flag, so a deduped post sends nothing — and the shell is left holding
@@ -931,6 +1067,241 @@ function commitEditor() {
   // undo stack contradicting it. The close is exactly when the shell needs the
   // stack's answer, whether or not the answer changed (the S15 rule).
   postHistory(true);
+}
+
+// ---- document reflow --------------------------------------------------------
+// The settle walk lives in the core (core/src/flow.cpp) for the same reason the undo
+// journal does: web, Android and iOS must behave identically from one implementation.
+// This function is only the shell contract around it — group, settle, invalidate,
+// re-group, tell the host.
+let flowOn = false;
+
+// THE CASCADE LIVES IN THE CORE NOW (2026-09-03) — pdfe_flow_cascade_begin/step/end —
+// and this file keeps only what a shell alone can do around it. It used to live here,
+// deliberately, because the shell owns the page handles, the text-page cache and the
+// caches that go stale. It moved because a second shell (Android) needed it, and a
+// behaviour that exists twice diverges — this one is full of order-sensitive rules that
+// are silent when wrong (the stop condition, the page bound, the undo GROUP count). The
+// core now decides which page is next, when to stop, and how many transactions a cascade
+// made; the loop below has no semantic content left in it.
+//
+// WHY IT MATTERS THAT IT EXISTS AT ALL: without it, overflow leaving page 3 lands under
+// page 4's own content, which on a full page means off the bottom of it — correct in the
+// model and invisible to the user. With it, the ripple continues until a page has room
+// or a new one is appended, which is what "document reflow" means to anybody watching.
+// The 24-page bound is the core's (an unbounded reflow on a bad document is a hung tab).
+
+// ONE USER UNDO REVERSES ONE CASCADE, not one page of it. The core records how many flow
+// transactions each cascade produced and pdfe_flow_undo_group pops that many. Without it,
+// pressing undo after a reflow that rippled across six pages would un-ripple exactly one
+// of them and leave the document half-reflowed — which looks far more broken than not
+// undoing at all. That count used to be a shell-side array here (`flowGroups`), which is
+// exactly the thing a second shell would have had to get right independently.
+//
+// THE APPROXIMATION, stated because it is one: this pairs each cascade with the text step
+// that caused it, and the text journal coalesces keystrokes on its own schedule. So "undo"
+// means "reverse the last reflow and the last text step", which is right for the case the
+// feature exists for (type, commit, reflow) and is not a general reconciliation of two
+// independent histories. That reconciliation is the real Phase 6.
+
+// Room for the touched-page list the core hands back. A cascade touches at most its
+// 24-page bound plus one destination; a group at most 2 pages per transaction.
+const TOUCH_CAP = 64;
+
+// Everything a shell owes after the core moved objects around: drop the stale text pages
+// and cached bounds for the touched pages, re-group each one WITH OUR OWN HANDLE and refresh
+// the flow model from it (pdfe_flow_settle's contract — without it the model's object lists
+// are a guess), then re-measure the page list WITHOUT loading the new pages.
+function afterFlowMutation(touched) {
+  for (const p of touched) {
+    const tp = textPages.get(p);
+    if (tp) { F.closeTextPage(tp); textPages.delete(p); }
+    noteMutation(p);
+    dirtyPages.delete(p);            // the settle regenerated the content stream itself
+  }
+  coreGroupedPage = -1; coreGroupFresh = false;
+  const count = F.pageCount(doc);
+  let pagesChanged = false;
+  if (count !== pages.length) {
+    if (count > pages.length) {
+      const dims = mod._malloc(8);
+      for (let i = pages.length; i < count; i++) {
+        F.pageSizeAt(doc, i, dims, dims + 4);
+        const v = new Float32Array(mod.HEAPU8.buffer, dims, 2);
+        pages.push({ w: v[0], h: v[1] });
+      }
+      mod._free(dims);
+    } else {
+      pages.length = count;          // an undo took an appended page away again
+    }
+    pagesChanged = true;
+  }
+  for (const p of touched) {
+    if (p >= count) continue;        // deleted by the undo
+    groupPage(p);
+    F.flowRefresh(doc, p, acquirePage(p));
+  }
+  return pagesChanged;
+}
+
+function settleAfterCommit(page) {
+  if (!doc || !flowOn || page < 0) return null;
+
+  // I89 — SAY THAT THIS STARTED, AND SAY IT BEFORE THE FIRST SETTLE.
+  //
+  // A cascade is SLOW: measured on pennycount.pdf at 48 pt, 6.3 s from commit to
+  // `documentReflowed` for a 7 -> 8 page ripple. The user's report was not that it is slow,
+  // it is that NOTHING SAYS ANYTHING while it runs, so the page reads as hung.
+  //
+  // ⚠️ WHY A HOST INDICATOR ACTUALLY WORKS HERE, and it was worth measuring before
+  // building: the whole cost is in THIS worker. Main-thread JS during that 6.3 s is 3.9 ms
+  // (`_buildStrip` 1.7 ms plus the message dispatch 2.2 ms), so the host's own spinner
+  // paints and animates normally. Had the main thread been the blocked one, a modal would
+  // not have painted at all and this event would have been a lie.
+  //
+  // WHAT IS SLOW, so nobody optimises the wrong thing: `pdfe_flow_settle` costs 214 ms for
+  // the whole 8-page cascade. `pdfe_group_page` costs 4 588 ms of it — the settle needs a
+  // fresh grouping per page (the core does that one now), and the caller owes another one
+  // afterwards, so a dense page is grouped TWICE at ~300-600 ms a time. (Grouper VERBOSE
+  // logging was A/B measured and is NOT the cost: 4 588 ms with it, 5 082 ms without.)
+  // Making that cheaper is real work on a parity-critical pass, not a tweak.
+  //
+  // ONE EVENT NAME, ALWAYS PAIRED: `start`, then a `page` per cascade round, then `end`.
+  // A host shows its indicator on `start` and hides it on `end`, and that rule holds on
+  // every exit — including the common case where nothing moved and no `documentReflowed`
+  // is posted at all. Two names (a start event plus `documentReflowed` as the terminator)
+  // would have made the hide conditional on which of two messages arrived, which is the
+  // kind of asymmetry that leaves a spinner up for ever on the path nobody tested.
+  postMessage({ type: "documentReflowing", page, phase: "start", pagesDone: 0 });
+
+  // ROUND 0 USES OUR OWN HANDLE, exactly as pdfe_flow_settle took one; every later page the
+  // core resolves through the registry — which hands back OUR handle because acquirePage
+  // ADOPTS everything it loads. That adoption is what lets the walk see the view we paint
+  // from; without it the cascade would stop dead at its first destination (§2sexies), and
+  // flow_settle_test §6 would go red.
+  if (F.flowCascadeBegin(doc, page, acquirePage(page)) !== 1) {
+    console.warn("[pdfe] documentReflow: cascade refused to start on page", page);
+    postMessage({ type: "documentReflowing", page, phase: "end", changed: false });
+    return null;
+  }
+  const stepBuf = mod._malloc(6 * 4);
+  let rounds = 0;
+  while (F.flowCascadeStep(doc, stepBuf) === 1) {
+    const st = new Int32Array(mod.HEAPU8.buffer, stepBuf, 6);
+    ++rounds;
+    // Per-page progress. postMessage does not block the worker and the main thread is
+    // idle, so these arrive while the cascade is still running — which is what lets a host
+    // show "page 3 of 8" rather than an indeterminate spinner.
+    postMessage({ type: "documentReflowing", page, phase: "page", pagesDone: rounds,
+                  settled: st[0], pagesTotal: st[5] });
+  }
+  mod._free(stepBuf);
+  const statsBuf = mod._malloc(8 * 4);
+  const touchBuf = mod._malloc(TOUCH_CAP * 4);
+  const nTouched = F.flowCascadeEnd(doc, statsBuf, touchBuf, TOUCH_CAP);
+  const stats = Array.from(new Int32Array(mod.HEAPU8.buffer, statsBuf, 8));
+  const touched = Array.from(new Int32Array(mod.HEAPU8.buffer, touchBuf, Math.max(0, Math.min(nTouched, TOUCH_CAP))));
+  mod._free(statsBuf); mod._free(touchBuf);
+  const total = { nudged: stats[0], linesMigrated: stats[1], itemsMigrated: stats[2], pagesAdded: stats[3] };
+  const moved = !!(stats[7] & 1);
+  if (stats[7] & 2) console.warn("[pdfe] documentReflow: a settle refused inside the cascade");
+  if (stats[7] & 4) console.warn("[pdfe] documentReflow: cascade hit the core's page bound");
+
+  if (!moved) {
+    // NOTHING MOVED — the common case, and the one a paired indicator must survive. No
+    // `documentReflowed` is posted here on purpose: no geometry changed, so a host must
+    // not rebuild its strip or tell its user a reflow happened. The core still grouped the
+    // anchor page with its own text page, so our cached one is stale — drop it.
+    for (const p of touched) {
+      const tp = textPages.get(p);
+      if (tp) { F.closeTextPage(tp); textPages.delete(p); }
+      noteMutation(p);
+    }
+    coreGroupedPage = -1; coreGroupFresh = false;
+    postMessage({ type: "documentReflowing", page, phase: "end", changed: false });
+    return null;
+  }
+
+  const pagesChanged = afterFlowMutation(touched);
+  const out = { type: "documentReflowed", page, ...total, pagesChanged,
+                cascadedPages: touched, pages: pages.slice() };
+  postMessage(out);
+  postMessage({ type: "documentReflowing", page, phase: "end", changed: true });
+  return out;
+}
+
+// Reverse every flow transaction the last cascade produced — the core walks the group
+// (newest first; its own stack is LIFO) and hands back which pages it touched.
+function undoFlowGroup() {
+  if (!F.flowGroupCount(doc)) return;
+  // I89: reversing a cascade regroups every page it touched, so it costs what the cascade
+  // cost. Same start/end pairing as settleAfterCommit — the `documentReflowed` posted at the
+  // end of this function is the terminator, and there is no early return between here and
+  // it, so a host indicator cannot be stranded.
+  postMessage({ type: "documentReflowing", page: F.flowUndoPage(doc), phase: "start",
+                pagesDone: 0, undoing: true });
+  // LET GO OF THE TAIL PAGES FIRST. pdfe_delete_page refuses a page anything holds a live
+  // handle on — which is exactly the protection we want, and which this worker trips on its
+  // own: it acquires a page handle to PAINT it, so the page a reflow appended is being held
+  // by the very act of showing it to the user. Measured in the browser: the undo restored
+  // every object correctly and the extra page stayed, empty, on screen.
+  //
+  // Closing them here is safe: a page handle is a cache, and anything that still needs one
+  // re-acquires it. Only pages after the anchor are dropped, so the page being edited keeps
+  // the handle its own identity registry is scoped to. (This is the one thing the core
+  // cannot do for us — it does not own these handles — and pdfe.h says so.)
+  const anchor = F.flowUndoPage(doc);
+  if (anchor >= 0)
+    for (const k of [...pageHandles.keys()]) if (k > anchor) closePageHandles(k);
+  const infoBuf = mod._malloc(4 * 4);
+  const touchBuf = mod._malloc(TOUCH_CAP * 4);
+  F.flowUndoGroup(doc, infoBuf, touchBuf, TOUCH_CAP);
+  const info = Array.from(new Int32Array(mod.HEAPU8.buffer, infoBuf, 4));
+  const touched = Array.from(new Int32Array(mod.HEAPU8.buffer, touchBuf, Math.max(0, Math.min(info[1], TOUCH_CAP))));
+  mod._free(infoBuf); mod._free(touchBuf);
+  const pagesChanged = afterFlowMutation(touched);
+  postMessage({ type: "documentReflowed", page: touched[0] ?? 0, nudged: 0,
+                linesMigrated: 0, itemsMigrated: 0, pagesAdded: 0, undone: true,
+                pagesChanged, cascadedPages: touched, pages: pages.slice() });
+  postMessage({ type: "documentReflowing", page: touched[0] ?? 0, phase: "end",
+                changed: true, undoing: true });
+}
+
+// Replay every flow transaction the last undo reversed, OLDEST FIRST — and that order is
+// not the mirror of undoFlowGroup's, it is the opposite of it. The core owns it now (the
+// order falls out of its two stacks), and pdfe.h explains why: a cascade settles pages
+// 0,1,2 and stacks T0,T1,T2; the undo unwinds T2,T1,T0; a redo must put them back the way
+// the cascade did, and replaying newest-first would seat page 2's content on a page 1 that
+// has not yet given anything up.
+//
+// AND IT NEEDS NO HANDLE DANCE. undoFlowGroup drops the tail pages' handles first, because
+// pdfe_delete_page refuses a page anything holds a live handle on and the worker holds one
+// to paint it. A redo APPENDS instead of deleting, and appending at the tail touches no
+// existing page — so there is nothing to let go of.
+function redoFlowGroup() {
+  if (!F.flowRedoGroupCount(doc)) return;
+  // I89: same as the undo — a replay regroups every page it touched, and the
+  // `documentReflowed` at the end of this function terminates the indicator.
+  postMessage({ type: "documentReflowing", page: F.flowRedoPage(doc), phase: "start",
+                pagesDone: 0, redoing: true });
+  const infoBuf = mod._malloc(4 * 4);
+  const touchBuf = mod._malloc(TOUCH_CAP * 4);
+  F.flowRedoGroup(doc, infoBuf, touchBuf, TOUCH_CAP);
+  const info = Array.from(new Int32Array(mod.HEAPU8.buffer, infoBuf, 4));
+  const touched = Array.from(new Int32Array(mod.HEAPU8.buffer, touchBuf, Math.max(0, Math.min(info[1], TOUCH_CAP))));
+  mod._free(infoBuf); mod._free(touchBuf);
+  if (info[3])
+    // A REFUSAL IS REPORTED, NEVER RETRIED. The core refuses when a page the transaction
+    // created is no longer the tail of the document; retrying or forcing it would put a
+    // page's worth of content somewhere the user did not put it.
+    console.warn("[pdfe] documentReflow: redo refused mid-group — the replay is partial and " +
+                 "the rest of the group is left stacked");
+  const pagesChanged = afterFlowMutation(touched);
+  postMessage({ type: "documentReflowed", page: touched[0] ?? 0, nudged: 0,
+                linesMigrated: 0, itemsMigrated: 0, pagesAdded: 0, redone: true,
+                pagesChanged, cascadedPages: touched, pages: pages.slice() });
+  postMessage({ type: "documentReflowing", page: touched[0] ?? 0, phase: "end",
+                changed: true, redoing: true });
 }
 
 // ---- undo / redo ------------------------------------------------------------
@@ -973,9 +1344,26 @@ function applyHistory(kind) {
   // core anything.
   if (pendingEdit) drainLatch();
 
+  // DOCUMENT REFLOW, AND THE ORDER IS THE OPPOSITE IN EACH DIRECTION. This is the one part
+  // of redo that is NOT a mirror of undo, and getting it backwards is silent rather than
+  // loud — the replay would still report success.
+  //
+  // UNDO REVERSES THE FLOW FIRST: the reflow was caused by the text step about to be undone,
+  // so the geometry has to come back before the text that justified it disappears. Reversing
+  // it afterwards would be reversing a settle of a page that no longer looks like the one
+  // that was settled.
+  //
+  // REDO REPLAYS THE FLOW LAST, for the mirror of that reason: the transaction was recorded
+  // against POST-edit geometry, so replaying it before the text is back would replay it onto
+  // a page that does not match what was recorded.
+  const replayFlow = () => { if (!undo && flowOn && F.flowRedoGroupCount(doc)) redoFlowGroup(); };
+  if (undo && flowOn && F.flowGroupCount(doc)) undoFlowGroup();
+
   // S1. Which page? This IS canUndo — never cache a separate flag.
   const page = undo ? F.undoPage(doc) : F.redoPage(doc);
-  if (page < 0) { postHistory(true); return; }
+  // Nothing left in the TEXT journal does not mean nothing left in the FLOW one — the two
+  // are paired by convention, not reconciled — so a pending replay still runs.
+  if (page < 0) { replayFlow(); postHistory(true); return; }
 
   // S2. A session on ANOTHER page must be committed; one on this page stays
   // open, which is what makes the in-place fast path (code 2) reachable.
@@ -1044,7 +1432,23 @@ function applyHistory(kind) {
   // of what changed. Never by index: a step renumbers blocks.
   const blocks = groupPage(page);
   let selection = null;
-  if (!live && focus[2] > focus[0] && focus[3] > focus[1]) {
+  // AN IMAGE STEP FIRST. Its focus rect is the PICTURE's, and hit-testing that
+  // for a paragraph is not merely useless — a picture usually has text near or
+  // over it, so the paragraph branch below would hand the selection to an
+  // unrelated text box on every image undo. The list index is stable (nothing
+  // adds or removes image objects), so the picture is re-read, not re-found.
+  let imageStep = false;
+  if (selectedImage && selectedImage.page === page) {
+    const fresh = cachedImages(page).find((im) => im.index === selectedImage.index);
+    if (fresh) {
+      imageStep = true;
+      selectedImage = { page, index: fresh.index, bounds: fresh.bounds, quad: fresh.quad,
+                        turns: fresh.turns, flags: fresh.flags };
+      postMessage({ type: "imageSelected", page, index: fresh.index, bounds: fresh.bounds,
+                    quad: fresh.quad, turns: fresh.turns, flags: fresh.flags });
+    }
+  }
+  if (!imageStep && !live && focus[2] > focus[0] && focus[3] > focus[1]) {
     const cx = 0.5 * (focus[0] + focus[2]);
     const cy = 0.5 * (focus[1] + focus[3]);
     const hit = hitParagraph(page, cx, cy);
@@ -1058,11 +1462,17 @@ function applyHistory(kind) {
   }
 
   postMessage({
-    type: "historyApplied", kind, page, ok: true, code, live, blocks, selection,
+    type: "historyApplied", kind, page, ok: true, code, live, blocks,
+    images: imageCache.get(page) || [], selection,
     dirty, focus,
     // Present only on the live path — the shell re-seeds its sink from these.
     ...(liveState || {}),
   });
+  // …AND ONLY NOW THE FLOW REPLAY: the text is back, so the geometry the transaction was
+  // recorded against is back with it. (A text redo that FAILED deliberately does not reach
+  // here — the group stays stacked rather than being replayed onto a page that never
+  // changed.)
+  replayFlow();
   // S14/S15 (dirty flag + button state) are the SDK's half.
   postHistory(true);
 }
@@ -1080,7 +1490,24 @@ function selectPara(page, hit, xPt, yPt) {
                 blockIndex: hit.blockIndex, blockBounds: hit.blockBounds });
 }
 
+// A SELECTED PICTURE. Held beside selectedPara rather than folded into it: the
+// two answer different questions (a paragraph can be OPENED for typing, a
+// picture never can), and every existing test of `selectedPara` means "is there
+// a text box selected" and must keep meaning exactly that.
+let selectedImage = null;   // { page, index, bounds, quad, turns, flags }
+
+function selectImage(page, im) {
+  selectedImage = { page, index: im.index, bounds: im.bounds, quad: im.quad,
+                    turns: im.turns, flags: im.flags };
+  postMessage({ type: "imageSelected", page, index: im.index,
+                bounds: im.bounds, quad: im.quad, turns: im.turns, flags: im.flags });
+}
+
 function clearSelection() {
+  if (selectedImage) {
+    selectedImage = null;
+    postMessage({ type: "imageDeselected" });
+  }
   if (!selectedPara) return;
   selectedPara = null;
   postMessage({ type: "paraDeselected" });
@@ -1126,6 +1553,109 @@ function deleteParagraphAt(page, xPt, yPt) {
   renderDirtyStrip(page, strip);
   postMessage({ type: "paraDeleted", page, ok: true });
   postHistory();
+}
+
+// ---- image move + rotate (docs/IMAGE_EDIT.md) -------------------------------
+//
+// Simpler than the block path below, and worth saying why rather than leaving
+// the asymmetry looking like an oversight: a picture IS one object, so there is
+// no membership to re-resolve and no identity to pin before touching it. What
+// the two share is the rule that the SELECTION decides which thing moves, never
+// a point test — after a drop, an anchor point can sit inside several things at
+// once, and the point test then hands the next nudge to a neighbour.
+
+// The shared tail: repaint, re-group, and re-find the picture we just changed so
+// it stays selected. |before| is its rect before the change.
+function afterImageChange(page, before, kind) {
+  dirtyPages.add(page);
+  noteMutation(page);
+  const imgs = cachedImages(page);          // re-groups; restores the fresh-open gate
+  // Re-find by the rect the core reports NOW for the same list slot, then widen
+  // the repaint over both. Doing it from the fresh list rather than from our own
+  // arithmetic means a clamped move repaints where the picture actually landed.
+  const now = imgs.find((im) => im.index === selectedImage.index) || null;
+  const after = now ? now.bounds : before;
+  renderDirtyStrip(page, [
+    Math.min(before[0], after[0]), Math.min(before[1], after[1]),
+    Math.max(before[2], after[2]), Math.max(before[3], after[3]),
+  ]);
+  if (now) {
+    selectedImage = { page, index: now.index, bounds: now.bounds, quad: now.quad,
+                      turns: now.turns, flags: now.flags };
+    postMessage({ type: "imageSelected", page, index: now.index, bounds: now.bounds,
+                  quad: now.quad, turns: now.turns, flags: now.flags });
+  }
+  // The DIRTY flag is the editor's to set when this result lands — the same
+  // split every other mutation follows (see "blockMoved" in pdfe-editor.js).
+  //
+  // THE WHOLE PAGE'S PICTURE LIST TRAVELS WITH THE RESULT, not just the one that
+  // moved. The shell draws a faint outline per picture from its own cached copy,
+  // and that copy is otherwise only refreshed by the `groups` message — so after
+  // a drag the moved picture's outline stayed at its ORIGINAL position, showing
+  // up the moment the user deselected (user-reported). Sending the fresh list is
+  // what `blockMoved` already does with `blocks`, and for exactly this reason.
+  postMessage({ type: kind, page, ok: true, images: imgs,
+                bounds: now ? now.bounds : null, turns: now ? now.turns : null });
+  // AND TELL THE HOST ITS UNDO BUTTON CHANGED. The core records the step itself
+  // — a shell cannot forget that — but nothing pushes the new can-undo state to
+  // the editor except this call, and without it the engine holds a perfectly
+  // good undo entry that no button is lit for. Every other recordable mutation
+  // in this file ends the same way.
+  postHistory(true);
+}
+
+function moveSelectedImage(dx, dy) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.moveImage(doc, acquirePage(page), selectedImage.index, dx, dy, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageMoved", page, ok: false }); return; }
+  afterImageChange(page, before, "imageMoved");
+}
+
+function rotateSelectedImage(turns) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.rotateImage(doc, acquirePage(page), selectedImage.index, turns, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageRotated", page, ok: false }); return; }
+  afterImageChange(page, before, "imageRotated");
+}
+
+// DELETE THE SELECTED PICTURE (user, 2026-08-28 — this reverses the 2026-08-25
+// "image deletion is out of scope" decision; see docs/IMAGE_EDIT.md §1).
+//
+// NOT a call to afterImageChange, and the difference is the whole point: that
+// helper's job is to re-find the picture and keep it selected, and after a
+// delete there is nothing to re-find. Getting this wrong would leave the
+// selection outline and the rotate handle floating over a picture that is no
+// longer there — which is exactly defect #3 of the first image-edit pass.
+function deleteSelectedImage() {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  const index = selectedImage.index;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const dp = mod._malloc(16);
+  const ok = F.deleteImage(doc, acquirePage(page), index, dp);
+  mod._free(dp);
+  if (!ok) { postMessage({ type: "imageDeleted", page, ok: false }); return; }
+  clearSelection();                       // the picture is gone: nothing is selected
+  dirtyPages.add(page);
+  noteMutation(page);
+  const imgs = cachedImages(page);        // re-groups; the deleted one is now absent
+  renderDirtyStrip(page, before);         // repaint exactly where it was
+  // The whole page's picture list travels with the result, for the same reason
+  // afterImageChange sends it: the shell draws its faint outlines from a cached
+  // copy, and without a fresh list the deleted picture keeps its outline.
+  postMessage({ type: "imageDeleted", page, ok: true, images: imgs });
+  postHistory(true);                      // …and light the undo button
 }
 
 // ---- block move (drag a text box to a new position) -------------------------
@@ -1248,6 +1778,94 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
 // line-preserving), 0 force reflow, 1 force line-preserving. Re-groups only
 // when the fresh-open gate demands it, then hit-tests the refreshed cache so
 // the index it opens always matches the core's own grouping slot.
+// ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------------
+//
+// An ARMED mode, never a heuristic on an existing tap. tap-on-empty = deselect and
+// tap-outside = commit are both load-bearing, so the arm sits in FRONT of the tap
+// routing and is CONSUMED by the tap it serves — one placement per arming, which is
+// also what makes the host's button state unambiguous.
+let addTextArmed = false;
+// The host's default look for new text (user decision 2026-08-24: "it will be on host
+// how he will provide this data"). Held here rather than passed per placement because
+// there is no placement CALL from the host — the gesture is a tap.
+let newTextStyle = { fontName: null, sizePt: 0, colorArgb: 0 };
+
+// AN ARM REPORTS ITSELF, ON ARM *AND* ON DISARM (parity rule 14 / I76). A host paints
+// its button from this; a spent arm that never reported would leave the button lit and
+// the next tap would do something the user did not ask for.
+function setAddTextArmed(on) {
+  const next = !!on;
+  if (next === addTextArmed) return;
+  addTextArmed = next;
+  postMessage({ type: "addTextArmed", armed: addTextArmed });
+}
+
+const SPEC_BYTES = 32;   // PdfeNewBoxSpec: 2 x u32, 3 x f32, ptr, f32, u32
+
+// Place a NEW box at (xPt, yPt) and open it for typing. The shell then behaves exactly
+// as it does for any open run — same "editOpened" message, same caret, same blue box —
+// because after this call the session IS an ordinary session.
+function placeNewBoxAt(page, xPt, yPt) {
+  // The core's fresh-open gate wants a current grouping, and its page pin reads it.
+  ensureCoreGroup(page);
+  const sp = mod._malloc(SPEC_BYTES);
+  try {
+    const u32v = new Uint32Array(mod.HEAPU8.buffer, sp, 2);
+    u32v[0] = SPEC_BYTES;
+    u32v[1] = 1;                                   // PDFE_NEW_TEXT
+    const f32v = new Float32Array(mod.HEAPU8.buffer, sp + 8, 3);
+    f32v[0] = xPt; f32v[1] = yPt;
+    f32v[2] = 0;                                   // page-bounded wrap (tap-to-place)
+    // The seed FACE resolves through this document's handle map, exactly as a sticky
+    // typeface pick does. A name with nothing to resolve to here is not an error — the
+    // core falls back to its standard-14 floor, which is the same face on every
+    // platform, so the host still gets a predictable result rather than a refusal.
+    const h = newTextStyle.fontName
+      ? (fontHandles.get(newTextStyle.fontName) || 0) : 0;
+    new Uint32Array(mod.HEAPU8.buffer, sp + 20, 1)[0] = h;
+    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] = newTextStyle.sizePt || 0;
+    new Uint32Array(mod.HEAPU8.buffer, sp + 28, 1)[0] = (newTextStyle.colorArgb || 0) >>> 0;
+    const ed = F.editBeginNew(doc, acquirePage(page), textPageOf(page), sp);
+    if (!ed) {
+      // The core refuses an off-page point (and a stale grouping). Say so rather than
+      // leaving the host wondering why its armed tap did nothing.
+      postMessage({ type: "error", code: "add-text-refused", page, xPt, yPt });
+      return;
+    }
+    editor = ed;
+    editPage = page;
+    // The "am I inside the open run" rect the tap router uses. At zero characters this
+    // is the caret's own zero-width box (S66) — a later tap is therefore outside it and
+    // commits, which is right: an empty box the user taps away from evaporates.
+    const c0 = readCaret(-1);
+    editParaBounds = c0 ? [c0[0], c0[2], c0[0], c0[1]] : [xPt, yPt, xPt, yPt];
+    // A fresh session carries no pick in flight, for the same reason openEditorAt
+    // clears these: an armed index names a spot in a run that no longer exists.
+    typingColorArmedAt = -1;
+    typingFontArmedAt = -1;
+    typingFontArmedName = null;
+    postMessage({
+      type: "editOpened",
+      page,
+      paraIndex: -1,          // it owns no paragraph in the cached grouping yet…
+      blockIndex: -1,         // …and no block, so there is no faint box to hide
+      // CREATED, rather than a second event firing at the same moment as this one and
+      // carrying nothing it lacks. A host that wants to know "this is a NEW box" reads
+      // the flag; everything else about entering edit mode is already this message.
+      created: true,
+      text: "",
+      caretIndex: 0,
+      caret: readCaret(0),
+      runBounds: readRunBounds(0),
+      isParagraph: F.editIsPara(editor) === 1,
+      linePreserve: F.editLineMode(editor) === 1,
+      style: readRangeStyle(0, 0),
+    });
+  } finally {
+    mod._free(sp);
+  }
+}
+
 function openEditorAt(page, xPt, yPt, lineMode) {
   ensureCoreGroup(page);
   const hit = hitParagraph(page, xPt, yPt);
@@ -1669,7 +2287,8 @@ function drainLatch() {
     const page = groupQueue.shift();
     groupQueued.delete(page);
     if (doc && canvases.has(page)) {
-      postMessage({ type: "groups", page, blocks: cachedGroups(page) });
+      postMessage({ type: "groups", page, blocks: cachedGroups(page),
+                    images: cachedImages(page) });
     }
   }
   if (tileQueue.length || paintQueue.length || groupQueue.length || pendingEdit) {
@@ -1739,7 +2358,8 @@ onmessage = async (e) => {
       for (const p of pageHandles.values()) F.closePage(p);
       pageHandles.clear(); canvases.clear(); paintGen.clear(); pageScale.clear();
       tileQueue.length = 0; paintQueue.length = 0; pendingEdit = null;
-      groupQueue.length = 0; groupQueued.clear(); groupCache.clear();
+      groupQueue.length = 0; groupQueued.clear(); groupCache.clear(); imageCache.clear();
+      flowGroups = []; flowRedoGroups = [];   // the flow stacks died with the document
       coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
       // Font handles are DOCUMENT-owned (pdfe_close_doc frees them), so the registry
       // must not outlive the doc — a stale handle applied to the next file is a
@@ -1798,6 +2418,24 @@ onmessage = async (e) => {
     // accumulates inactive objects until the journal is cleared. Must be enabled
     // BEFORE the first edit — enabling later starts an empty journal.
     F.historySetEnabled(doc, 1);
+    // DOCUMENT REFLOW, opt-in per open. Enabling BUILDS THE MODEL, which groups every
+    // page — so it must happen here, before anything is edited: grouping moves the
+    // identity scope, and doing it later would wipe the pin the edit session is relying
+    // on. It also arms doc-wide id allocation, which has to precede the first mint.
+    flowOn = !!msg.documentReflow;
+    if (flowOn) {
+      const t0 = performance.now();
+      const built = F.flowEnable(doc, 1);
+      // The build left the core's one-slot grouping pointing at the LAST page it
+      // touched, so our own cache must not believe it holds page 0.
+      coreGroupedPage = -1; coreGroupFresh = false;
+      groupCache.clear(); imageCache.clear();
+      for (const tp of textPages.values()) F.closeTextPage(tp);
+      textPages.clear();
+      flowOn = built === 1;
+      console.log(`[pdfe] documentReflow: model ${flowOn ? "built" : "FAILED"} in ` +
+                  `${Math.round(performance.now() - t0)} ms`);
+    }
     const n = F.pageCount(doc);
     const dims = mod._malloc(8);
     // Measure WITHOUT loading pages: FPDF_LoadPage makes the document retain
@@ -1913,6 +2551,16 @@ onmessage = async (e) => {
     // SELECTED (not opened — select-then-act). Tapping the already-selected
     // paragraph a second time is the shortcut into editing.
     if (!doc) return;
+    // ADD TEXT: the arm outranks every branch below and is CONSUMED here. Placed
+    // before the "inside the open run" test on purpose — while armed, a tap means
+    // "put a box here", even if it lands inside the box being edited.
+    if (addTextArmed) {
+      setAddTextArmed(false);            // spent, and reported spent
+      if (editor) commitEditor();        // tap-outside-commits still holds
+      clearSelection();
+      placeNewBoxAt(msg.page, msg.xPt, msg.yPt);
+      return;
+    }
     if (editor && msg.page === editPage && editParaBounds &&
         msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
         msg.yPt >= editParaBounds[1] && msg.yPt <= editParaBounds[3]) {
@@ -1921,8 +2569,17 @@ onmessage = async (e) => {
       return;
     }
     if (editor) commitEditor();   // tap outside / another paragraph: commit first
-    const hit = hitParagraph(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
-    if (!hit) { clearSelection(); return; }   // empty space: just deselect
+    const item = hitItem(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
+    if (!item) { clearSelection(); return; }   // empty space: just deselect
+    if (item.kind === "image") {
+      // A picture has no second-tap-to-edit: there is nothing to open. Tapping
+      // the selected one again simply keeps it selected.
+      const same = selectedImage && selectedImage.page === msg.page &&
+                   selectedImage.index === item.image.index;
+      if (!same) { clearSelection(); selectImage(msg.page, item.image); }
+      return;
+    }
+    const hit = item.para;
     const again = selectedPara &&
       selectedPara.page === msg.page && selectedPara.index === hit.index;
     clearSelection();
@@ -1950,7 +2607,14 @@ onmessage = async (e) => {
   }
 
   if (msg.type === "deleteSelected") {
-    if (!doc || !selectedPara) return;
+    if (!doc) return;
+    // ROUTED BY WHAT IS SELECTED, deliberately reusing the ONE message rather
+    // than adding a second: "delete what I picked" is the same host intent
+    // either way, and a new bridge command would be surface every shell has to
+    // learn for no gain. A picture and a paragraph can never both be selected
+    // (selecting either clears the other), so there is no ambiguity to resolve.
+    if (selectedImage) { deleteSelectedImage(); return; }
+    if (!selectedPara) return;
     const { page, xPt, yPt } = selectedPara;
     clearSelection();
     deleteParagraphAt(page, xPt, yPt);
@@ -1959,6 +2623,42 @@ onmessage = async (e) => {
 
   if (msg.type === "deselect") {
     clearSelection();
+    return;
+  }
+
+  // ---- IMAGE EDIT (docs/IMAGE_EDIT.md) -------------------------------------
+  if (msg.type === "moveImage") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageMoved", ok: false }); return; }
+    moveSelectedImage(Number(msg.dx) || 0, Number(msg.dy) || 0);
+    return;
+  }
+  if (msg.type === "rotateImage") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
+    rotateSelectedImage(Number(msg.turns) || 0);
+    return;
+  }
+  if (msg.type === "imageMoveLimits") {
+    if (!doc || !selectedImage) return;
+    ensureCoreGroup(selectedImage.page);
+    const lp = mod._malloc(16);
+    const ok = F.imageMoveLimits(doc, acquirePage(selectedImage.page),
+                                 selectedImage.index, lp);
+    const limits = ok ? readF32(lp, 4) : null;
+    mod._free(lp);
+    if (limits) postMessage({ type: "moveLimits", limits });
+    return;
+  }
+
+  // ---- ADD TEXT ------------------------------------------------------------
+  if (msg.type === "armAddText") { setAddTextArmed(true); return; }
+  if (msg.type === "cancelAddText") { setAddTextArmed(false); return; }
+  if (msg.type === "setNewTextStyle") {
+    // Every field is optional and independent, so a host can set only the colour and
+    // leave the face and size on the core's floor. null/0 means "not specified".
+    if ("fontName" in msg) newTextStyle.fontName = msg.fontName || null;
+    if ("sizePt" in msg) newTextStyle.sizePt = Number(msg.sizePt) || 0;
+    if ("colorArgb" in msg)
+      newTextStyle.colorArgb = msg.colorArgb == null ? 0 : (msg.colorArgb >>> 0);
     return;
   }
 
@@ -2065,7 +2765,11 @@ onmessage = async (e) => {
     // front of paints, tiles, or a tap.
     if (!doc) return;
     const cached = groupCache.get(msg.page);
-    if (cached) { postMessage({ type: "groups", page: msg.page, blocks: cached }); return; }
+    if (cached) {
+      postMessage({ type: "groups", page: msg.page, blocks: cached,
+                    images: imageCache.get(msg.page) || [] });
+      return;
+    }
     requestGroupJob(msg.page);
     return;
   }

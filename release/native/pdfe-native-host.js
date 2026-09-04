@@ -85,7 +85,25 @@ export function attachNativeHost(editor, opts = {}) {
   // a keyboard whose keys do nothing.
   for (const ev of ["ready", "opened", "editmode", "select", "editopen", "editclose",
                     "deleted", "moved", "dirty", "zoom", "page", "history", "styled",
-                    "selection", "inputRejected", "error", "fontsReady"]) {
+                    "selection", "inputRejected", "error", "fontsReady",
+                    // IMAGE ROTATION (2026-09-03). `moved` was forwarded and its twin `rotated`
+                    // was not — a real one-line gap the parity gate had flagged for as long
+                    // as image edit existed. A native shell that hears `moved` but not
+                    // `rotated` cannot tell a picture was turned.
+                    "rotated",
+                    // DOCUMENT REFLOW (2026-09-03). Forwarded the day the cascade moved into
+                    // the shared core and Android learned to drive it — the three events
+                    // were declared web-only in the parity gate until then, and this list is
+                    // the ONLY way iOS hears about a reflow at all: a native shell needs
+                    // `documentReflowing` to show that a multi-second settle is running,
+                    // `documentReflowed` to know geometry moved, and `pagesChanged` to grow
+                    // its own page list when a page is appended or taken away again.
+                    "documentReflowing", "documentReflowed", "pagesChanged",
+                    // ADD TEXT (docs/ADD_TEXT.md). Forwarded in the SAME change as the
+                    // armAddText command, deliberately: telling a native shell that the
+                    // mode is armed while giving it no way to arm or cancel would be a
+                    // worse shape than a declared gap.
+                    "addtextarmed"]) {
     editor.on(ev, (detail) => emit(ev, detail));
   }
   if (opts.telemetry) editor.on("edit", (d) => emit("edit", d));
@@ -103,12 +121,21 @@ export function attachNativeHost(editor, opts = {}) {
      * code `password-required` (none supplied) or `password-wrong` (supplied and
      * refused) — the native side raises ITS OWN prompt and calls `open` again
      * with the same url plus the password. Nothing here stores it.
+     *
+     * `documentReflow` (optional, DEFAULT TRUE since 2.2.0) — DOCUMENT REFLOW for this
+     * open: a commit re-settles the page and the overflow ripples through the
+     * document, appending a page when it must. Omitted, the web SDK's own default
+     * applies (on); pass `false` to keep the pre-2.2.0 behaviour for one open. The same
+     * default on web and Android — a default that differs on one platform is the
+     * asymmetry the parity gate exists to catch. Its three events are forwarded (see
+     * the list above).
      */
-    open: async ({ url, name, password }) => editor.open(url, { name, password }),
+    open: async ({ url, name, password, documentReflow }) =>
+      editor.open(url, { name, password, documentReflow }),
 
     /** Fallback path for small documents when no scheme handler is available. */
-    openBase64: async ({ data, name, password }) =>
-      editor.open(fromBase64(data), { name, password }),
+    openBase64: async ({ data, name, password, documentReflow }) =>
+      editor.open(fromBase64(data), { name, password, documentReflow }),
 
     /**
      * Commit + save. Returns the sizes only; the BYTES are pulled afterwards
@@ -301,6 +328,76 @@ export function attachNativeHost(editor, opts = {}) {
      */
     setBlockMove: ({ on } = {}) => ({ blockMove: editor.setBlockMove(!!on) }),
 
+    // ---- THE SELECTION VERBS (2026-09-03) — the box lifecycle a native shell can
+    // DRIVE, not only hear about. `select`/`deleted`/`moved` reached this bridge in
+    // 2026-08-13, and every one of the verbs behind them stayed web-and-Android only:
+    // an iOS product could show its own Delete button from the `select` event and had
+    // no command to wire it to. The SDK's own in-page bar covers the finger; these
+    // cover the host's chrome — which is the whole point of the chrome-free surface.
+    //
+    // `deleteSelection` and `clearSelection` route by WHAT IS SELECTED (a text box or
+    // a picture), exactly as on web — no second Delete for pictures, by design
+    // (docs/IMAGE_EDIT.md §6).
+    deleteSelection: () => { editor.deleteSelection(); return {}; },
+    clearSelection: () => { editor.clearSelection(); return {}; },
+    /** Nudge the selected TEXT box by (dx, dy) PDF points (the drag's programmatic form). */
+    moveSelection: ({ dx, dy } = {}) => { editor.moveSelection(Number(dx) || 0, Number(dy) || 0); return {}; },
+    // ---- IMAGE EDIT (docs/IMAGE_EDIT.md) — a picture's two verbs. Both return
+    // `{ok:false}` harmlessly when the selection is text or empty, so a shell may wire
+    // its buttons unconditionally and branch its LABELS on `state.selectionKind`.
+    /** Turn the selected picture by `turns` x 90 degrees, clockwise when positive. */
+    rotateSelection: ({ turns } = {}) => ({ ok: editor.rotateSelection(turns == null ? 1 : Number(turns)) }),
+    /** Move the selected picture by (dx, dy) PDF points; the engine clamps it to the page. */
+    moveImageSelection: ({ dx, dy } = {}) => ({ ok: editor.moveImageSelection(Number(dx) || 0, Number(dy) || 0) }),
+
+    // ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------
+    // Placing a NEW text box where the document has none. An ARMED mode, so this is
+    // two commands and a report rather than one "insert" call: the SDK cannot know
+    // where the user wants the box, and the tap that decides is a gesture inside the
+    // web view, not something a native shell can pass as coordinates.
+    //
+    // WHY IT MATTERS THAT THESE EXIST AT ALL: iOS drives this bridge and NEVER the JS
+    // API. Without them the feature is present in the bundle an iPhone is already
+    // running and unreachable from it — the 1.6.0 password shape exactly, one feature
+    // over (docs/CONSUMER_CONTRACT.md).
+
+    /**
+     * Arm ADD TEXT: the next tap in the page area creates an empty text box there with
+     * the caret inside it, and the arm is spent. Typing, styling, undo, save and
+     * dragging then behave as they do in any other box.
+     *
+     * Nothing is created until a character is typed — a box the user places and taps
+     * away from evaporates, leaving no object and no undo step. Turns edit mode on if
+     * it is off, because placing text is editing.
+     *
+     * Watch the `addtextarmed` event for the state, INCLUDING the disarm that the
+     * placing tap performs — a button driven by your own click handler will go stale.
+     */
+    // ⚠️ RETURNS ONLY `ok`, AND THAT IS DELIBERATE. An earlier version also returned
+    // `addingText`, and it LIED: arming round-trips through the worker, so the field
+    // still reads false when this returns, and a shell trusting the result would decide
+    // the arm had failed. The `addtextarmed` event is the truth; `state` is the re-sync.
+    // Measured through this bridge, not reasoned about.
+    armAddText: () => ({ ok: editor.armAddText() }),
+
+    /** Disarm ADD TEXT without placing anything. Safe when not armed. */
+    cancelAddText: () => { editor.cancelAddText(); return {}; },
+
+    /**
+     * The default look for text created by `armAddText`. Every field is optional and
+     * independent, so sending only `color` leaves the face and size alone. `font` is a
+     * family name you loaded with `loadFont` (or a standard-14 name); one this document
+     * cannot resolve falls back to the built-in Helvetica rather than failing.
+     */
+    setNewTextStyle: ({ font, size, color } = {}) => {
+      const style = {};
+      if (font !== undefined) style.font = font;
+      if (size !== undefined) style.size = size;
+      if (color !== undefined) style.color = color;
+      editor.setNewTextStyle(style);
+      return {};
+    },
+
     /** Go to a 0-based page. `ok:false` in the result means out of range. */
     goToPage: ({ page }) => ({ ok: editor.goToPage(Number(page)), page: editor.currentPage }),
     /** Deprecated alias kept for shells built against the older bridge. */
@@ -341,6 +438,14 @@ export function attachNativeHost(editor, opts = {}) {
       zoom: editor.zoom, editMode: editor.editMode, blockMove: editor.blockMove,
       dirty: editor.dirty, editing: editor.editing, selection: editor.selection,
       textSelection: editor.textSelection, textStyle: editor.textStyle,
+      // ADD TEXT: the fifth editing state. A shell that reloads its web view has no
+      // event history to replay, so every state a toolbar branches on must be askable.
+      addingText: editor.addingText,
+      // WHAT KIND is selected — "text", "image" or null — and the picture itself
+      // (docs/IMAGE_EDIT.md). The sixth state: a toolbar shows Edit for a text box and
+      // Rotate for a picture, and `selection` alone cannot tell them apart.
+      selectionKind: editor.selectionKind,
+      imageSelection: editor.imageSelection,
       capabilities: editor.capabilities,
       documentName: editor.documentName, documentBytes: editor.documentBytes,
       suggestedName: editor.suggestedName(),

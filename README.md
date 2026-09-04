@@ -4,7 +4,7 @@ Built artifacts only, generated from the private source repo. Two sites:
 
 | Path | Built from | Use it to |
 | --- | --- | --- |
-| `release/` | the **published** npm package `@muhammad-ishfaq-imaginationai/pdfe-editor` | test a release the way a consumer gets it |
+| `release/` | the **published** npm package `@muhammadishfaq-wq/pdfe-editor` | test a release the way a consumer gets it |
 | `dev/` | the working tree (**unreleased**) | look at work in progress before it ships |
 
 A PDF text editor that edits the REAL text layer in your browser: rendering and

@@ -26,6 +26,17 @@ const PDFE_STYLE_ID = "pdfe-editor-styles";
 // CSS fallback, the option default and the docs cannot drift apart.
 const PDFE_DEFAULT_BG = "#f8f9fb";
 
+// imageRotateControl's vocabulary (docs/IMAGE_EDIT.md). The SAME four words on web,
+// Android (PdfeEditorView.ROTATE_CONTROL_*) and the iOS bridge — one behaviour, one
+// spelling, so a cross-platform product configures it once.
+const PDFE_ROTATE_CONTROLS = ["both", "handle", "bar", "none"];
+
+// THE THREE MODES (docs/annotations/12-VOCABULARY.md). Peers, never combinable --
+// two booleans can express "annotate && !annotate", three named values cannot (D9).
+// The SAME three words on web, Android (PdfeMode.wire) and the iOS bridge; the parity
+// gate asserts the three spellings are identical.
+const PDFE_MODES = ["view", "text", "annotate"];
+
 // Double-tap / double-click word select. 350 ms matches the pinch-suppression
 // window already used in the tap path; 20 px is generous enough for a fingertip
 // yet far below a deliberate second tap on a different word.
@@ -139,6 +150,8 @@ const PDFE_CSS = `
                        border-radius: 6px; padding: 8px 12px; cursor: pointer;
                        touch-action: manipulation; }
 .pdfe-actions button:hover { background: #3f51b51f; }
+.pdfe-actions .pdfe-act-rotate { color: #1a237e; }
+.pdfe-actions .pdfe-act-rotate:hover { background: #1a237e1f; }
 .pdfe-actions .pdfe-act-del { color: #c62828; }
 .pdfe-actions .pdfe-act-del:hover { background: #c628281f; }
 .pdfe-caret { position: absolute; width: 2px; background: #000; z-index: 1;
@@ -266,17 +279,13 @@ export class PdfeEditor {
     // it can still be switched back with one flag and no redeploy of this SDK
     // (docs/BLOCK_MOVE.md).
     this._blockMove = opts.blockMove ?? true;
-    /* DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md) — DEFAULT ON since 2.2.0 (user
-     * directive 2026-09-03: the release ships with reflow on). Off means a commit
-     * re-settles nothing and text may hang past the page bottom, exactly as before
-     * 2.2.0 — `documentReflow: false` restores that. Read as `?? true`, like
-     * blockMove, so an explicit false is respected, never overridden.
-     * The name is `documentReflow`, never `reflow`: that word already means the
-     * line-mode wrap inside one paragraph, and one word with two meanings in one API
-     * is a support ticket waiting to happen. When on, committing an edit re-settles the
-     * page — content below a grown paragraph moves down, and overflow migrates to the
-     * next page, appending one if there is nowhere to put it. */
-    this._documentReflow = opts.documentReflow ?? true;
+    // WHERE THE ROTATE CONTROL LIVES — the host's choice (user decision 2026-09-15):
+    // "both" (the default), "handle" (on the picture), "bar" (in the action bar) or
+    // "none". The same four words on web, Android and the iOS bridge, deliberately,
+    // so a product configures one behaviour rather than three. rotateSelection()
+    // works at every setting including "none", so a host can own the chrome entirely.
+    this._imageRotateControl = PDFE_ROTATE_CONTROLS.includes(opts.imageRotateControl)
+      ? opts.imageRotateControl : "both";
     // ADD TEXT: armed between armAddText() and the tap that places a box.
     // Read by _tapWantsKeyboard, which must answer synchronously inside the
     // gesture for iOS to raise a keyboard at all (S39).
@@ -296,6 +305,7 @@ export class PdfeEditor {
 
     // ---- document/view state --------------------------------------------------
     this._pages = [];            // [{w,h}] PDF points
+    this._pageMatrices = new Map(); // page -> the engine's display map, only for pages that need one (I99)
     this._painted = new Set();   // pages already painted at the current zoom
     this._livePages = new Set(); // pages whose canvas holds a bitmap (any zoom) —
                                  // the eviction sweep's working set (7000-page
@@ -312,7 +322,16 @@ export class PdfeEditor {
     this._dirty = false;
 
     // ---- edit state -----------------------------------------------------------
-    this._editMode = false;
+    // THE MODE IS THE ONE STORED VALUE, and `editMode` is derived from it
+    // (docs/annotations/12-VOCABULARY.md). There is deliberately no `_editMode`
+    // field: `editMode === (mode === "text")` must hold in BOTH directions forever,
+    // and two fields that must agree is the bug, not the fix -- the shape that left
+    // undo dead on Android for a whole release (I79).
+    //
+    // The initial value is asserted against Android's PdfeMode.VIEW by
+    // check_platform_parity.mjs rule 13: a default that drifts on ONE platform is
+    // the asymmetry nobody notices.
+    this._mode = "view";
     this._editingPage = -1;
     this._editingParaIndex = -1;
     // The BLOCK the open paragraph lives in — the box hidden while editing. A
@@ -414,7 +433,9 @@ export class PdfeEditor {
   get documentBytes() { return this._docBytes; }
   get dirty() { return this._dirty; }
   get zoom() { return this._zoom; }
-  get editMode() { return this._editMode; }
+  get mode() { return this._mode; }
+  /** `true` exactly while the mode is `"text"`. Derived -- see `_mode`. */
+  get editMode() { return this._mode === "text"; }
   /** Live edit session (null when nothing is open). */
   get editing() {
     if (this._editingPage < 0) return null;
@@ -468,12 +489,8 @@ export class PdfeEditor {
                       recording: false };
     this._closeEditUiState();
     const p = this._promiseFor("open");
-    // documentReflow is decided PER OPEN as well as per instance: enabling it builds a
-    // model over every page, which is work a host may not want on every document.
-    const wantFlow = opts.documentReflow ?? this._documentReflow;
-    this._documentReflow = wantFlow;
     this._post({ type: "open", blob, tier: opts.tier || 0, blockKB: opts.blockKB || 0,
-                 password: opts.password || "", documentReflow: !!wantFlow });
+                 password: opts.password || "" });
     return p;
   }
 
@@ -542,12 +559,42 @@ export class PdfeEditor {
    */
   setEditMode(on) {
     on = !!on;
-    if (this._editMode === on || this._destroyed) return;
-    this._editMode = on;
-    if (on) {
+    // Guard on the DERIVED value, so that setEditMode(false) while the mode is
+    // "annotate" is a no-op rather than a mode change: edit mode is already off,
+    // and a legacy toggle must not silently drag a host out of a mode it chose.
+    if (this.editMode === on) return;
+    this.setMode(on ? "text" : "view");
+  }
+  toggleEditMode() { this.setEditMode(!this.editMode); }
+
+  /**
+   * SET THE MODE: `"view"` | `"text"` | `"annotate"`
+   * (docs/annotations/12-VOCABULARY.md). This is the ONE funnel -- `setEditMode` and
+   * `toggleEditMode` both come through here, so the mode and `editMode` cannot
+   * disagree.
+   *
+   * `"annotate"` is DECLARED AND INERT. Setting it is legal, `mode` reads it back,
+   * and it behaves in every other respect exactly like `"view"` -- no tool, no marks,
+   * no gesture. The behaviour lands at roadmap step 13; the value is here now so the
+   * vocabulary ships once and a host's switch is written once.
+   *
+   * An unrecognised value is IGNORED rather than thrown, the same way
+   * `setImageRotateControl` ignores one: nothing crosses this SDK's boundary as an
+   * exception.
+   */
+  setMode(next) {
+    if (!PDFE_MODES.includes(next) || this._destroyed) return;
+    const previous = this._mode;
+    if (previous === next) return;
+    const wasText = previous === "text", isText = next === "text";
+    this._mode = next;
+    // THE TEXT-EDITING SEAM. Only a change in text-ness does any work -- every other
+    // transition (view <-> annotate) is state plus events, which is exactly why this
+    // step is a no-op. Step 13 hangs annotate's own enter/leave off this branch.
+    if (isText) {
       this._sweepVisible();
-    } else {
-      // Turning edit mode off is leaving box editing, keyboard included.
+    } else if (wasText) {
+      // Leaving text mode is leaving box editing, keyboard included.
       this.getOutOfBoxEditing();
       this._post({ type: "deselect" });
       this._selected = null;
@@ -557,9 +604,21 @@ export class PdfeEditor {
       this._groupsPending.clear();
       this._renderBoxes();
     }
-    this._emit("editmode", { editMode: on });
+    // `editmode` FIRST, unchanged in payload and in timing, so a host that has never
+    // heard of modes observes exactly the sequence it observed before. `mode` is the
+    // additive one.
+    //
+    // KNOWN, PRE-EXISTING HAZARD, not introduced here: a listener that re-enters
+    // setMode during this emit completes the inner transition first, so the outer
+    // frame then emits a payload naming a mode that is no longer current. `editmode`
+    // has behaved this way since it was written (measured). Suppressing it would be a
+    // behaviour change, and this step must have none -- recorded for step 13.
+    if (isText !== wasText) this._emit("editmode", { editMode: isText });
+    // canDiscard is ALWAYS false until discardModeChanges() exists (step 13/14). It is
+    // in the payload from day one because the vocabulary froze this shape, and because
+    // adding it later would cost Android a third onModeChanged overload.
+    this._emit("mode", { mode: next, previous, canDiscard: false });
   }
-  toggleEditMode() { this.setEditMode(!this._editMode); }
 
   /**
    * LEAVE BOX EDITING — the programmatic form of tapping outside the box, and
@@ -687,6 +746,30 @@ export class PdfeEditor {
    * and the default is OFF). Turning it off disarms the gesture and makes
    * `moveSelection()` a no-op; it does not undo a move already applied.
    */
+  /** Where the rotate control lives: "both" | "handle" | "bar" | "none". */
+  get imageRotateControl() { return this._imageRotateControl; }
+
+  /**
+   * Move the rotate control, or take it away. An unrecognised value is ignored
+   * rather than thrown — nothing crosses this SDK's boundary as an exception.
+   */
+  setImageRotateControl(where) {
+    if (!PDFE_ROTATE_CONTROLS.includes(where)) return;
+    this._imageRotateControl = where;
+    // Hide it NOW rather than at the next render: a host that switches the control
+    // off while a picture is selected must not be left looking at the old one.
+    if (this.rotateBtn) this.rotateBtn.style.display = "none";
+    this._renderBoxes();
+  }
+
+  _rotateHandleShown() {
+    return this._imageRotateControl === "both" || this._imageRotateControl === "handle";
+  }
+
+  _rotateBarShown() {
+    return this._imageRotateControl === "both" || this._imageRotateControl === "bar";
+  }
+
   setBlockMove(on) {
     this._blockMove = !!on;
     if (!this._blockMove && this._draggingBox) {
@@ -727,7 +810,7 @@ export class PdfeEditor {
    * set you get Helvetica 12pt black, which resolves identically on every platform.
    */
   armAddText() {
-    if (!this._editMode) this.setEditMode(true);   // placing text IS editing
+    if (!this.editMode) this.setEditMode(true);   // placing text IS editing
     this._post({ type: "armAddText" });
     return true;
   }
@@ -963,7 +1046,7 @@ export class PdfeEditor {
    * `name` is the identity you apply by — your own label, not a filename. Pass
    * `bytes` (ArrayBuffer/TypedArray) to embed a real font, or omit it to load a
    * standard-14 face by its PDF name ("Helvetica", "Times-Bold", "Courier-Oblique"…).
-   * Embedded faces auto-embed on save.
+   * A loaded face is written into the saved file only once text uses it.
    *
    * REGISTER EVERY VARIANT YOU WANT TO OFFER. `applyBold`/`applyItalic` resolve the
    * SIBLING FACE of the family already under the cursor, and refuse when that face
@@ -1120,6 +1203,31 @@ export class PdfeEditor {
   get canUndo() { return this._history.canUndo; }
   /** True when there is something to redo. */
   get canRedo() { return this._history.canRedo; }
+
+  /**
+   * EVERY STATE IN ONE CALL (V2, 2026-09-29) — what a host reads after its own UI was
+   * rebuilt (a route change, a web-view reload) instead of asking a dozen getters one by one.
+   * The native bridge's `state` command returns exactly this object, so an iOS shell reads
+   * what a web host reads. Pure: it reads cached state only, never the worker, and it answers
+   * with no document open (`pageCount: 0`, `mode: "view"`). A fresh object each call.
+   */
+  state() {
+    return {
+      pageCount: this.pageCount, page: this.currentPage,
+      zoom: this.zoom, editMode: this.editMode, blockMove: this.blockMove,
+      mode: this.mode,
+      dirty: this.dirty, editing: this.editing, selection: this.selection,
+      textSelection: this.textSelection, textStyle: this.textStyle,
+      addingText: this.addingText,
+      selectionKind: this.selectionKind,
+      imageSelection: this.imageSelection,
+      imageRotateControl: this.imageRotateControl,
+      capabilities: this.capabilities,
+      documentName: this.documentName, documentBytes: this.documentBytes,
+      suggestedName: this.suggestedName(),
+      canUndo: this.canUndo, canRedo: this.canRedo,
+    };
+  }
   /** 0-based page the next undo would affect, or -1. Lets a host label the button. */
   get undoPage() { return this._history.undoPage; }
   /** 0-based page the next redo would affect, or -1. */
@@ -1464,7 +1572,12 @@ export class PdfeEditor {
     this.deleteBtn.type = "button";
     this.editBtn.textContent = "✎ Edit";
     this.deleteBtn.textContent = "🗑 Delete";
-    this.actionsEl.append(this.editBtn, this.deleteBtn);
+    // The BAR form of rotation (imageRotateControl "bar" / "both"). The handle above
+    // is the same verb in the other place; a host picks which it wants, or neither.
+    this.rotateBarBtn = mk("button", "pdfe-act-rotate");
+    this.rotateBarBtn.type = "button";
+    this.rotateBarBtn.textContent = "⟳ Rotate";
+    this.actionsEl.append(this.editBtn, this.rotateBarBtn, this.deleteBtn);
     this.sink = mk("textarea", "pdfe-sink");
     for (const [k, v] of Object.entries({
       autocapitalize: "off", autocomplete: "off", autocorrect: "off",
@@ -1574,6 +1687,7 @@ export class PdfeEditor {
       }
       case "opened": {
         this._pages = msg.pages;
+        this._pageMatrices.clear();
         this._buildStrip();
         const info = {
           pages: msg.pages.length, pageSizes: this.pages, bytes: msg.bytes,
@@ -1582,58 +1696,6 @@ export class PdfeEditor {
         };
         this._settle("open", true, info);
         this._emit("opened", info);
-        break;
-      }
-      case "documentReflowing":
-        // I89 — THE ONLY SIGNAL A HOST GETS WHILE A REFLOW IS RUNNING, and the reason it
-        // exists: a cascade on a dense document takes SECONDS (measured 6.3 s on
-        // pennycount.pdf for a 7 -> 8 page ripple) and until now the SDK said nothing at
-        // all between the commit and the end, so the page read as hung. The user asked for
-        // a dialog; this is the event a host builds one from.
-        //
-        // ⚠️ IT IS PAIRED, AND THE PAIRING IS THE CONTRACT: `phase: "start"`, then a
-        // `phase: "page"` per cascade round, then exactly one `phase: "end"` — on EVERY
-        // exit, including the common one where nothing moved and no `documentReflowed`
-        // follows. Show on start, hide on end; never key the hide off `documentReflowed`.
-        //
-        // ⚠️ AND A HOST INDICATOR REALLY DOES PAINT, which was measured before this was
-        // built rather than assumed: the cost is all in the worker (main-thread JS during
-        // that 6.3 s totals 3.9 ms), so the main thread is free to animate. If the stall
-        // had been on the main thread a modal could not have rendered and this event would
-        // have been worse than useless.
-        //
-        // No repaint, no state change, no strip rebuild here — this event is telemetry for
-        // the host's own UI, and `documentReflowed` remains the one that means the geometry
-        // actually changed.
-        this._emit("documentReflowing", {
-          page: msg.page, phase: msg.phase,
-          pagesDone: msg.pagesDone || 0, settled: msg.settled,
-          pagesTotal: msg.pagesTotal, changed: msg.changed,
-          undoing: !!msg.undoing, redoing: !!msg.redoing,
-        });
-        break;
-      case "documentReflowed": {
-        // The page was re-settled after a commit. Two things may have changed: the
-        // GEOMETRY on this page and the next (content moved), and the PAGE COUNT.
-        //
-        // ⚠️ A FULL STRIP REBUILD, and it is a deliberate deviation from
-        // DOCUMENT_REFLOW.md §4, which specifies incremental tail-only growth and says
-        // never to call _buildStrip mid-session. This is the experimental path: the
-        // rebuild is correct but it repaints everything and drops the visual selection,
-        // and on a 7000-page document it would be unacceptable. It is safe HERE only
-        // because the commit has already closed the edit session, so there is no live
-        // caret or open run to lose. Incremental growth is the Phase-7 job.
-        this._pages = msg.pages;
-        this._buildStrip();
-        this._emit("documentReflowed", {
-          page: msg.page, nudged: msg.nudged, linesMigrated: msg.linesMigrated,
-          itemsMigrated: msg.itemsMigrated, pagesAdded: msg.pagesAdded,
-          cascadedPages: msg.cascadedPages || [msg.page], pages: msg.pages.length,
-          undone: !!msg.undone,
-          redone: !!msg.redone,
-        });
-        if (msg.pagesChanged)
-          this._emit("pagesChanged", { pages: msg.pages.length, pageSizes: this.pages });
         break;
       }
       case "painted":
@@ -1744,6 +1806,10 @@ export class PdfeEditor {
           undoPage: msg.undoPage ?? -1, redoPage: msg.redoPage ?? -1,
           recording: !!msg.recording,
         };
+        // I103 (2026-09-29): the engine's caps DROPPED a text step. From here on an empty
+        // stack no longer proves "unmodified" — undoing what is left still leaves the evicted
+        // edits in the document — so latch exactly as a truncation (-3) does below.
+        if (msg.evicted > 0) this._dirtyUntracked = true;
         // THE UNDO STACK IS THE AUTHORITY ON "IS THIS DOCUMENT MODIFIED?" — it
         // is the same set of facts `dirty` was tracking separately, and two
         // flags for one question drift. They drifted here: undoing every edit
@@ -2125,7 +2191,7 @@ export class PdfeEditor {
         const page = msg.page;
         this._closeEditUiState();
         // The commit may have moved/re-split paragraphs: refresh this page.
-        if (this._editMode) {
+        if (this.editMode) {
           this._pageGroups.delete(page);
           this._groupsPending.delete(page);
           this._requestGroups(page);
@@ -2143,6 +2209,11 @@ export class PdfeEditor {
       }
       case "groups": {
         this._groupsPending.delete(msg.page);
+        // The page's display map rides with its groups (I99): null for an ordinary page.
+        // Kept OUT of this._pages on purpose: the public `pages` getter copies those
+        // objects, and a private field must not leak into a host's payload.
+        if (msg.matrix) this._pageMatrices.set(msg.page, msg.matrix);
+        else this._pageMatrices.delete(msg.page);
         const blocks = msg.blocks || [];
         this._pageGroups.set(msg.page, blocks);
         this._pageImages.set(msg.page, msg.images || []);
@@ -2187,6 +2258,7 @@ export class PdfeEditor {
         // to leave exactly that zombie behind; it became easy to hit once a
         // protected file could fail on purpose).
         this._pages = [];
+        this._pageMatrices.clear();
         this._docBytes = 0;
         this._buildStrip();
         const messages = {
@@ -2307,7 +2379,7 @@ export class PdfeEditor {
   }
 
   _requestGroups(page) {
-    if (!this._editMode || this._pageGroups.has(page) || this._groupsPending.has(page)) return;
+    if (!this.editMode || this._pageGroups.has(page) || this._groupsPending.has(page)) return;
     this._groupsPending.add(page);
     this._post({ type: "groups", page });
   }
@@ -2481,7 +2553,7 @@ export class PdfeEditor {
     this.boxesEl.innerHTML = "";
     this.actionsEl.style.display = "none";
     this.rotateBtn.style.display = "none";
-    if (!this._editMode) return;
+    if (!this.editMode) return;
     const scaleCss = this._fitScale * this._zoom;
     const sel = this._selected;
     // All geometry comes from the CACHED page rects: zero layout reads in this
@@ -2491,10 +2563,11 @@ export class PdfeEditor {
       if (!rect) return null;
       const div = this._doc.createElement("div");
       div.className = cls;
-      div.style.left = `${rect.left + b[0] * scaleCss}px`;
-      div.style.top = `${rect.top + (this._pages[page].h - b[3]) * scaleCss}px`;
-      div.style.width = `${(b[2] - b[0]) * scaleCss}px`;
-      div.style.height = `${(b[3] - b[1]) * scaleCss}px`;
+      const v = this._viewBox(page, b);
+      div.style.left = `${rect.left + v.left * scaleCss}px`;
+      div.style.top = `${rect.top + v.top * scaleCss}px`;
+      div.style.width = `${v.width * scaleCss}px`;
+      div.style.height = `${v.height * scaleCss}px`;
       this.boxesEl.appendChild(div);
       return div;
     };
@@ -2517,7 +2590,8 @@ export class PdfeEditor {
     // during a drag (a scroll, a zoom) would otherwise put it back on the old rect.
     if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")
         && !this._draggingBox) {
-      this.editBtn.style.display = "";     // restored: a picture's bar hides it
+      this.editBtn.style.display = "";       // restored: a picture's bar hides it
+      this.rotateBarBtn.style.display = "none";  // text cannot be turned
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
     // PICTURES. One faint outline EACH, exactly as every text block gets one:
@@ -2536,7 +2610,8 @@ export class PdfeEditor {
       const ph = this._pages[page].h * scaleCss;
       const pts = [];
       for (let i = 0; i < 8; i += 2) {
-        pts.push(`${quad[i] * scaleCss},${(this._pages[page].h - quad[i + 1]) * scaleCss}`);
+        const v = this._ptToView(page, quad[i], quad[i + 1]);
+        pts.push(`${v[0] * scaleCss},${v[1] * scaleCss}`);
       }
       const svg = this._doc.createElementNS("http://www.w3.org/2000/svg", "svg");
       svg.setAttribute("class", cls);
@@ -2562,7 +2637,9 @@ export class PdfeEditor {
       imgSvg(selImg.page, selImg.quad, "pdfe-imagebox pdfe-imagebox-selected");
       // …and the rotate handle on it. Hidden during a drag for the same reason
       // the action bar is: any re-render mid-drag would strand it on the old rect.
-      if (!this._draggingBox) this._placeRotate(selImg, scaleCss);
+      if (!this._draggingBox && this._rotateHandleShown()) {
+        this._placeRotate(selImg, scaleCss);
+      }
       // A DELETE-ONLY ACTION BAR (user, 2026-08-28). The first image-edit pass
       // hid this bar entirely, because NEITHER of its actions existed for a
       // picture. Delete now does, so the bar is back with Edit hidden — there
@@ -2571,6 +2648,7 @@ export class PdfeEditor {
       // rect. Turning a picture stays HOST chrome (rotateSelection).
       if (!this._draggingBox) {
         this.editBtn.style.display = "none";
+        this.rotateBarBtn.style.display = this._rotateBarShown() ? "" : "none";
         this._placeActions(selImg.page, selImg.bounds, scaleCss);
       }
     }
@@ -2647,10 +2725,11 @@ export class PdfeEditor {
     this._ghostDelta = [dx, dy];
     const el = this.moveGhostEl;
     el.style.display = "block";
-    el.style.left = `${rect.left + (bounds[0] + dx) * scaleCss}px`;
-    el.style.top = `${rect.top + (this._pages[page].h - (bounds[3] + dy)) * scaleCss}px`;
-    el.style.width = `${(bounds[2] - bounds[0]) * scaleCss}px`;
-    el.style.height = `${(bounds[3] - bounds[1]) * scaleCss}px`;
+    const v = this._viewBox(page, bounds, dx, dy);
+    el.style.left = `${rect.left + v.left * scaleCss}px`;
+    el.style.top = `${rect.top + v.top * scaleCss}px`;
+    el.style.width = `${v.width * scaleCss}px`;
+    el.style.height = `${v.height * scaleCss}px`;
   }
 
   _hideMoveGhost() {
@@ -2666,9 +2745,12 @@ export class PdfeEditor {
     if (!rect) return;
     const bar = this.actionsEl;
     bar.style.display = "flex";
-    const boxLeft = rect.left + b[0] * scaleCss;
-    const boxTop = rect.top + (this._pages[page].h - b[3]) * scaleCss;
-    const boxBot = rect.top + (this._pages[page].h - b[1]) * scaleCss;
+    const v = this._viewBox(page, b);
+    const boxLeft = rect.left + v.left * scaleCss;
+    const boxTop = rect.top + v.top * scaleCss;
+    const boxBot = this._pageMatrix(page)
+      ? boxTop + v.height * scaleCss
+      : rect.top + (this._pages[page].h - b[1]) * scaleCss;
     // The bar's own size is content-static: measure it once (ONE layout flush),
     // then reuse — re-reading it after the writes above would flush again.
     if (!this._actionsSize) this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
@@ -2688,11 +2770,11 @@ export class PdfeEditor {
   _placeRotate(sel, scaleCss) {
     const rect = this._pageRect(sel.page);
     if (!rect || !sel.quad) return;
-    const h = this._pages[sel.page].h;
     let bestX = -Infinity, bestY = Infinity;
     for (let i = 0; i < 8; i += 2) {
-      const x = sel.quad[i] * scaleCss;
-      const y = (h - sel.quad[i + 1]) * scaleCss;
+      const v = this._ptToView(sel.page, sel.quad[i], sel.quad[i + 1]);
+      const x = v[0] * scaleCss;
+      const y = v[1] * scaleCss;
       // "top-right" in SCREEN terms: largest x, smallest y, decided together so
       // a turned picture's handle lands on the corner the user sees as top-right.
       if (x - y > bestX - bestY) { bestX = x; bestY = y; }
@@ -2719,6 +2801,7 @@ export class PdfeEditor {
     // treats the press as a tap on the page and deselects the picture first.
     this._listen(this.rotateBtn, "pointerdown", swallow);
     this._listen(this.rotateBtn, "click", (ev) => { swallow(ev); this.rotateSelection(1); });
+    this._listen(this.rotateBarBtn, "click", (ev) => { swallow(ev); this.rotateSelection(1); });
     this._listen(this.editBtn, "click", (ev) => { swallow(ev); this.editSelection(); });
     this._listen(this.deleteBtn, "click", (ev) => { swallow(ev); this.deleteSelection(); });
   }
@@ -2740,10 +2823,49 @@ export class PdfeEditor {
     const rect = this._pageRect(page);
     if (!rect) return null;
     const scaleCss = this._fitScale * this._zoom;
+    const v = this._ptToView(page, xPt, yPt);
     return {
-      x: rect.left + xPt * scaleCss,
-      y: rect.top + (this._pages[page].h - yPt) * scaleCss,
+      x: rect.left + v[0] * scaleCss,
+      y: rect.top + v[1] * scaleCss,
     };
+  }
+
+  // ---- the page transform (docs/KNOWN_ISSUES.md I99, annotations step 13a) ----------
+  // Every piece of geometry the core hands us is in the page's UNROTATED user space; the
+  // page is DISPLAYED rotated (its size here is the rotated one). So every overlay goes
+  // through the engine's own map, pdfe_page_view_matrix, which the worker sends with a
+  // page's groups. `m` is null for an ORDINARY page (/Rotate 0, origin (0, 0)) and each
+  // helper then evaluates the old `x, H - y` expression literally — nothing on an existing
+  // document moves. The Android twin is pdf/PageTransform.kt.
+  _pageMatrix(page) { return this._pageMatrices.get(page) || null; }
+
+  /** User point -> display point [vx, vy], in points from the displayed top-left. */
+  _ptToView(page, x, y) {
+    const m = this._pageMatrix(page);
+    if (!m) return [x, this._pages[page].h - y];
+    return [m[0] * x + m[2] * y + m[4], m[1] * x + m[3] * y + m[5]];
+  }
+
+  /** Display point -> user point [x, y]. The linear part is a quarter-turn, so its
+   *  inverse is its transpose. */
+  _viewToPt(page, vx, vy) {
+    const m = this._pageMatrix(page);
+    if (!m) return [vx, this._pages[page].h - vy];
+    return [m[0] * (vx - m[4]) + m[1] * (vy - m[5]), m[2] * (vx - m[4]) + m[3] * (vy - m[5])];
+  }
+
+  /** A user box [l, b, r, t] shifted by (dx, dy) -> {left, top, width, height} in display
+   *  points. On a rotated page the box's width and height swap. */
+  _viewBox(page, b, dx = 0, dy = 0) {
+    const m = this._pageMatrix(page);
+    if (!m) {
+      return { left: b[0] + dx, top: this._pages[page].h - (b[3] + dy),
+               width: b[2] - b[0], height: b[3] - b[1] };
+    }
+    const p1 = this._ptToView(page, b[0] + dx, b[1] + dy);
+    const p2 = this._ptToView(page, b[2] + dx, b[3] + dy);
+    const left = Math.min(p1[0], p2[0]), top = Math.min(p1[1], p2[1]);
+    return { left, top, width: Math.max(p1[0], p2[0]) - left, height: Math.max(p1[1], p2[1]) - top };
   }
 
   _drawCaret(geom) {
@@ -2761,9 +2883,18 @@ export class PdfeEditor {
       return;
     }
     this.caretEl.style.display = "block";
-    this.caretEl.style.left = `${top.x - 1}px`;
-    this.caretEl.style.top = `${top.y}px`;
-    this.caretEl.style.height = `${Math.max(2, bot.y - top.y)}px`;
+    if (top.x === bot.x) {
+      this.caretEl.style.width = "";
+      this.caretEl.style.left = `${top.x - 1}px`;
+      this.caretEl.style.top = `${top.y}px`;
+      this.caretEl.style.height = `${Math.max(2, bot.y - top.y)}px`;
+    } else {
+      // A rotated page (I99): the caret lies along the displayed line.
+      this.caretEl.style.left = `${Math.min(top.x, bot.x)}px`;
+      this.caretEl.style.top = `${(top.y + bot.y) / 2 - 1}px`;
+      this.caretEl.style.width = `${Math.max(2, Math.abs(bot.x - top.x))}px`;
+      this.caretEl.style.height = "2px";
+    }
     // Keep the sink under the caret so an IME candidate window follows (§7).
     this.sink.style.left = `${Math.round(top.x)}px`;
     this.sink.style.top = `${Math.round(top.y)}px`;
@@ -2796,10 +2927,13 @@ export class PdfeEditor {
     const br = this._pageToCss(b[2], b[1]);
     if (!tl) { el.style.display = "none"; return; }
     el.style.display = "block";
-    el.style.left = `${tl.x - 2}px`;
-    el.style.top = `${tl.y - 2}px`;
-    el.style.width = `${Math.max(1, br.x - tl.x + 4)}px`;
-    el.style.height = `${Math.max(1, br.y - tl.y + 4)}px`;
+    // min/max: on a rotated page the user box's corners swap places on screen (I99).
+    const x0 = Math.min(tl.x, br.x), x1 = Math.max(tl.x, br.x);
+    const y0 = Math.min(tl.y, br.y), y1 = Math.max(tl.y, br.y);
+    el.style.left = `${x0 - 2}px`;
+    el.style.top = `${y0 - 2}px`;
+    el.style.width = `${Math.max(1, x1 - x0 + 4)}px`;
+    el.style.height = `${Math.max(1, y1 - y0 + 4)}px`;
   }
 
   _drawSelection(rects) {
@@ -2812,10 +2946,11 @@ export class PdfeEditor {
       if (!tl) continue;
       const div = this._doc.createElement("div");
       div.className = "pdfe-selrect";
-      div.style.left = `${tl.x}px`;
-      div.style.top = `${tl.y}px`;
-      div.style.width = `${br.x - tl.x}px`;
-      div.style.height = `${br.y - tl.y}px`;
+      const x0 = Math.min(tl.x, br.x), y0 = Math.min(tl.y, br.y);
+      div.style.left = `${x0}px`;
+      div.style.top = `${y0}px`;
+      div.style.width = `${Math.max(tl.x, br.x) - x0}px`;
+      div.style.height = `${Math.max(tl.y, br.y) - y0}px`;
       this.selEl.appendChild(div);
     }
   }
@@ -2855,9 +2990,9 @@ export class PdfeEditor {
           const scaleCss = this._fitScale * this._zoom;
           // The finger is on the knob BELOW the line — sample ~a knob height
           // above it so the boundary lookup lands on the dragged line.
-          const xPt = (mv.clientX - rect.left) / scaleCss;
-          const yPt = this._pages[this._editingPage].h -
-            (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss;
+          const [xPt, yPt] = this._viewToPt(this._editingPage,
+            (mv.clientX - rect.left) / scaleCss,
+            (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss);
           this._post({
             type: "dragHandle", which,
             start: this._selRange[0], end: this._selRange[1], xPt, yPt,
@@ -2893,9 +3028,9 @@ export class PdfeEditor {
         if (!canvas) return;
         const rect = canvas.getBoundingClientRect();
         const scaleCss = this._fitScale * this._zoom;
-        const xPt = (mv.clientX - rect.left) / scaleCss;
-        const yPt = this._pages[this._editingPage].h -
-          (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss;
+        const [xPt, yPt] = this._viewToPt(this._editingPage,
+          (mv.clientX - rect.left) / scaleCss,
+          (mv.clientY - HANDLE_TOUCH_LIFT - rect.top) / scaleCss);
         this._post({ type: "dragCaret", page: this._editingPage, xPt, yPt });
       };
       const up = () => {
@@ -2914,8 +3049,13 @@ export class PdfeEditor {
     this._listen(canvas, "pointerdown", (ev) => {
       // Recorded before the edit-mode gate: the caret thumb is touch-only, and
       // the input type is a property of the DEVICE, not of the mode.
+      // [tap-precedence: BEGIN web-pointer-down]
+      // ── WHAT MAY CLAIM THE GESTURE BEFORE IT IS A TAP ──────────────────
+      // Declared once in scripts/tap_precedence.data.mjs, rendered in
+      // docs/TAP_PRECEDENCE.md, checked by scripts/check_tap_precedence.mjs.
       this._lastPointerType = ev.pointerType || "mouse";
-      if (!this._editMode) return;
+      // [tap-rung: edit-mode-gate]
+      if (!this.editMode) return;
       // I9: killing the default action stops the browser from moving focus to
       // <body> after this handler (a mousedown on a non-focusable canvas blurs
       // the sink). Without it every caret-reposition tap silently disconnected
@@ -2926,10 +3066,9 @@ export class PdfeEditor {
       const toPt = (cx, cy) => {
         const rect = canvas.getBoundingClientRect();
         const scaleCss = this._fitScale * this._zoom;
-        return {
-          xPt: (cx - rect.left) / scaleCss,
-          yPt: this._pages[page].h - (cy - rect.top) / scaleCss,
-        };
+        const [xPt, yPt] = this._viewToPt(page, (cx - rect.left) / scaleCss,
+                                          (cy - rect.top) / scaleCss);
+        return { xPt, yPt };
       };
       // EXPERIMENTAL (feature/web-block-move): a drag that STARTS inside the
       // already-selected box moves it. Decided here, on DOWN, because it
@@ -2940,6 +3079,7 @@ export class PdfeEditor {
       // `_blockMove` first: the feature is EXPERIMENTAL and off by default, and a
       // disabled feature must not even arm the gesture — otherwise a drag would
       // still swallow the pan it is standing in front of.
+      // [tap-rung: box-drag-grab]
       const movableText = this._blockMove &&
         !!this._selected && this._selected.page === page &&
         this._editingPage !== page && this._inBounds(this._selected.bounds, down);
@@ -2958,6 +3098,7 @@ export class PdfeEditor {
       // the OPEN run only — same as Android. A press on a movable box must not
       // fire it: the box is not open, so there is no word to select, and the
       // press is the start of a possible drag.
+      // [tap-rung: long-press-arm]
       const lpTimer = movable ? 0 : setTimeout(() => {
         if (this._pinchActive) return;   // two held fingers are a pinch
         lpFired = true;
@@ -2969,6 +3110,7 @@ export class PdfeEditor {
         // is no word to select and no reason to raise it (S39).
         this._setSinkFocus(this._editingPage === page);
       }, this.longPressMs);
+      // [tap-precedence: END web-pointer-down]
       let dragging = false;
       let movingBox = false;
       const cleanup = () => {
@@ -3022,6 +3164,11 @@ export class PdfeEditor {
         this._post({ type: "dragSelect", page, ax: a.xPt, ay: a.yPt, xPt: c.xPt, yPt: c.yPt });
       };
       const up = (uv) => {
+      // [tap-precedence: BEGIN web-pointer-up]
+      // ── IS THIS STILL A TAP, AND WHICH KIND ─────────────────────────
+      // Same table, same checker. The rungs Android reaches through separate
+      // GestureDetector callbacks are declared there as `by-framework`.
+        // [tap-rung: pinch-wins]
         const wasMoving = movingBox;
         const drop = wasMoving ? toPt(uv.clientX, uv.clientY) : null;
         cleanup();
@@ -3029,6 +3176,7 @@ export class PdfeEditor {
         if (this._pinchActive || performance.now() - this._lastPinchEnd < 350) return;
         // Drop: translate for real, ONCE. The worker re-resolves the block from
         // a fresh grouping, so it can never act on a stale index.
+        // [tap-rung: box-drag-drop]
         if (wasMoving) {
           // Send the CLAMPED delta the ghost was showing, so the box lands exactly
           // where the outline was. Falls back to the raw delta if no ghost frame
@@ -3043,9 +3191,11 @@ export class PdfeEditor {
           else this._renderBoxes();       // nothing moved: nothing will restore the bar
           return;
         }
+        // [tap-rung: long-press-consumed]
         if (lpFired) return;
         // A drag that ended: keep the keyboard only if a run is actually open
         // (a pan with nothing open must not raise one on iOS — S39).
+        // [tap-rung: pan-consumed]
         if (dragging) { this._setSinkFocus(this._editingPage >= 0); return; }
         const { xPt, yPt } = toPt(uv.clientX, uv.clientY);
         // SHIFT+CLICK EXTENDS THE SELECTION, the way it does in every text field
@@ -3067,6 +3217,7 @@ export class PdfeEditor {
         // margin would silently select all the way to whichever end was nearer
         // instead of doing what an unmodified click there does (commit, and pick
         // the box you actually clicked).
+        // [tap-rung: shift-click-extend]
         if (uv.shiftKey && this._editingPage === page &&
             this._lastEditBounds && this._inBounds(this._lastEditBounds, { xPt, yPt })) {
           const s0 = this.sink.selectionStart, e0 = this.sink.selectionEnd;
@@ -3084,6 +3235,7 @@ export class PdfeEditor {
         // Gated on the open run: before one is open there is no word to select,
         // so a double tap stays two plain taps and the select-then-open flow
         // (first tap picks the box, second opens it) is untouched.
+        // [tap-rung: double-tap-word]
         const dbl = this._editingPage === page &&
           this._lastTapPage === page &&
           performance.now() - this._lastTapAt < DOUBLE_TAP_MS &&
@@ -3092,6 +3244,9 @@ export class PdfeEditor {
         this._lastTapX = uv.clientX;
         this._lastTapY = uv.clientY;
         this._lastTapPage = page;
+        // [tap-rung: single-tap-post]
+        // The hand-off: everything below this point is the L3 chain, and on this
+        // platform it runs in the WORKER (pdfe-worker.js), not here.
         this._post(dbl ? { type: "selectWord", page, xPt, yPt }
                        : { type: "tap", page, xPt, yPt });
         // Focus inside the user gesture — browsers only show a keyboard then —
@@ -3101,6 +3256,7 @@ export class PdfeEditor {
         // only fires inside an open run, so it always wants one.
         this._setSinkFocus(dbl || this._tapWantsKeyboard(page, { xPt, yPt }));
       };
+      // [tap-precedence: END web-pointer-up]
       canvas.addEventListener("pointermove", move);
       canvas.addEventListener("pointerup", up);
       canvas.addEventListener("pointercancel", abort);

@@ -86,24 +86,26 @@ export function attachNativeHost(editor, opts = {}) {
   for (const ev of ["ready", "opened", "editmode", "select", "editopen", "editclose",
                     "deleted", "moved", "dirty", "zoom", "page", "history", "styled",
                     "selection", "inputRejected", "error", "fontsReady",
-                    // IMAGE ROTATION (2026-09-03). `moved` was forwarded and its twin `rotated`
-                    // was not — a real one-line gap the parity gate had flagged for as long
-                    // as image edit existed. A native shell that hears `moved` but not
-                    // `rotated` cannot tell a picture was turned.
-                    "rotated",
-                    // DOCUMENT REFLOW (2026-09-03). Forwarded the day the cascade moved into
-                    // the shared core and Android learned to drive it — the three events
-                    // were declared web-only in the parity gate until then, and this list is
-                    // the ONLY way iOS hears about a reflow at all: a native shell needs
-                    // `documentReflowing` to show that a multi-second settle is running,
-                    // `documentReflowed` to know geometry moved, and `pagesChanged` to grow
-                    // its own page list when a page is appended or taken away again.
-                    "documentReflowing", "documentReflowed", "pagesChanged",
                     // ADD TEXT (docs/ADD_TEXT.md). Forwarded in the SAME change as the
                     // armAddText command, deliberately: telling a native shell that the
                     // mode is armed while giving it no way to arm or cancel would be a
                     // worse shape than a declared gap.
-                    "addtextarmed"]) {
+                    "addtextarmed",
+                    // IMAGE EDIT (docs/IMAGE_EDIT.md). `select`, `moved` and `deleted`
+                    // already carried pictures here — they gained a `kind` field, not a
+                    // new name. `rotated` is the one genuinely new event, because no
+                    // text verb turns anything, and it is forwarded in the SAME change
+                    // as the rotateSelection command for the reason addtextarmed was:
+                    // telling a shell a picture turned while giving it no way to turn
+                    // one is a worse shape than a declared gap.
+                    "rotated",
+                    // THE MODE (docs/annotations/12-VOCABULARY.md). Forwarded in the
+                    // SAME change as the setMode command. Note this puts a SECOND
+                    // message on the wire for every edit-mode toggle, because
+                    // setEditMode now funnels through setMode -- additive, exactly as
+                    // `rotated` and `addtextarmed` were, but a shell with an
+                    // exhaustive switch over event names sees a name it has not seen.
+                    "mode"]) {
     editor.on(ev, (detail) => emit(ev, detail));
   }
   if (opts.telemetry) editor.on("edit", (d) => emit("edit", d));
@@ -121,21 +123,12 @@ export function attachNativeHost(editor, opts = {}) {
      * code `password-required` (none supplied) or `password-wrong` (supplied and
      * refused) — the native side raises ITS OWN prompt and calls `open` again
      * with the same url plus the password. Nothing here stores it.
-     *
-     * `documentReflow` (optional, DEFAULT TRUE since 2.2.0) — DOCUMENT REFLOW for this
-     * open: a commit re-settles the page and the overflow ripples through the
-     * document, appending a page when it must. Omitted, the web SDK's own default
-     * applies (on); pass `false` to keep the pre-2.2.0 behaviour for one open. The same
-     * default on web and Android — a default that differs on one platform is the
-     * asymmetry the parity gate exists to catch. Its three events are forwarded (see
-     * the list above).
      */
-    open: async ({ url, name, password, documentReflow }) =>
-      editor.open(url, { name, password, documentReflow }),
+    open: async ({ url, name, password }) => editor.open(url, { name, password }),
 
     /** Fallback path for small documents when no scheme handler is available. */
-    openBase64: async ({ data, name, password, documentReflow }) =>
-      editor.open(fromBase64(data), { name, password, documentReflow }),
+    openBase64: async ({ data, name, password }) =>
+      editor.open(fromBase64(data), { name, password }),
 
     /**
      * Commit + save. Returns the sizes only; the BYTES are pulled afterwards
@@ -164,6 +157,23 @@ export function attachNativeHost(editor, opts = {}) {
 
     setEditMode: ({ on }) => { editor.setEditMode(!!on); return { editMode: editor.editMode }; },
     toggleEditMode: () => { editor.toggleEditMode(); return { editMode: editor.editMode }; },
+    /**
+     * THE MODE: `"view"` | `"text"` | `"annotate"`
+     * (docs/annotations/12-VOCABULARY.md). The general form of the two commands
+     * above -- `setEditMode({on:true})` is `setMode({mode:"text"})`, and both keep
+     * working, because `editMode` is exactly `mode === "text"` in both directions.
+     *
+     * `"annotate"` is ACCEPTED AND INERT: it can be set and read back, and it
+     * currently behaves like `"view"`. Marking up arrives at roadmap step 13.
+     *
+     * An unrecognised mode is IGNORED rather than refused, matching the SDK verb --
+     * so the reply, like every other setter here, is the RESULTING state, which is
+     * how a shell tells whether its value was taken.
+     */
+    setMode: ({ mode }) => {
+      editor.setMode(mode);
+      return { mode: editor.mode, editMode: editor.editMode };
+    },
     /**
      * Leave box editing: commit the open run and DROP THE KEYBOARD. A native
      * shell needs this before it presents anything of its own over the WebView,
@@ -328,27 +338,39 @@ export function attachNativeHost(editor, opts = {}) {
      */
     setBlockMove: ({ on } = {}) => ({ blockMove: editor.setBlockMove(!!on) }),
 
-    // ---- THE SELECTION VERBS (2026-09-03) — the box lifecycle a native shell can
-    // DRIVE, not only hear about. `select`/`deleted`/`moved` reached this bridge in
-    // 2026-08-13, and every one of the verbs behind them stayed web-and-Android only:
-    // an iOS product could show its own Delete button from the `select` event and had
-    // no command to wire it to. The SDK's own in-page bar covers the finger; these
-    // cover the host's chrome — which is the whole point of the chrome-free surface.
+    // ---- select-then-act, for ALL FOUR verbs (docs/IMAGE_EDIT.md, BLOCK_MOVE.md) --
+    // THE DECLARED GAP IS CLOSED HERE, AND AS ONE UNIT because that is how it was
+    // declared: the bridge had no select-then-act command at all, and the gate's
+    // KNOWN_BRIDGE_GAPS said in those words that adding one alone "would make it the
+    // only selection command on the bridge, which is a worse shape than none. When it
+    // is done, add all four here and to pdfe-native-host.js in one change."
     //
-    // `deleteSelection` and `clearSelection` route by WHAT IS SELECTED (a text box or
-    // a picture), exactly as on web — no second Delete for pictures, by design
-    // (docs/IMAGE_EDIT.md §6).
-    deleteSelection: () => { editor.deleteSelection(); return {}; },
-    clearSelection: () => { editor.clearSelection(); return {}; },
-    /** Nudge the selected TEXT box by (dx, dy) PDF points (the drag's programmatic form). */
-    moveSelection: ({ dx, dy } = {}) => { editor.moveSelection(Number(dx) || 0, Number(dy) || 0); return {}; },
-    // ---- IMAGE EDIT (docs/IMAGE_EDIT.md) — a picture's two verbs. Both return
-    // `{ok:false}` harmlessly when the selection is text or empty, so a shell may wire
-    // its buttons unconditionally and branch its LABELS on `state.selectionKind`.
-    /** Turn the selected picture by `turns` x 90 degrees, clockwise when positive. */
-    rotateSelection: ({ turns } = {}) => ({ ok: editor.rotateSelection(turns == null ? 1 : Number(turns)) }),
-    /** Move the selected picture by (dx, dy) PDF points; the engine clamps it to the page. */
-    moveImageSelection: ({ dx, dy } = {}) => ({ ok: editor.moveImageSelection(Number(dx) || 0, Number(dy) || 0) }),
+    // Pictures are what forced it: a native shell could be TOLD a picture was selected
+    // and had no way to delete, deselect or nudge it. Each routes by what is selected,
+    // so a shell learns one verb for both kinds, never a picture-specific twin
+    // (IMAGE_EDIT.md §6).
+    editSelection: () => { editor.editSelection(); return { ok: true }; },
+    deleteSelection: () => { editor.deleteSelection(); return { ok: true }; },
+    clearSelection: () => { editor.clearSelection(); return { ok: true }; },
+    moveSelection: ({ dx, dy } = {}) => {
+      editor.moveSelection(Number(dx) || 0, Number(dy) || 0);
+      return { ok: true };
+    },
+
+    // ---- pictures (docs/IMAGE_EDIT.md) --------------------------------------
+    // Turning and nudging a PICTURE. Deleting one is deleteSelection above, and
+    // selecting one is a tap inside the web view, so neither gets a twin here.
+    rotateSelection: ({ turns } = {}) => ({
+      ok: editor.rotateSelection(turns === undefined ? 1 : Math.trunc(Number(turns) || 0)),
+    }),
+    moveImageSelection: ({ dx, dy } = {}) => ({
+      ok: editor.moveImageSelection(Number(dx) || 0, Number(dy) || 0),
+    }),
+    /** Where the rotate control lives: "both" | "handle" | "bar" | "none". */
+    setImageRotateControl: ({ where } = {}) => {
+      editor.setImageRotateControl(where);
+      return { imageRotateControl: editor.imageRotateControl };
+    },
 
     // ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------
     // Placing a NEW text box where the document has none. An ARMED mode, so this is
@@ -433,23 +455,11 @@ export function attachNativeHost(editor, opts = {}) {
      * only `editing` for its whole life, which is the pull-side twin of the gap the
      * `select` event had until 2026-08-13.
      */
-    state: () => ({
-      pageCount: editor.pageCount, page: editor.currentPage,
-      zoom: editor.zoom, editMode: editor.editMode, blockMove: editor.blockMove,
-      dirty: editor.dirty, editing: editor.editing, selection: editor.selection,
-      textSelection: editor.textSelection, textStyle: editor.textStyle,
-      // ADD TEXT: the fifth editing state. A shell that reloads its web view has no
-      // event history to replay, so every state a toolbar branches on must be askable.
-      addingText: editor.addingText,
-      // WHAT KIND is selected — "text", "image" or null — and the picture itself
-      // (docs/IMAGE_EDIT.md). The sixth state: a toolbar shows Edit for a text box and
-      // Rotate for a picture, and `selection` alone cannot tell them apart.
-      selectionKind: editor.selectionKind,
-      imageSelection: editor.imageSelection,
-      capabilities: editor.capabilities,
-      documentName: editor.documentName, documentBytes: editor.documentBytes,
-      suggestedName: editor.suggestedName(),
-    }),
+    //
+    // Since 2026-09-29 (V2, the review fixes) this IS the web SDK's own state():
+    // one key list for the web host and the iOS shell, which also gained canUndo /
+    // canRedo here. Parity rule 13 reads the keys from pdfe-editor.js's state().
+    state: () => editor.state(),
   };
 
   const api = {

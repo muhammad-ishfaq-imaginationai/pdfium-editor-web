@@ -483,8 +483,14 @@ export class PdfeEditor {
 
     this._docName = opts.name || blob.name || "document.pdf";
     this._docBytes = blob.size;
-    this._dirty = false;
+    // THROUGH THE FUNNEL, never `this._dirty = false` (I127, 2026-10-01): a host paints
+    // its Save button from the `dirty` event, and a direct assignment said nothing — so
+    // the worker's forced post-open `history` found the flag already false and stayed
+    // silent too, leaving "unsaved" lit over a fresh document. Here and not at "opened":
+    // the worker closes the old document before it tries the new one, so a FAILED open
+    // has also replaced it. Android's openPdf does the same in both outcomes.
     this._dirtyUntracked = false;
+    this._setDirty(false);
     this._painted = new Set();
     this._selected = null;
     this._selectedImage = null;
@@ -545,6 +551,38 @@ export class PdfeEditor {
     }
     const p = this._promiseFor("save");
     this._post({ type: "save", forceInHeap });
+    return p;
+  }
+
+  /**
+   * exportFlattened (3.2.0): a COPY of the document with its annotations burned into the
+   * pages, as PDF bytes — for printing, or anywhere the marks must show whatever draws the
+   * PDF. Optional; nothing changes for a host that never calls it.
+   *
+   * The OPEN document is unchanged: marks stay marks, undo/redo and `dirty` are untouched,
+   * it is not a save. It includes unsaved work and leaves the open box first (as save()
+   * does). Hidden / do-not-print annotations are left out. A password document gives an
+   * UNPROTECTED copy. All or nothing.
+   *
+   * Rejects with PdfeError: 'no-document', 'flatten-failed' (a page would not flatten; no
+   * copy), 'engine-error' (the engine failed writing it), 'save-too-large' (the copy is made
+   * in memory and the document is over the in-heap ceiling), or 'superseded' (a newer call
+   * replaced this one). Emits no event.
+   */
+  async exportFlattened() {
+    // Same order as save(): leave the box synchronously, inside the host's gesture.
+    this.getOutOfBoxEditing();
+    await this._readyPromise;
+    if (!this._pages.length) throw new PdfeError("no-document", "nothing open to export");
+    const limitMB = this._caps.inHeapMaxMB;
+    const sizeMB = this._docBytes / (1024 * 1024);
+    if (limitMB && sizeMB > limitMB) {
+      throw new PdfeError("save-too-large",
+        "the copy is made in memory and the document is over the in-heap ceiling",
+        { sizeMB, limitMB });
+    }
+    const p = this._promiseFor("exportFlattened");
+    this._post({ type: "exportFlattened" });
     return p;
   }
 
@@ -2303,6 +2341,19 @@ export class PdfeEditor {
         this._emit("saved", info);
         break;
       }
+      case "flattened": {
+        // The worker committed the open box before copying (as a save does), so the
+        // edit UI is put away the same way — but NOTHING about dirty or history moves:
+        // an export is not a save.
+        this._closeEditUiState();
+        this._renderBoxes();
+        this._settle("exportFlattened", true, msg.bytes);
+        break;
+      }
+      case "flattenFailed": {
+        this._settle("exportFlattened", false, new PdfeError(msg.code, msg.detail));
+        break;
+      }
       case "saveRefused": {
         // The worker's §7 backstop (the API check above normally gets there first).
         const err = new PdfeError("save-too-large",
@@ -2336,6 +2387,10 @@ export class PdfeEditor {
         const err = new PdfeError("engine-error", msg.detail);
         this._settle("open", false, err);
         this._settle("save", false, err);
+        // NOT exportFlattened: the worker answers every export with its own
+        // flattened/flattenFailed message, and this generic `error` is also how unrelated
+        // refusals arrive (add-text-refused) — settling here would reject an export whose
+        // copy is still coming.
         this._emit("error", { code: err.code, detail: msg.detail });
         break;
       }

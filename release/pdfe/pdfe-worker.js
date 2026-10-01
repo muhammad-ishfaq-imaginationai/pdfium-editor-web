@@ -241,6 +241,7 @@ const ready = createPdfe({
   F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
   F.generateContent = m.cwrap("pdfe_generate_content", "number", ["number"]);
   F.wasmSave      = m.cwrap("pdfe_wasm_save", "number", ["number"]);
+  F.wasmExportFlat = m.cwrap("pdfe_wasm_export_flattened", "number", ["number"]);
   F.init(0);
   // Probe the save sink BEFORE announcing readiness: the shell must know up
   // front whether saves will stream (OPFS) or fall back to in-heap, because
@@ -1862,6 +1863,46 @@ async function saveDocument(forceInHeap) {
   });
 }
 
+// exportFlattened (3.2.0): a COPY with every printable annotation burned into the page,
+// for printing (pdfe_export_flattened). Unlike saveDocument it is ALWAYS in memory (the
+// host asked for bytes) and it is NOT a save: no history clear, no dirty change, no
+// staged OPFS file. It commits and flushes first, as a save does, so the copy carries the
+// open box's typing.
+function exportFlattened() {
+  const refuse = (code, detail) => postMessage({ type: "flattenFailed", code, detail });
+  if (!doc) return refuse("no-document", "no document");
+  if (sourceSize > IN_HEAP_MAX) {
+    return refuse("save-too-large", `the copy is made in memory; the document is over ${IN_HEAP_MAX / 1048576} MB`);
+  }
+  if (editor) commitEditor();
+  for (const p of dirtyPages) F.generateContent(acquirePage(p));
+  dirtyPages.clear();
+  const t0 = performance.now();
+  const prevHandle = saveHandle, prevChunks = saveChunks;
+  saveHandle = null;
+  saveChunks = [];
+  let written, chunks;
+  try {
+    written = F.wasmExportFlat(doc);
+    chunks = saveChunks;
+  } catch (e) {
+    // A trap must still ANSWER the export (its own message, never the generic `error`,
+    // which unrelated refusals such as add-text share).
+    return refuse("engine-error", `the engine failed to write the copy: ${e}`);
+  } finally {
+    saveHandle = prevHandle; saveChunks = prevChunks;
+  }
+  if (written < 0) {
+    return written === -2
+      ? refuse("flatten-failed", "a page of the copy could not be flattened")
+      : refuse("engine-error", "the engine failed to write the copy");
+  }
+  const bytes = new Uint8Array(written);
+  let o = 0;
+  for (const c of chunks) { bytes.set(c, o); o += c.length; }
+  postMessage({ type: "flattened", bytes, ms: Math.round(performance.now() - t0) }, [bytes.buffer]);
+}
+
 // ---- single-flight, newest-wins latch (docs/WEB_VIEWER.md §9) ----------------
 // One drain tick per animation frame. Priorities inside a drain:
 //   1. the newest pending edit (keystrokes preempt everything)
@@ -3051,6 +3092,11 @@ onmessage = async (e) => {
 
   if (msg.type === "save") {
     await saveDocument(!!msg.forceInHeap);
+    return;
+  }
+
+  if (msg.type === "exportFlattened") {
+    exportFlattened();
     return;
   }
 

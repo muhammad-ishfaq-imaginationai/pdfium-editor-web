@@ -143,7 +143,20 @@ export function attachNativeHost(editor, opts = {}) {
       };
     },
 
-    /** Pull one slice of the last save as base64. */
+    /**
+     * exportFlattened (3.2.0): a COPY with the annotations burned in, for printing. Like
+     * `save` it returns the SIZE only; the bytes are pulled with readChunk and released
+     * with releaseSaved — they are staged in the same slot, so an export replaces a save
+     * not yet read, and the reverse, exactly as two saves in a row do. Not a save: the
+     * open document, its history and its dirty flag are unchanged.
+     */
+    exportFlattened: async () => {
+      const bytes = await editor.exportFlattened();
+      savedFile = new Blob([bytes], { type: "application/pdf" });
+      return { bytes: bytes.length, chunkSize: CHUNK };
+    },
+
+    /** Pull one slice of the last save (or exportFlattened) as base64. */
     readChunk: async ({ offset = 0, length = CHUNK } = {}) => {
       if (!savedFile) throw new Error("no saved file to read");
       const end = Math.min(savedFile.size, offset + length);

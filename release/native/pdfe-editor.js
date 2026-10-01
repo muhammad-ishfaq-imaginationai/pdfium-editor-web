@@ -280,12 +280,15 @@ export class PdfeEditor {
     // (docs/BLOCK_MOVE.md).
     this._blockMove = opts.blockMove ?? true;
     // WHERE THE ROTATE CONTROL LIVES — the host's choice (user decision 2026-09-15):
-    // "both" (the default), "handle" (on the picture), "bar" (in the action bar) or
+    // "bar" (the default since 3.1.0 — the labelled button only; 3.0.0 defaulted to
+    // "both"), "both", "handle" (on the picture), or
     // "none". The same four words on web, Android and the iOS bridge, deliberately,
     // so a product configures one behaviour rather than three. rotateSelection()
     // works at every setting including "none", so a host can own the chrome entirely.
     this._imageRotateControl = PDFE_ROTATE_CONTROLS.includes(opts.imageRotateControl)
-      ? opts.imageRotateControl : "both";
+      ? opts.imageRotateControl : "bar";
+    // DOES A PICTURE'S BAR OFFER DELETE (3.1.0): on unless the host passes false.
+    this._imageDeleteControl = opts.imageDeleteControl !== false;
     // ADD TEXT: armed between armAddText() and the tap that places a box.
     // Read by _tapWantsKeyboard, which must answer synchronously inside the
     // gesture for iOS to raise a keyboard at all (S39).
@@ -672,6 +675,21 @@ export class PdfeEditor {
     if (this._selected) return "text";
     return null;
   }
+  /** true while a TEXT BOX is selected (tapped once, not open for typing) — the
+   *  one-line form of `selectionKind === "text"`. Since 3.1.0. */
+  get isTextBoxSelected() { return this.selectionKind === "text"; }
+  /** true while a PICTURE is selected — `selectionKind === "image"`. Since 3.1.0. */
+  get isImageSelected() { return this.selectionKind === "image"; }
+  /**
+   * The TEXT of the selected text box, or null when no text box is selected (a
+   * picture, nothing, or a box open for typing — read `editing` for that). Plain
+   * text as the box shows it: paragraphs on their own lines, a bullet list one line
+   * per line; no style. Answered from what the SDK already holds, so it is instant
+   * and safe inside the `select` handler. Since 3.1.0.
+   */
+  get selectedTextBoxText() {
+    return this.selectionKind === "text" ? (this._selected.text ?? null) : null;
+  }
   /** The selected picture, or null: {page, index, bounds, quad, quarterTurns, clipped}. */
   get imageSelection() {
     const im = this._selectedImage;
@@ -729,6 +747,26 @@ export class PdfeEditor {
     if (this._selected || this._selectedImage) this._post({ type: "deselect" });
   }
   /**
+   * Select ALL the text of the box being typed in (the open run) — the host's
+   * "Select all" button. Text mode only, and only while a box is open; an empty
+   * box has nothing to select. The keyboard is left exactly as it is (focus is not
+   * touched, so iOS does not drop it) and the selection gets the usual highlight
+   * and start/end handles, because it takes the same path as Ctrl/Cmd+A and a
+   * long-press. Returns true when a selection was made. Since 3.1.0.
+   */
+  selectAllText() {
+    if (this._mode !== "text" || this._editingPage < 0) return false;
+    return this._selectAllInRun();
+  }
+  /** The one select-all path: Ctrl/Cmd+A and selectAllText() both land here. */
+  _selectAllInRun() {
+    const len = this.sink.value.length;
+    if (!len) return false;                 // empty run: stay a collapsed caret
+    this.sink.setSelectionRange(0, len);
+    this._post({ type: "selectRange", start: 0, end: len });
+    return true;
+  }
+  /**
    * Move the selected box by (dx, dy) PDF points — the programmatic sibling of
    * the drag gesture, for a host that wants nudge buttons or arrow keys.
    */
@@ -759,6 +797,19 @@ export class PdfeEditor {
     // Hide it NOW rather than at the next render: a host that switches the control
     // off while a picture is selected must not be left looking at the old one.
     if (this.rotateBtn) this.rotateBtn.style.display = "none";
+    this._renderBoxes();
+  }
+
+  /** Does the selected picture's action bar offer Delete? Default true. 3.1.0. */
+  get imageDeleteControl() { return this._imageDeleteControl; }
+
+  /**
+   * Show or hide Delete in a PICTURE's action bar (3.1.0). `deleteSelection()`
+   * works either way; a text box's bar keeps its Delete. With neither Delete nor a
+   * bar Rotate left, the picture gets no bar at all.
+   */
+  setImageDeleteControl(on) {
+    this._imageDeleteControl = !!on;
     this._renderBoxes();
   }
 
@@ -1220,8 +1271,12 @@ export class PdfeEditor {
       textSelection: this.textSelection, textStyle: this.textStyle,
       addingText: this.addingText,
       selectionKind: this.selectionKind,
+      isTextBoxSelected: this.isTextBoxSelected,
+      isImageSelected: this.isImageSelected,
+      selectedTextBoxText: this.selectedTextBoxText,
       imageSelection: this.imageSelection,
       imageRotateControl: this.imageRotateControl,
+      imageDeleteControl: this.imageDeleteControl,
       capabilities: this.capabilities,
       documentName: this.documentName, documentBytes: this.documentBytes,
       suggestedName: this.suggestedName(),
@@ -1605,6 +1660,10 @@ export class PdfeEditor {
     this._listen(this.scroller, "scroll", () => {
       this._updateCurrentPage();
       this._scheduleEvictSweep();
+      // The rotate handle is clamped into the VISIBLE area, so it has to follow a
+      // scroll (a few style writes; nothing else re-renders on scroll).
+      if (this._selectedImage && this.rotateBtn.style.display === "flex" && !this._draggingBox)
+        this._placeRotate(this._selectedImage, this._fitScale * this._zoom);
     }, { passive: true });
 
     // Lazy paint/group as pages scroll into view — rooted at OUR scroller, not
@@ -1709,7 +1768,7 @@ export class PdfeEditor {
         break;
       case "paraSelected":
         this._selected = { page: msg.page, index: msg.index, bounds: msg.bounds,
-                           blockIndex: msg.blockIndex ?? -1 };
+                           blockIndex: msg.blockIndex ?? -1, text: msg.text ?? null };
         this._renderBoxes();
         // BOUNDS TRAVEL WITH THE EVENT (2026-08-13): a host that hides our
         // Edit/Delete bar has to place its own, and asking for geometry after
@@ -1877,7 +1936,8 @@ export class PdfeEditor {
           this._selected = msg.selection
             ? { page: msg.page, index: msg.selection.index,
                 bounds: msg.selection.bounds,
-                blockIndex: msg.selection.blockIndex ?? -1 }
+                blockIndex: msg.selection.blockIndex ?? -1,
+                text: msg.selection.text ?? null }
             : null;
           // Bring the change into view if it happened off-screen — but only
           // then: jumping the page on every undo of a keystroke is jarring.
@@ -1917,7 +1977,8 @@ export class PdfeEditor {
         this._selected = msg.selection
           ? { page: msg.page, index: msg.selection.index,
               bounds: msg.selection.bounds,
-              blockIndex: msg.selection.blockIndex ?? -1 }
+              blockIndex: msg.selection.blockIndex ?? -1,
+              text: msg.selection.text ?? null }
           : null;
         this._renderBoxes();
         if (!msg.blocks) this._requestGroups(msg.page);
@@ -2592,6 +2653,7 @@ export class PdfeEditor {
         && !this._draggingBox) {
       this.editBtn.style.display = "";       // restored: a picture's bar hides it
       this.rotateBarBtn.style.display = "none";  // text cannot be turned
+      this.deleteBtn.style.display = "";     // restored: a picture's bar may hide it
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
     // PICTURES. One faint outline EACH, exactly as every text block gets one:
@@ -2648,8 +2710,15 @@ export class PdfeEditor {
       // rect. Turning a picture stays HOST chrome (rotateSelection).
       if (!this._draggingBox) {
         this.editBtn.style.display = "none";
-        this.rotateBarBtn.style.display = this._rotateBarShown() ? "" : "none";
-        this._placeActions(selImg.page, selImg.bounds, scaleCss);
+        const rotateInBar = this._rotateBarShown();
+        this.rotateBarBtn.style.display = rotateInBar ? "" : "none";
+        this.deleteBtn.style.display = this._imageDeleteControl ? "" : "none";
+        // Nothing left to offer: no bar at all, rather than an empty pill.
+        if (rotateInBar || this._imageDeleteControl) {
+          this._placeActions(selImg.page, selImg.bounds, scaleCss);
+        } else {
+          this.actionsEl.style.display = "none";
+        }
       }
     }
   }
@@ -2753,7 +2822,15 @@ export class PdfeEditor {
       : rect.top + (this._pages[page].h - b[1]) * scaleCss;
     // The bar's own size is content-static: measure it once (ONE layout flush),
     // then reuse — re-reading it after the writes above would flush again.
-    if (!this._actionsSize) this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
+    // ...keyed by WHICH buttons show: a picture's bar (no Edit, maybe no Delete) is a
+    // different width from a text box's, and a size measured for one parked the other
+    // off-centre.
+    const sig = this.editBtn.style.display + "|" + this.rotateBarBtn.style.display +
+                "|" + this.deleteBtn.style.display;
+    if (!this._actionsSize || this._actionsSig !== sig) {
+      this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
+      this._actionsSig = sig;
+    }
     const [bw, bh] = this._actionsSize;
     let top = boxTop - bh - 6;
     if (top < rect.top) top = boxBot + 6;
@@ -2771,6 +2848,7 @@ export class PdfeEditor {
     const rect = this._pageRect(sel.page);
     if (!rect || !sel.quad) return;
     let bestX = -Infinity, bestY = Infinity;
+    let l = Infinity, t = Infinity, r = -Infinity, b = -Infinity;
     for (let i = 0; i < 8; i += 2) {
       const v = this._ptToView(sel.page, sel.quad[i], sel.quad[i + 1]);
       const x = v[0] * scaleCss;
@@ -2778,14 +2856,32 @@ export class PdfeEditor {
       // "top-right" in SCREEN terms: largest x, smallest y, decided together so
       // a turned picture's handle lands on the corner the user sees as top-right.
       if (x - y > bestX - bestY) { bestX = x; bestY = y; }
+      l = Math.min(l, x); t = Math.min(t, y); r = Math.max(r, x); b = Math.max(b, y);
     }
-    const SIZE = 28, GAP = 6;
+    const SIZE = 28, GAP = 6, PAD = 2;
     const btn = this.rotateBtn;
     btn.style.display = "flex";
-    const left = rect.left + bestX - SIZE / 2 + GAP;
-    const top = rect.top + bestY - SIZE / 2 - GAP;
-    btn.style.left = `${Math.max(rect.left, Math.min(left, rect.left + rect.width - SIZE))}px`;
-    btn.style.top = `${Math.max(rect.top, Math.min(top, rect.top + rect.height - SIZE))}px`;
+    const clamp = (v, lo, hi) => (lo > hi ? (lo + hi) / 2 : Math.max(lo, Math.min(v, hi)));
+    let left = clamp(rect.left + bestX - SIZE / 2 + GAP, rect.left, rect.left + rect.width - SIZE);
+    let top = clamp(rect.top + bestY - SIZE / 2 - GAP, rect.top, rect.top + rect.height - SIZE);
+    // KEEP THE WHOLE HANDLE IN VIEW (3.1.0). The page clamp above is not enough: a
+    // zoomed page is wider than the viewport, and a client's layout can hand us a
+    // page box wider than what is on screen — either way the corner sits past the
+    // visible edge and the handle was cut in half (client report, iOS, a quarter
+    // turn of a tall picture on a narrow page). So also clamp into the scroller's
+    // visible area, pulled in along the picture's own box so it still reads as "on
+    // this picture". A picture wholly out of view keeps its true corner and
+    // scrolls away with it. Strip-relative, like everything else here.
+    const sc = this.scroller;
+    const vx0 = sc.scrollLeft - (this._stripLeft || 0), vx1 = vx0 + sc.clientWidth;
+    const vy0 = sc.scrollTop - (this._stripTop || 0), vy1 = vy0 + sc.clientHeight;
+    const pl = rect.left + l, pr = rect.left + r, pt = rect.top + t, pb = rect.top + b;
+    if (pr > vx0 && pl < vx1 && pb > vy0 && pt < vy1) {
+      left = clamp(left, Math.max(vx0 + PAD, pl - SIZE / 2), Math.min(vx1 - SIZE - PAD, pr - SIZE / 2));
+      top = clamp(top, Math.max(vy0 + PAD, pt - SIZE / 2), Math.min(vy1 - SIZE - PAD, pb - SIZE / 2));
+    }
+    btn.style.left = `${left}px`;
+    btn.style.top = `${top}px`;
   }
 
   // The bar is the one overlay the user can press, so it must swallow its own
@@ -3450,10 +3546,7 @@ export class PdfeEditor {
       if ((e.ctrlKey || e.metaKey) && !e.altKey &&
           (e.key === "a" || e.key === "A") && this._editingPage >= 0) {
         e.preventDefault();
-        const len = this.sink.value.length;
-        if (!len) return;                     // empty run: stay a collapsed caret
-        this.sink.setSelectionRange(0, len);
-        this._post({ type: "selectRange", start: 0, end: len });
+        this._selectAllInRun();               // the same path selectAllText() takes
         return;
       }
       // Up/Down/Home/End must move by the PDF wrap, not the sink textarea's own

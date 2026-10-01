@@ -145,6 +145,8 @@ const ready = createPdfe({
   F.paraInfo      = m.cwrap("pdfe_para_info", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.blockCount    = m.cwrap("pdfe_block_count", "number", ["number"]);
+  F.blockText     = m.cwrap("pdfe_block_text", "number",
+                            ["number", "number", "number", "number", "number"]);
   F.blockInfo     = m.cwrap("pdfe_block_info", "number",
     ["number", "number", "number", "number", "number"]);
   F.moveBlock     = m.cwrap("pdfe_move_block", "number",
@@ -342,6 +344,23 @@ function openErrorCode(err) {
   if (err === 100) return "password-required";  // PDFE_OPEN_ERR_PASSWORD_REQUIRED
   if (err === 4) return "password-wrong";       // PDFE_OPEN_ERR_PASSWORD
   return "open-failed";
+}
+
+// The plain text of block |b| as the box shows it (pdfe_block_text, 3.1.0), read
+// while the core's grouping is this page's and fresh — i.e. only from groupPage.
+// Cached WITH the block, so "the text of the selected box" costs no core pass when
+// the box is tapped. null when the core refuses (stale grouping) — never a guess.
+function readBlockText(page, b) {
+  const n = F.blockText(doc, acquirePage(page), b, 0, 0);
+  if (n < 0) return null;
+  if (n === 0) return "";
+  const ptr = mod._malloc(n * 2);
+  F.blockText(doc, acquirePage(page), b, ptr, n);
+  let s = "";
+  const v = new Uint16Array(mod.HEAPU8.buffer, ptr, n);   // re-derived post-call (§10)
+  for (let i = 0; i < n; i += 8192) s += String.fromCharCode(...v.subarray(i, i + 8192));
+  mod._free(ptr);
+  return s;
 }
 
 function readEditorText() {
@@ -818,7 +837,7 @@ function groupPage(page) {
       for (let p = first; p < first + count; p++) {
         if (paraBounds[p]) paras.push({ index: p, bounds: paraBounds[p] });
       }
-      if (paras.length) blockList.push({ index: b, bounds, paras });
+      if (paras.length) blockList.push({ index: b, bounds, paras, text: readBlockText(page, b) });
     }
     mod._free(ip);
     mod._free(bp);
@@ -905,7 +924,8 @@ function hitParagraph(page, xPt, yPt) {
   const hit = pickPara(block.b, xPt, yPt);
   if (!hit) return null;
   return { index: hit.index, bounds: hit.bounds,
-           blockIndex: block.b.index, blockBounds: block.b.bounds };
+           blockIndex: block.b.index, blockBounds: block.b.bounds,
+           blockText: block.b.text ?? null };
 }
 
 // ONE TAP, TWO KINDS — and TEXT WINS. The core has this rule too
@@ -1181,7 +1201,8 @@ function applyHistory(kind) {
     if (hit) {
       selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt: cx, yPt: cy };
       selection = { index: hit.index, bounds: hit.blockBounds,
-                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy };
+                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy,
+                    text: hit.blockText ?? null };
     } else {
       selectedPara = null;
     }
@@ -1207,7 +1228,7 @@ function selectPara(page, hit, xPt, yPt) {
   // unit Edit opens and Delete removes.
   selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt, yPt };
   postMessage({ type: "paraSelected", page, index: hit.index,
-                bounds: hit.blockBounds,
+                bounds: hit.blockBounds, text: hit.blockText ?? null,
                 blockIndex: hit.blockIndex, blockBounds: hit.blockBounds });
 }
 
@@ -1461,7 +1482,8 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
     const para = pickPara(movedBlock, dropX, dropY);
     if (para) {
       reHit = { index: para.index, bounds: para.bounds,
-                blockIndex: movedBlock.index, blockBounds: movedBlock.bounds };
+                blockIndex: movedBlock.index, blockBounds: movedBlock.bounds,
+                blockText: movedBlock.text ?? null };
     }
   }
   if (!reHit) reHit = hitParagraph(page, dropX, dropY);
@@ -1472,7 +1494,7 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
     const ax = Math.min(Math.max(dropX, rb[0]), rb[2]);
     const ay = Math.min(Math.max(dropY, rb[1]), rb[3]);
     selectedPara = { page, index: reHit.index, bounds: reHit.blockBounds,
-                     xPt: ax, yPt: ay };
+                     xPt: ax, yPt: ay, text: reHit.blockText ?? null };
   } else {
     selectedPara = null;
   }
@@ -1488,7 +1510,8 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
           // The CLAMPED anchor, the same one selectedPara holds — reporting the raw
           // drop point would leave the shell and the worker disagreeing about where
           // the selection lives the moment the drop lands over a neighbour.
-          xPt: selectedPara.xPt, yPt: selectedPara.yPt }
+          xPt: selectedPara.xPt, yPt: selectedPara.yPt,
+          text: selectedPara.text ?? null }
       : null,
   });
   postHistory();
@@ -2293,11 +2316,13 @@ onmessage = async (e) => {
     if (!item) { clearSelection(); return; }   // empty space: just deselect
     // [tap-rung: image-select]
     if (item.kind === "image") {
-      // A picture has no second-tap-to-edit: there is nothing to open. Tapping
-      // the selected one again simply keeps it selected.
+      // A picture has no second-tap-to-edit: there is nothing to open, so
+      // tapping the selected one again toggles it OFF (3.1.0) — the same
+      // deselect as a tap on empty space, and the host hears `select` null.
       const same = selectedImage && selectedImage.page === msg.page &&
                    selectedImage.index === item.image.index;
-      if (!same) { clearSelection(); selectImage(msg.page, item.image); }
+      clearSelection();
+      if (!same) selectImage(msg.page, item.image);
       return;
     }
     // [tap-rung: para-reopen]

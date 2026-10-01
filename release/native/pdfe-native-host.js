@@ -352,6 +352,14 @@ export function attachNativeHost(editor, opts = {}) {
     editSelection: () => { editor.editSelection(); return { ok: true }; },
     deleteSelection: () => { editor.deleteSelection(); return { ok: true }; },
     clearSelection: () => { editor.clearSelection(); return { ok: true }; },
+    // Select ALL the text of the open box (3.1.0). ok:false when no box is open, the
+    // mode is not text, or the box is empty. Focus is not touched, so the keyboard stays.
+    selectAllText: () => ({ ok: editor.selectAllText() }),
+    // Show or hide Delete in a PICTURE's action bar (3.1.0): `{ on: false }` hides it.
+    setImageDeleteControl: ({ on } = {}) => {
+      editor.setImageDeleteControl(on !== false);
+      return { ok: true, on: editor.imageDeleteControl };
+    },
     moveSelection: ({ dx, dy } = {}) => {
       editor.moveSelection(Number(dx) || 0, Number(dy) || 0);
       return { ok: true };

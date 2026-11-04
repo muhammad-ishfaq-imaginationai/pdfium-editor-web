@@ -105,8 +105,23 @@ export function attachNativeHost(editor, opts = {}) {
                     // setEditMode now funnels through setMode -- additive, exactly as
                     // `rotated` and `addtextarmed` were, but a shell with an
                     // exhaustive switch over event names sees a name it has not seen.
-                    "mode"]) {
-    editor.on(ev, (detail) => emit(ev, detail));
+                    "mode",
+                    // THE CLIENT'S OWN DESIGN (3.3.0): a bar button was tapped. A native
+                    // shell cannot answer in time to stop the SDK, so it routes by ID: an
+                    // app's own id (an AI button, say) is only reported, and to change what a built-in
+                    // does it lists its own id instead and calls performAction itself.
+                    "action",
+                    // What an app's own chrome follows (3.3.0): the selection's place on
+                    // screen, and the keyboard (the SDK's typing target focused or not).
+                    "selectionrect", "keyboard",
+                    // The reader (3.3.0): where it is, its scroll state, the ends, a reading tap.
+                    "scroll", "scrollstate", "scrolledge", "pagetap",
+                    // Text search (3.3.0): the whole snapshot on every change.
+                    "search"]) {
+    // "select" carries WHERE the selection is on screen too (3.3.0), so a native shell
+    // that turned the SDK's bar off (setActionBarEnabled) can put its own buttons there.
+    editor.on(ev, (detail) => emit(ev, ev === "select"
+      ? { ...detail, screenRect: editor.selectionScreenRect } : detail));
   }
   if (opts.telemetry) editor.on("edit", (d) => emit("edit", d));
 
@@ -373,6 +388,25 @@ export function attachNativeHost(editor, opts = {}) {
       editor.setImageDeleteControl(on !== false);
       return { ok: true, on: editor.imageDeleteControl };
     },
+    // ---- the client's own design (3.3.0) -----------------------------------
+    // The look: the same fields as Android's PdfeAppearance; colours as CSS strings.
+    setAppearance: ({ appearance } = {}) => { editor.setAppearance(appearance || {}); return { ok: true }; },
+    // The action bar's buttons for "text" or "image": [{id, label?, icon?}], icon = SVG
+    // markup or an image URL. Taps arrive as the "action" event.
+    setActions: ({ kind, actions } = {}) => {
+      editor.setActions(String(kind), Array.isArray(actions) ? actions : []);
+      return { ok: true, actions: editor.actions(String(kind)) };
+    },
+    setActionBarEnabled: ({ on } = {}) => {
+      editor.setActionBarEnabled(on !== false);
+      return { ok: true, on: editor.actionBarEnabled };
+    },
+    performAction: ({ id } = {}) => ({ ok: editor.performAction(String(id)) }),
+    // The keyboard while a box stays open (3.3.0). iOS raises a keyboard only from a user
+    // gesture inside the web view, so showKeyboard may report ok and raise nothing there.
+    showKeyboard: () => ({ ok: editor.showKeyboard() }),
+    hideKeyboard: () => { editor.hideKeyboard(); return { ok: true }; },
+    selectionScreenRect: () => ({ ok: true, rect: editor.selectionScreenRect }),
     moveSelection: ({ dx, dy } = {}) => {
       editor.moveSelection(Number(dx) || 0, Number(dy) || 0);
       return { ok: true };
@@ -442,7 +476,20 @@ export function attachNativeHost(editor, opts = {}) {
     },
 
     /** Go to a 0-based page. `ok:false` in the result means out of range. */
-    goToPage: ({ page }) => ({ ok: editor.goToPage(Number(page)), page: editor.currentPage }),
+    goToPage: ({ page, animated }) => ({ ok: editor.goToPage(Number(page), animated === true), page: editor.currentPage }),
+    // The reader (3.3.0): scroll to a place 0..1 (an own scroll handle, continue reading).
+    scrollToPosition: ({ position, animated } = {}) => {
+      editor.scrollToPosition(Number(position), animated === true);
+      return { ok: true, position: editor.scrollPosition };
+    },
+    // Text search (3.3.0). Progress and results arrive as `search` events.
+    search: ({ query, matchCase, wholeWord } = {}) => {
+      editor.search(String(query ?? ""), { matchCase: matchCase === true, wholeWord: wholeWord === true });
+      return { ok: true };
+    },
+    goToNextResult: () => ({ ok: editor.goToNextResult(), search: editor.searchState() }),
+    goToPreviousResult: () => ({ ok: editor.goToPreviousResult(), search: editor.searchState() }),
+    clearSearch: () => { editor.clearSearch(); return { ok: true }; },
     /** Deprecated alias kept for shells built against the older bridge. */
     scrollToPage: ({ page }) => ({ ok: editor.goToPage(Number(page)), page: editor.currentPage }),
 

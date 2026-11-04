@@ -141,6 +141,11 @@ const ready = createPdfe({
     ["number", "number", "number", "number", "number", "number", "number", "number", "number"]);
   F.loadTextPage  = m.cwrap("pdfe_load_text_page", "number", ["number"]);
   F.closeTextPage = m.cwrap("pdfe_close_text_page", null, ["number"]);
+  // text search (3.3.0): the engine's finder, and the quads a match paints (= a mark's)
+  F.findOnPage    = m.cwrap("pdfe_find_on_page", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupQuads   = m.cwrap("pdfe_markup_quads_for_range", "number",
+    ["number", "number", "number", "number", "number"]);
   F.group         = m.cwrap("pdfe_group_page", "number", ["number", "number", "number"]);
   F.paraInfo      = m.cwrap("pdfe_para_info", "number",
     ["number", "number", "number", "number", "number", "number"]);
@@ -297,6 +302,45 @@ function blitRegion(ctx, pageHandle, scale, x, y, w, h) {
 }
 
 // ---- edit-session helpers ------------------------------------------------------
+
+// ---- text search (3.3.0) -------------------------------------------------------
+let searchGen = 0;
+
+/** One page's matches, each as its quads (unrotated page points, 8 per quad, Z order). */
+function findOnPage(page, query, flags) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  const tp = textPageOf(page);
+  if (!tp || !query) return [];
+  const qp = mod._malloc(query.length * 2);
+  for (let i = 0; i < query.length; i++) mod.HEAPU16[(qp >> 1) + i] = query.charCodeAt(i);
+  const hits = [];
+  const n = F.findOnPage(tp, qp, query.length, flags, 0, 0);
+  if (n > 0) {
+    const rb = mod._malloc(n * 8);
+    const got = F.findOnPage(tp, qp, query.length, flags, rb, n);
+    const ranges = Array.from(mod.HEAP32.subarray(rb >> 2, (rb >> 2) + 2 * got));
+    mod._free(rb);
+    for (let k = 0; k < got; k++) {
+      const c = F.markupQuads(tp, ranges[2 * k], ranges[2 * k + 1], 0, 0);
+      if (c <= 0) continue;
+      const qb = mod._malloc(c * 32);
+      F.markupQuads(tp, ranges[2 * k], ranges[2 * k + 1], qb, c);
+      hits.push(Array.from(mod.HEAPF32.subarray(qb >> 2, (qb >> 2) + c * 8)));
+      mod._free(qb);
+    }
+  }
+  mod._free(qp);
+  return hits;
+}
+
+async function runSearch(msg) {
+  for (const page of msg.order) {
+    await new Promise((r) => setTimeout(r, 0));   // let a newer search / clear in first
+    if (searchGen !== msg.gen || !doc) return;
+    const hits = findOnPage(page, msg.query, msg.flags);
+    postMessage({ type: "searchPage", gen: msg.gen, page, hits });
+  }
+}
 
 function textPageOf(i) {
   let tp = textPages.get(i);
@@ -3097,6 +3141,18 @@ onmessage = async (e) => {
 
   if (msg.type === "exportFlattened") {
     exportFlattened();
+    return;
+  }
+
+  // TEXT SEARCH (3.3.0): pages in the order given, one per task turn, so a newer
+  // search or a clear (a higher gen) stops this one after at most one page.
+  if (msg.type === "search") {
+    searchGen = msg.gen;
+    await runSearch(msg);
+    return;
+  }
+  if (msg.type === "clearSearch") {
+    searchGen = msg.gen;
     return;
   }
 

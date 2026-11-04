@@ -208,5 +208,31 @@
         }
       ]
     }
+  ],
+  "signatureFaces": [
+    {
+      "file": "DancingScript-Regular.ttf",
+      "label": "Dancing Script",
+      "bytes": 37404,
+      "sha256": "3e5f39c4c91d3526695732f42176f0cc714df8493c542a79c3940dc4d45e6dcd"
+    },
+    {
+      "file": "GreatVibes-Regular.ttf",
+      "label": "Great Vibes",
+      "bytes": 43564,
+      "sha256": "4c180a0ff544a4a9f1ca5bf5d32b0ebd9aa7ac74af71f69fd78d1d9559edaf40"
+    },
+    {
+      "file": "Caveat-Regular.ttf",
+      "label": "Caveat",
+      "bytes": 59516,
+      "sha256": "bc7ccf733730ee5a4c636046169daef1a18cec64b1f13babc4f9897318d299b7"
+    },
+    {
+      "file": "MrDafoe-Regular.ttf",
+      "label": "Mr Dafoe",
+      "bytes": 42396,
+      "sha256": "682f101d4ffea81602013c385cd82b012689213b4fd0370b17d16cc9ad04335e"
+    }
   ]
 }

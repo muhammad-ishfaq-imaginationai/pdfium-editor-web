@@ -89,9 +89,18 @@ const PDFE_CSS = `
    GREY DASHED hairline; the selected box switches to a SOLID SKY-BLUE hairline
    with a blue wash (user decision 2026-07-29), so "which box am I acting on"
    is unmistakable without the overlay ever growing. */
-.pdfe-parabox { position: absolute; border: 1px dashed #757575cc; background: #7575751f;
-                pointer-events: none; border-radius: 1px; }
-.pdfe-parabox.pdfe-selected { border-style: solid; border-color: #03a9f4; background: #03a9f426; }
+.pdfe-search-hit { position: absolute; pointer-events: none;
+                   background: var(--pdfe-search, #ffeb3b66); }
+.pdfe-search-hit.pdfe-current { background: var(--pdfe-search-current, #ff980088); }
+.pdfe-parabox { position: absolute;
+                border: var(--pdfe-line, 1px) var(--pdfe-box-style, dashed) var(--pdfe-box-border, #757575cc);
+                background: var(--pdfe-box-fill, #7575751f);
+                pointer-events: none; border-radius: var(--pdfe-box-radius, 1px); }
+.pdfe-parabox.pdfe-selected { border-style: solid; border-color: var(--pdfe-sel-border, #03a9f4);
+                              background: var(--pdfe-sel-fill, #03a9f426); }
+/* setAppearance({showBoxOutlines: false}) (3.3.0): only the selected box and picture show. */
+.pdfe-nooutlines .pdfe-parabox:not(.pdfe-selected),
+.pdfe-nooutlines .pdfe-imagebox:not(.pdfe-imagebox-selected) { display: none; }
 /* A SELECTED PICTURE. Same sky blue as a selected text box so "this is
    selected" reads identically, but a POLYGON — a turned picture's outline is
    still a rectangle geometrically and still needs four arbitrary corners, and a
@@ -100,13 +109,14 @@ const PDFE_CSS = `
 .pdfe-imagebox { position: absolute; pointer-events: none; overflow: visible; }
 /* UNSELECTED: the picture's twin of .pdfe-parabox — a grey dashed hairline that
    says "this is a thing you can grab", drawn for every picture in edit mode. */
-.pdfe-imagebox polygon { fill: none; stroke: #9e9e9e; stroke-width: 1;
+.pdfe-imagebox polygon { fill: none; stroke: var(--pdfe-image-border, #9e9e9e); stroke-width: var(--pdfe-line, 1px);
                          stroke-dasharray: 3 3; vector-effect: non-scaling-stroke; }
 /* SELECTED: solid sky blue + the same wash, matching .pdfe-parabox.pdfe-selected
    so "selected" reads identically whichever kind it is. Two pixels, not one: a
    1 px hairline over a busy photograph is genuinely hard to see, which is what
    the first look at this reported. */
-.pdfe-imagebox-selected polygon { fill: #03a9f426; stroke: #03a9f4; stroke-width: 2;
+.pdfe-imagebox-selected polygon { fill: var(--pdfe-sel-fill, #03a9f426); stroke: var(--pdfe-sel-border, #03a9f4);
+                                  stroke-width: calc(2 * var(--pdfe-line, 1px));
                                   stroke-dasharray: none; }
 /* The rotate handle. Sky blue to read as part of the selection, circular so it
    is obviously a button and not a resize grip — this feature has no resize, and
@@ -114,16 +124,17 @@ const PDFE_CSS = `
    touch target that still sits on a small picture. */
 .pdfe-rotate { position: absolute; z-index: 5; display: none;
                width: 28px; height: 28px; padding: 0; border-radius: 50%;
-               border: 1px solid #03a9f4; background: #fff; color: #03a9f4;
+               border: 1px solid var(--pdfe-rotate, #03a9f4); background: #fff; color: var(--pdfe-rotate, #03a9f4);
                box-shadow: 0 1px 4px #0003; cursor: pointer;
                align-items: center; justify-content: center; }
-.pdfe-rotate:hover { background: #03a9f4; color: #fff; }
+.pdfe-rotate:hover { background: var(--pdfe-rotate, #03a9f4); color: #fff; }
 .pdfe-rotate:active { transform: scale(0.92); }
 /* EXPERIMENTAL (feature/web-block-move): the drag ghost. A box being dragged is
    previewed as an outline that follows the finger; the real text is translated
    ONCE on drop, so a drag costs no engine work per frame. Dashed and washed so
    it reads as "not there yet", and above the faint boxes it slides over. */
-.pdfe-moveghost { position: absolute; border: 2px dashed #03a9f4; background: #03a9f41f;
+.pdfe-moveghost { position: absolute; border: calc(2 * var(--pdfe-line, 1px)) dashed var(--pdfe-ghost-border, #03a9f4);
+                  background: var(--pdfe-ghost-fill, #03a9f41f);
                   pointer-events: none; border-radius: 2px; z-index: 3; display: none; }
 /* NOTE: the box overlay deliberately stays pointer-events: none. Making the
    selected box interactive so it could carry a move cursor would steal the
@@ -137,29 +148,40 @@ const PDFE_CSS = `
    being edited and fight the selection highlight. It is its own element (not a
    .pdfe-parabox) because its geometry is the run's LIVE bounds from the core,
    refreshed every keystroke, while the grouping bounds go stale on reflow. */
-.pdfe-editbox { position: absolute; border: 1px solid #1976d2; border-radius: 1px;
+.pdfe-editbox { position: absolute; border: var(--pdfe-line, 1px) solid var(--pdfe-edit-border, #1976d2);
+                border-radius: var(--pdfe-box-radius, 1px);
                 display: none; pointer-events: none; z-index: 1; }
 /* The selected box's action bar: the ONLY chrome the SDK owns, because it is
    part of the canvas gesture (it must sit ON the box it acts on). It lives in
    the strip, so it scrolls and zooms with the page for free. */
 .pdfe-actions { position: absolute; z-index: 4; display: none; gap: 2px; padding: 3px;
-                border-radius: 8px; background: #fff; box-shadow: 0 2px 10px #00000059;
+                border-radius: var(--pdfe-bar-radius, 8px); background: var(--pdfe-bar-bg, #fff);
+                box-shadow: 0 2px 10px #00000059, 0 0 0 1px var(--pdfe-bar-border, transparent);
                 white-space: nowrap; }
-.pdfe-actions button { font: 600 13px/1 system-ui, -apple-system, sans-serif;
-                       color: #1a237e; background: transparent; border: 0;
+.pdfe-actions button { font: var(--pdfe-bar-weight, 600) var(--pdfe-bar-size, 13px)/1 system-ui, -apple-system, sans-serif;
+                       color: var(--pdfe-bar-text, #1a237e); background: transparent; border: 0;
                        border-radius: 6px; padding: 8px 12px; cursor: pointer;
                        touch-action: manipulation; }
 .pdfe-actions button:hover { background: #3f51b51f; }
-.pdfe-actions .pdfe-act-rotate { color: #1a237e; }
+.pdfe-actions .pdfe-act-rotate { color: var(--pdfe-bar-text, #1a237e); }
 .pdfe-actions .pdfe-act-rotate:hover { background: #1a237e1f; }
-.pdfe-actions .pdfe-act-del { color: #c62828; }
+.pdfe-actions .pdfe-act-del { color: var(--pdfe-bar-delete, #c62828); }
+/* setAppearance (3.3.0): the icon ABOVE the label, and thin lines between buttons. */
+/* Only a button carrying an app icon is a flex row, so the SDK's own text buttons keep their look. */
+.pdfe-actions button.pdfe-has-icon { display: inline-flex; align-items: center; gap: 4px; }
+.pdfe-actions.pdfe-icontop button.pdfe-has-icon { flex-direction: column; }
+.pdfe-actions.pdfe-dividers button + button { box-shadow: -1px 0 0 var(--pdfe-bar-border, #00000022); }
+.pdfe-actions .pdfe-act-icon { display: inline-flex; width: 20px; height: 20px; }
+.pdfe-actions .pdfe-act-icon > * { width: 100%; height: 100%; }
+/* The APP's own bar (setActionBarElement): the SDK only places it. */
+.pdfe-actions.pdfe-hostbar { padding: 0; background: none; box-shadow: none; border-radius: 0; }
 .pdfe-actions .pdfe-act-del:hover { background: #c628281f; }
 .pdfe-caret { position: absolute; width: 2px; background: #000; z-index: 1;
               display: none; pointer-events: none; animation: pdfe-blink 1s steps(1) infinite; }
 @keyframes pdfe-blink { 50% { opacity: 0; } }
-.pdfe-selrect { position: absolute; background: #3f51b555; z-index: 1; pointer-events: none; }
+.pdfe-selrect { position: absolute; background: var(--pdfe-textsel, #3f51b555); z-index: 1; pointer-events: none; }
 .pdfe-handle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
-               background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
+               background: var(--pdfe-handle, #3f51b5); border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
                z-index: 3; display: none; touch-action: none; cursor: grab; }
 /* The CARET thumb: the insertion handle under a COLLAPSED caret, so a finger can
    drag the caret instead of having to tap the exact glyph. Its own class (not
@@ -167,7 +189,7 @@ const PDFE_CSS = `
    collapsed-caret message. Deliberately NOT inside .pdfe-caret: the caret blinks,
    and a blinking grip reads as a rendering fault. */
 .pdfe-carethandle { position: absolute; width: 18px; height: 18px; border-radius: 50%;
-                    background: #3f51b5; border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
+                    background: var(--pdfe-handle, #3f51b5); border: 2px solid #fff; box-shadow: 0 1px 4px #0007;
                     z-index: 3; display: none; touch-action: none; cursor: grab; }
 /* The IME sink (WEB_VIEWER.md §7): 1x1, transparent, parked at the caret. NEVER
    a visible editor — it exists only to summon the keyboard and receive
@@ -181,6 +203,24 @@ const PDFE_CSS = `
              pointer-events: none; font-size: 16px; /* prevents iOS focus-zoom */
              -webkit-user-select: text; user-select: text; }
 `;
+
+// THE CLIENT'S OWN DESIGN (3.3.0): each setAppearance field -> its CSS variable. The
+// names are Android's PdfeAppearance's; the CSS above falls back to today's look.
+const PDFE_APPEARANCE_VARS = {
+  boxBorderColor: "--pdfe-box-border", boxFillColor: "--pdfe-box-fill",
+  selectedBorderColor: "--pdfe-sel-border", selectedFillColor: "--pdfe-sel-fill",
+  editingBorderColor: "--pdfe-edit-border", imageBorderColor: "--pdfe-image-border",
+  textSelectionColor: "--pdfe-textsel", handleColor: "--pdfe-handle",
+  ghostBorderColor: "--pdfe-ghost-border", ghostFillColor: "--pdfe-ghost-fill",
+  rotateHandleColor: "--pdfe-rotate", borderWidthDp: "--pdfe-line", cornerRadiusDp: "--pdfe-box-radius",
+  searchHighlightColor: "--pdfe-search", searchCurrentColor: "--pdfe-search-current",
+  barBackgroundColor: "--pdfe-bar-bg", barBorderColor: "--pdfe-bar-border",
+  barCornerRadiusDp: "--pdfe-bar-radius", barTextColor: "--pdfe-bar-text",
+  barDeleteColor: "--pdfe-bar-delete", barTextSizeSp: "--pdfe-bar-size",
+};
+const PDFE_BUILT_IN_ACTIONS = new Set(["edit", "copy", "delete", "rotate"]);
+const PDFE_ACTION_LABEL = { edit: "✎ Edit", copy: "⧉ Copy", delete: "🗑 Delete", rotate: "⟳ Rotate" };
+const PDFE_ACTION_CLASS = { edit: "pdfe-act-edit", copy: "pdfe-act-copy", delete: "pdfe-act-del", rotate: "pdfe-act-rotate" };
 
 function injectStyles(doc) {
   if (doc.getElementById(PDFE_STYLE_ID)) return;
@@ -289,6 +329,12 @@ export class PdfeEditor {
       ? opts.imageRotateControl : "bar";
     // DOES A PICTURE'S BAR OFFER DELETE (3.1.0): on unless the host passes false.
     this._imageDeleteControl = opts.imageDeleteControl !== false;
+    // The client's own design (3.3.0): the look, the buttons per kind, the bar switch,
+    // and the app's own bar element. See setAppearance / setActions.
+    this._appearance = {};
+    this._actionsByKind = new Map();
+    this._actionBarEnabled = true;
+    this._actionBarElement = null;
     // ADD TEXT: armed between armAddText() and the tap that places a box.
     // Read by _tapWantsKeyboard, which must answer synchronously inside the
     // gesture for iOS to raise a keyboard at all (S39).
@@ -629,6 +675,7 @@ export class PdfeEditor {
     if (previous === next) return;
     const wasText = previous === "text", isText = next === "text";
     this._mode = next;
+    if (isText) this.clearSearch();   // 3.3.0: typing changes the words under the results
     // THE TEXT-EDITING SEAM. Only a change in text-ness does any work -- every other
     // transition (view <-> annotate) is state plus events, which is exactly why this
     // step is a no-op. Step 13 hangs annotate's own enter/leave off this branch.
@@ -718,6 +765,9 @@ export class PdfeEditor {
   get isTextBoxSelected() { return this.selectionKind === "text"; }
   /** true while a PICTURE is selected — `selectionKind === "image"`. Since 3.1.0. */
   get isImageSelected() { return this.selectionKind === "image"; }
+  /** true while ANYTHING is selected — what `clearSelection()` clears. The web has no
+   *  page-text selection, so this is `selectionKind !== null`. Since 3.3.0. */
+  get isAnythingSelected() { return this.selectionKind !== null; }
   /**
    * The TEXT of the selected text box, or null when no text box is selected (a
    * picture, nothing, or a box open for typing — read `editing` for that). Plain
@@ -849,6 +899,235 @@ export class PdfeEditor {
   setImageDeleteControl(on) {
     this._imageDeleteControl = !!on;
     this._renderBoxes();
+  }
+
+  // ---- the client's own design: buttons and look (3.3.0) -------------------
+
+  /** The look last given to setAppearance (only the fields that were set). */
+  get appearance() { return { ...this._appearance }; }
+
+  /**
+   * THE LOOK of what the SDK draws over the page — box outlines, the selection, the
+   * knobs, the move ghost, the rotate control and the action bar. Every field is
+   * optional and defaults to today's look; the names are Android's PdfeAppearance's.
+   * Colours are CSS colours ("#7c3aed", "#7c3aed1a"); sizes are CSS pixels.
+   * Replaces the whole look (pass the same object with one field changed to tweak one).
+   */
+  setAppearance(a) {
+    this._appearance = { ...(a || {}) };
+    const st = this.root.style;
+    for (const [field, v] of Object.entries(PDFE_APPEARANCE_VARS)) {
+      const val = this._appearance[field];
+      if (val === undefined || val === null) { st.removeProperty(v); continue; }
+      st.setProperty(v, typeof val === "number" ? `${val}px` : String(val));
+    }
+    const ap = this._appearance;
+    if (ap.boxBorderDashed === false) st.setProperty("--pdfe-box-style", "solid");
+    else st.removeProperty("--pdfe-box-style");
+    if (ap.barTextBold === false) st.setProperty("--pdfe-bar-weight", "400");
+    else st.removeProperty("--pdfe-bar-weight");
+    this.root.classList.toggle("pdfe-nooutlines", ap.showBoxOutlines === false);
+    this.actionsEl.classList.toggle("pdfe-icontop", ap.barIconPosition === "top");
+    this.actionsEl.classList.toggle("pdfe-dividers", ap.barDividers === true);
+    this._actionsKey = null;
+    this._renderBoxes();
+  }
+
+  /**
+   * WHICH BUTTONS the action bar shows for one kind — "text" or "image" — in this
+   * order (a repeated id is dropped). Each is {id, label?, icon?}: the SDK's own ids
+   * are "edit", "copy", "delete", "rotate"; any other id is the app's own button
+   * (e.g. {id: "ai", label: "Edit with AI", icon: "<svg …>"} — icon is SVG markup or an
+   * image URL). A tap on any of them emits "action" first. A built-in shows only where
+   * it can act; an empty list hides the bar for that kind.
+   */
+  setActions(kind, actions) {
+    const seen = new Set();
+    this._actionsByKind.set(String(kind), (actions || []).filter((a) => {
+      const id = a && String(a.id || "");
+      if (!id || seen.has(id)) return false;
+      seen.add(id);
+      return true;
+    }).map((a) => ({ id: String(a.id), label: a.label ?? null, icon: a.icon ?? null })));
+    this._actionsKey = null;
+    this._renderBoxes();
+  }
+
+  /** The buttons |kind|'s bar offers: what setActions set, or the default
+   *  (text: edit, delete · image: rotate, delete). */
+  actions(kind) {
+    const set = this._actionsByKind.get(String(kind));
+    if (set) return set.map((a) => ({ ...a }));
+    return (kind === "text" ? ["edit", "delete"] : kind === "image" ? ["rotate", "delete"] : ["delete"])
+      .map((id) => ({ id, label: null, icon: null }));
+  }
+
+  /** Does the SDK draw its action bar over a selected item? Default true. */
+  get actionBarEnabled() { return this._actionBarEnabled; }
+  /** Off: the SDK draws no bar; the app draws its own at selectionScreenRect and calls
+   *  performAction for the SDK's actions. */
+  setActionBarEnabled(on) {
+    this._actionBarEnabled = !!on;
+    this._renderBoxes();
+  }
+
+  /**
+   * The app's OWN action bar element, or null for the SDK's. The SDK only places it
+   * over the selection and hides it; each button with data-pdfe-action="<id>" is
+   * shown for the kinds whose actions list it, and a tap emits "action" first.
+   */
+  setActionBarElement(el) {
+    this._actionBarElement = el || null;
+    this._actionsKey = null;
+    this._renderBoxes();
+  }
+
+  /**
+   * Run one of the SDK's own actions on what is selected now: "edit", "delete",
+   * "rotate", "copy". Emits no "action" event. Returns false when it does not apply.
+   */
+  performAction(id) {
+    const kind = this.selectionKind;
+    if (!kind) return false;
+    switch (id) {
+      case "edit": if (kind !== "text") return false; this.editSelection(); return true;
+      case "delete": this.deleteSelection(); return true;
+      case "rotate": return kind === "image" && this.rotateSelection(1);
+      case "copy": {
+        const t = this.selectedTextBoxText;
+        if (t == null) return false;
+        try { navigator.clipboard?.writeText(t); } catch (e) { /* no clipboard here */ }
+        return true;
+      }
+      default: return false;
+    }
+  }
+
+  /**
+   * WHERE THE SELECTION IS ON SCREEN, in CSS pixels relative to the editor's own
+   * box: {left, top, width, height}, or null when nothing is selected. Read it on
+   * "select"; scrolling and zooming move it.
+   */
+  get selectionScreenRect() {
+    const sel = this._selectedImage || this._selected;
+    if (!sel) return null;
+    const rect = this._pageRect(sel.page);
+    if (!rect) return null;
+    const k = this._fitScale * this._zoom;
+    const v = this._viewBox(sel.page, sel.bounds);
+    // Page rects are STRIP coordinates; the strip's own box carries the scroll.
+    const box = this.root.getBoundingClientRect();
+    const strip = this.strip.getBoundingClientRect();
+    return {
+      left: strip.left - box.left + rect.left + v.left * k,
+      top: strip.top - box.top + rect.top + v.top * k,
+      width: v.width * k, height: v.height * k,
+    };
+  }
+
+  /**
+   * IS THE KEYBOARD THE SDK'S NOW — its typing target has focus. On a phone or tablet that
+   * is exactly when the on-screen keyboard is up; a desktop has none. The `keyboard` event
+   * reports every change.
+   */
+  get keyboardVisible() { return !!this.sink && this._doc.activeElement === this.sink; }
+
+  /** Bring the keyboard back while a box is open for typing (call it from a tap — iOS raises
+   *  a keyboard only inside a user gesture). false when no box is open. */
+  showKeyboard() {
+    if (this._editingPage < 0) return false;
+    this._setSinkFocus(true);
+    return true;
+  }
+
+  /** Put the keyboard away and STAY in the box (caret and selection kept). To leave the box
+   *  too, call getOutOfBoxEditing(). */
+  hideKeyboard() { this._setSinkFocus(false); }
+
+  /** Emit "selectionrect" when the selection's place on screen changed — at most once a frame. */
+  _reportSelectionRect() {
+    if (this._rectFrame) return;
+    const raf = globalThis.requestAnimationFrame ?? ((f) => setTimeout(f, 16));
+    this._rectFrame = raf(() => {
+      this._rectFrame = 0;
+      const r = this.selectionScreenRect;
+      const key = r ? `${r.left}|${r.top}|${r.width}|${r.height}` : "";
+      if (key === this._rectKey) return;
+      this._rectKey = key;
+      this._emit("selectionrect", { rect: r });
+    });
+  }
+
+  /** Is built-in |id| able to act on |kind| now? An app id always shows. */
+  _actionOffered(kind, id) {
+    switch (id) {
+      case "edit": return kind === "text";
+      case "copy": return kind === "text" && this.selectedTextBoxText != null;
+      case "rotate": return kind === "image" && this._rotateBarShown();
+      case "delete": return kind !== "image" || this._imageDeleteControl;
+      default: return true;
+    }
+  }
+
+  /** Fill the bar for |kind|; false = show no bar. */
+  _fillActions(kind) {
+    if (!this._actionBarEnabled) return false;
+    const items = this.actions(kind).filter((a) => this._actionOffered(kind, a.id));
+    const host = this._actionBarElement;
+    const key = kind + "|" + items.map((a) => a.id).join(",") + "|" + (host ? "host" : "sdk");
+    if (key === this._actionsKey) return host ? true : items.length > 0;
+    this._actionsKey = key;
+    this._actionsSize = null;               // a different set of buttons is a different size
+    this.actionsEl.classList.toggle("pdfe-hostbar", !!host);
+    if (host) {
+      if (host.parentNode !== this.actionsEl) this.actionsEl.replaceChildren(host);
+      for (const el of host.querySelectorAll("[data-pdfe-action]"))
+        el.style.display = items.some((a) => a.id === el.dataset.pdfeAction) ? "" : "none";
+      return true;
+    }
+    this.actionsEl.replaceChildren(...items.map((a) => {
+      const b = this._doc.createElement("button");
+      b.type = "button";
+      b.dataset.pdfeAction = a.id;
+      const cls = PDFE_ACTION_CLASS[a.id];
+      if (cls) b.className = cls;
+      // The SDK's own labels carry a glyph as their icon; with the app's icon, drop it.
+      const own = PDFE_ACTION_LABEL[a.id];
+      const label = a.label ?? (own && a.icon ? own.replace(/^\S+\s/, "") : own) ?? a.id;
+      if (a.icon) {
+        b.classList.add("pdfe-has-icon");
+        const i = this._doc.createElement("span");
+        i.className = "pdfe-act-icon";
+        if (/^\s*<svg/i.test(a.icon)) i.innerHTML = a.icon;
+        else {
+          const img = this._doc.createElement("img");
+          img.src = a.icon;
+          img.alt = "";
+          i.append(img);
+        }
+        const t = this._doc.createElement("span");
+        t.textContent = label;
+        b.append(i, t);
+      } else {
+        b.textContent = label;
+      }
+      return b;
+    }));
+    return items.length > 0;
+  }
+
+  /** A bar button was tapped: the app is asked first ("action"), then the SDK acts. */
+  _onActionPick(id) {
+    const kind = this.selectionKind;
+    if (!kind) return;
+    const sel = this._selectedImage || this._selected;
+    let handled = false;
+    this._emit("action", {
+      id, kind, page: sel.page, boundsPt: sel.bounds ? [...sel.bounds] : null,
+      text: kind === "text" ? this.selectedTextBoxText : null,
+      preventDefault() { handled = true; },
+    });
+    if (!handled && PDFE_BUILT_IN_ACTIONS.has(id)) this.performAction(id);
   }
 
   _rotateHandleShown() {
@@ -1310,6 +1589,7 @@ export class PdfeEditor {
       addingText: this.addingText,
       selectionKind: this.selectionKind,
       isTextBoxSelected: this.isTextBoxSelected,
+      isAnythingSelected: this.isAnythingSelected,
       isImageSelected: this.isImageSelected,
       selectedTextBoxText: this.selectedTextBoxText,
       imageSelection: this.imageSelection,
@@ -1319,6 +1599,8 @@ export class PdfeEditor {
       documentName: this.documentName, documentBytes: this.documentBytes,
       suggestedName: this.suggestedName(),
       canUndo: this.canUndo, canRedo: this.canRedo,
+      keyboardVisible: this.keyboardVisible,
+      search: this.searchState(),
     };
   }
   /** 0-based page the next undo would affect, or -1. Lets a host label the button. */
@@ -1396,15 +1678,199 @@ export class PdfeEditor {
    * decision, like save). Note that typing afterwards scrolls the caret back into
    * view, so a host offering "go to page" mid-edit usually wants `commit()` first.
    */
-  goToPage(page) {
+  goToPage(page, animated = false) {
     const i = Math.trunc(Number(page));
     if (!Number.isFinite(i) || i < 0 || i >= this._pageCanvases.length) return false;
     if (!this._pageOffsets.length) this._measurePageOffsets();
-    this.scroller.scrollTop = this._pageOffsets[i][0] - 8;
+    const top = this._pageOffsets[i][0] - 8;
+    // 3.3.0: `animated` glides there (the go-to-page sheet, a bookmark, read-aloud).
+    if (animated) this.scroller.scrollTo({ top, behavior: "smooth" });
+    else this.scroller.scrollTop = top;
     // Announce the new page now instead of waiting for the browser's scroll event,
     // so a host that shows a page label sees it update in the same task.
     this._updateCurrentPage();
     return true;
+  }
+
+  // ---- the reader (3.3.0): where the user is, and the scroll's state -----------------
+
+  /** How far down the document the view is: 0 = the very top, 1 = the very bottom (0 when it
+   *  all fits). The `scroll` event reports every change. */
+  get scrollPosition() {
+    const sc = this.scroller;
+    if (!sc) return 0;                  // a reader never throws, even before the view exists
+    const range = sc.scrollHeight - sc.clientHeight;
+    return range > 0 ? Math.min(1, Math.max(0, sc.scrollTop / range)) : 0;
+  }
+
+  /** Is the user scrolling now? The `scrollstate` event reports every change. */
+  get isScrolling() { return !!this._scrolling; }
+
+  /** Scroll to |position| (0..1, the scrollPosition scale); |animated| glides there. */
+  scrollToPosition(position, animated = false) {
+    const range = this.scroller.scrollHeight - this.scroller.clientHeight;
+    if (!(range > 0)) return;
+    const top = Math.min(1, Math.max(0, Number(position) || 0)) * range;
+    if (animated) this.scroller.scrollTo({ top, behavior: "smooth" });
+    else this.scroller.scrollTop = top;
+  }
+
+  /** After the scroller moved: `scroll` {position, page}, `scrollstate` on a start and (150 ms
+   *  after the last movement) a stop, and `scrolledge` once per arrival at the top or bottom. */
+  _reportScroll() {
+    if (!this.scroller) return;
+    const pos = this.scrollPosition;
+    if (pos === this._reportedScroll) return;
+    this._reportedScroll = pos;
+    this._emit("scroll", { position: pos, page: this._currentPage });
+    const fits = this.scroller.scrollHeight <= this.scroller.clientHeight;
+    const at = fits || pos <= 0.0005 ? "top" : pos >= 0.9995 ? "bottom" : null;
+    if (at && at !== this._reportedEdge) this._emit("scrolledge", { edge: at });
+    this._reportedEdge = at;
+  }
+
+  _scrollMoved() {
+    if (!this._scrolling) { this._scrolling = true; this._emit("scrollstate", { scrolling: true }); }
+    clearTimeout(this._scrollStopTimer);
+    this._scrollStopTimer = setTimeout(() => {
+      this._scrolling = false;
+      this._emit("scrollstate", { scrolling: false });
+    }, 150);
+    this._reportScroll();
+  }
+
+  // ---- TEXT SEARCH (3.3.0) ------------------------------------------------------------
+  // Pages are searched in the worker one per task, starting at the page on screen and
+  // wrapping; results are NUMBERED in document order. The Android twin of the walking rule is
+  // pdf/SearchRun.kt — keep the two in step (web/sdk/search_test.mjs, SearchRunTest).
+
+  /** Where the text search stands — the same snapshot the `search` event carries. */
+  searchState() {
+    const s = this._search;
+    if (!s) return { query: "", searching: false, pagesSearched: 0, pageCount: 0,
+                     resultCount: 0, currentIndex: -1, currentPage: -1 };
+    let idx = -1;
+    if (s.curPage >= 0) {
+      idx = s.curOnPage;
+      for (let p = 0; p < s.curPage; p++) idx += (s.hits.get(p) || []).length;
+    }
+    return { query: s.query, searching: s.pagesSearched < s.pageCount,
+             pagesSearched: s.pagesSearched, pageCount: s.pageCount, resultCount: s.resultCount,
+             currentIndex: idx, currentPage: s.curPage };
+  }
+
+  /** Search the document's text, in view or annotate mode. Every result is highlighted, the
+   *  first one found is shown, and `search` reports after every page. A blank query clears. */
+  search(query, { matchCase = false, wholeWord = false } = {}) {
+    const q = String(query ?? "");
+    if (!q.trim()) { this.clearSearch(); return; }
+    if (!this._pages || !this._pages.length) {
+      this._emit("error", { code: "no-document", detail: "No document is open" }); return;
+    }
+    if (this._mode === "text") {
+      this._emit("error", { code: "search-unavailable", detail: "Search works in view or annotate mode" });
+      return;
+    }
+    const n = this._pages.length;
+    const start = Math.min(n - 1, Math.max(0, this._currentPage | 0));
+    const gen = (this._searchGen = (this._searchGen || 0) + 1);
+    this._search = { query: q, gen, pageCount: n, pagesSearched: 0, resultCount: 0,
+                     hits: new Map(), curPage: -1, curOnPage: -1 };
+    this._renderSearch();
+    this._emit("search", this.searchState());
+    const order = Array.from({ length: n }, (_, i) => (start + i) % n);
+    this._post({ type: "search", gen, query: q, flags: (matchCase ? 1 : 0) | (wholeWord ? 2 : 0), order });
+  }
+
+  /** A page's results arrived from the worker. */
+  _onSearchPage(msg) {
+    const s = this._search;
+    if (!s || msg.gen !== s.gen || s.hits.has(msg.page)) return;   // replaced or cleared
+    s.hits.set(msg.page, msg.hits);
+    s.pagesSearched++;
+    s.resultCount += msg.hits.length;
+    const first = s.curPage < 0 && msg.hits.length > 0;
+    if (first) { s.curPage = msg.page; s.curOnPage = 0; }
+    this._renderSearch();
+    if (first) this._revealSearchHit();
+    this._emit("search", this.searchState());
+  }
+
+  /** Show the next result (wrapping after the last). false when there is none. */
+  goToNextResult() { return this._stepSearch(true); }
+  /** Show the previous result (wrapping before the first). false when there is none. */
+  goToPreviousResult() { return this._stepSearch(false); }
+
+  _stepSearch(forward) {
+    const s = this._search;
+    if (!s || s.resultCount === 0 || s.curPage < 0) return false;
+    const on = (p) => (s.hits.get(p) || []).length;
+    if (forward && s.curOnPage + 1 < on(s.curPage)) s.curOnPage++;
+    else if (!forward && s.curOnPage > 0) s.curOnPage--;
+    else {
+      let p = s.curPage, moved = false;
+      for (let k = 0; k < s.pageCount; k++) {
+        p = forward ? (p + 1) % s.pageCount : (p - 1 + s.pageCount) % s.pageCount;
+        if (on(p) > 0) { s.curPage = p; s.curOnPage = forward ? 0 : on(p) - 1; moved = true; break; }
+      }
+      if (!moved) return false;
+    }
+    this._renderSearch();
+    this._revealSearchHit();
+    this._emit("search", this.searchState());
+    return true;
+  }
+
+  /** End the search: the highlights go and one last `search` event says query "". Also done
+   *  when text mode is entered or a new document opens. */
+  clearSearch() {
+    this._searchGen = (this._searchGen || 0) + 1;
+    if (this._worker) this._post({ type: "clearSearch", gen: this._searchGen });
+    if (!this._search) return;
+    this._search = null;
+    this._renderSearch();
+    this._emit("search", this.searchState());
+  }
+
+  /** The highlights, in strip space like the boxes (they scroll and zoom with the pages). */
+  _renderSearch() {
+    if (!this.searchEl) return;
+    this.searchEl.innerHTML = "";
+    const s = this._search;
+    if (!s) return;
+    const scaleCss = this._fitScale * this._zoom;
+    for (const [page, hits] of s.hits) {
+      const rect = this._pageRect(page);
+      if (!rect || !this._pages[page]) continue;
+      hits.forEach((q, i) => {
+        for (let o = 0; o + 8 <= q.length; o += 8) {
+          const xs = [q[o], q[o + 2], q[o + 4], q[o + 6]], ys = [q[o + 1], q[o + 3], q[o + 5], q[o + 7]];
+          const v = this._viewBox(page, [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)]);
+          const div = this._doc.createElement("div");
+          div.className = page === s.curPage && i === s.curOnPage ? "pdfe-search-hit pdfe-current" : "pdfe-search-hit";
+          div.style.left = (rect.left + v.left * scaleCss) + "px";
+          div.style.top = (rect.top + v.top * scaleCss) + "px";
+          div.style.width = (v.width * scaleCss) + "px";
+          div.style.height = (v.height * scaleCss) + "px";
+          this.searchEl.appendChild(div);
+        }
+      });
+    }
+  }
+
+  /** Scroll the current result into view (centred) when it is not already well inside it. */
+  _revealSearchHit() {
+    const s = this._search;
+    const el = this.searchEl && this.searchEl.querySelector(".pdfe-current");
+    if (!s || !el || !this.scroller) return;
+    const top = parseFloat(el.style.top), h = parseFloat(el.style.height);
+    const left = parseFloat(el.style.left), w = parseFloat(el.style.width);
+    const sc = this.scroller, margin = 48;
+    const inY = top >= sc.scrollTop + margin && top + h <= sc.scrollTop + sc.clientHeight - margin;
+    const inX = left >= sc.scrollLeft && left + w <= sc.scrollLeft + sc.clientWidth;
+    if (inY && inX) return;
+    sc.scrollTo({ top: inY ? sc.scrollTop : top + h / 2 - sc.clientHeight / 2,
+                  left: inX ? sc.scrollLeft : left + w / 2 - sc.clientWidth / 2, behavior: "smooth" });
   }
 
   /** @deprecated since 1.2 — use {@link goToPage}. Kept for existing hosts. */
@@ -1635,6 +2101,7 @@ export class PdfeEditor {
     this.root.style.setProperty("--pdfe-bg", this._backgroundColor);
     this.strip = mk("div", "pdfe-strip");
     this.boxesEl = mk("div", "pdfe-layer pdfe-boxes");
+    this.searchEl = mk("div", "pdfe-layer pdfe-search");
     this.selEl = mk("div", "pdfe-layer pdfe-sel");
     this.caretEl = mk("div", "pdfe-caret");
     this.editBoxEl = mk("div", "pdfe-editbox");
@@ -1659,25 +2126,15 @@ export class PdfeEditor {
       'stroke-linecap="round" stroke-linejoin="round" ' +
       'd="M20 11a8 8 0 1 0-2.3 5.7"/>' +
       '<path fill="currentColor" d="M20 4.5v6h-6z"/></svg>';
-    this.editBtn = mk("button", "pdfe-act-edit");
-    this.deleteBtn = mk("button", "pdfe-act-del");
-    this.editBtn.type = "button";
-    this.deleteBtn.type = "button";
-    this.editBtn.textContent = "✎ Edit";
-    this.deleteBtn.textContent = "🗑 Delete";
-    // The BAR form of rotation (imageRotateControl "bar" / "both"). The handle above
-    // is the same verb in the other place; a host picks which it wants, or neither.
-    this.rotateBarBtn = mk("button", "pdfe-act-rotate");
-    this.rotateBarBtn.type = "button";
-    this.rotateBarBtn.textContent = "⟳ Rotate";
-    this.actionsEl.append(this.editBtn, this.rotateBarBtn, this.deleteBtn);
+    // The action bar's BUTTONS are built from setActions(kind) at every show (3.3.0) —
+    // see _fillActions. Rotate in the bar is imageRotateControl "bar" / "both".
     this.sink = mk("textarea", "pdfe-sink");
     for (const [k, v] of Object.entries({
       autocapitalize: "off", autocomplete: "off", autocorrect: "off",
       spellcheck: "false", "aria-hidden": "true", tabindex: "-1",
     })) this.sink.setAttribute(k, v);
 
-    this.strip.append(this.boxesEl, this.editBoxEl, this.moveGhostEl, this.selEl,
+    this.strip.append(this.searchEl, this.boxesEl, this.editBoxEl, this.moveGhostEl, this.selEl,
       this.caretEl, ...this.handleEls, this.caretHandleEl, this.actionsEl,
       this.rotateBtn, this.sink);
     this.root.appendChild(this.strip);
@@ -1689,6 +2146,18 @@ export class PdfeEditor {
     this._wireActions();
     this._wireViewportGestures();
     this._wireHistoryKeys();
+    // A TAP IN READING MODE (3.3.0) — the canvas router returns at its edit-mode gate, so a
+    // view-mode tap never reaches it; this reports it as "pagetap" (a reader toggles its bars).
+    this._listen(this.scroller, "click", (ev) => {
+      if (this._mode !== "view" || this._pinchActive || performance.now() - this._lastPinchEnd < 350) return;
+      const canvas = ev.target?.closest?.("canvas[data-page]");
+      if (!canvas) return;
+      const page = Number(canvas.dataset.page);
+      const rect = canvas.getBoundingClientRect();
+      const k = this._fitScale * this._zoom;
+      const [xPt, yPt] = this._viewToPt(page, (ev.clientX - rect.left) / k, (ev.clientY - rect.top) / k);
+      this._emit("pagetap", { page, xPt, yPt });
+    });
 
     // Live page number. Safe to do synchronously: the browser already coalesces
     // scroll events to one per frame per element, and the work reads only CACHED
@@ -1697,11 +2166,13 @@ export class PdfeEditor {
     // The scroll also arms the (throttled) far-page eviction sweep.
     this._listen(this.scroller, "scroll", () => {
       this._updateCurrentPage();
+      this._scrollMoved();   // the reader's reports (3.3.0)
       this._scheduleEvictSweep();
       // The rotate handle is clamped into the VISIBLE area, so it has to follow a
       // scroll (a few style writes; nothing else re-renders on scroll).
       if (this._selectedImage && this.rotateBtn.style.display === "flex" && !this._draggingBox)
         this._placeRotate(this._selectedImage, this._fitScale * this._zoom);
+      this._reportSelectionRect();   // an app's own bar follows the selection (3.3.0)
     }, { passive: true });
 
     // Lazy paint/group as pages scroll into view — rooted at OUR scroller, not
@@ -1782,6 +2253,7 @@ export class PdfeEditor {
         this._emit("ready", this.capabilities);
         break;
       }
+      case "searchPage": this._onSearchPage(msg); break;
       case "opened": {
         this._pages = msg.pages;
         this._pageMatrices.clear();
@@ -1793,6 +2265,9 @@ export class PdfeEditor {
         };
         this._settle("open", true, info);
         this._emit("opened", info);
+        this._reportedScroll = undefined; this._reportedEdge = undefined;
+        this._reportScroll();   // a reader is told where it starts: the top
+        this.clearSearch();     // 3.3.0: results named the previous document
         break;
       }
       case "painted":
@@ -2666,6 +3141,8 @@ export class PdfeEditor {
   // inside the strip so they scroll and pinch with the pages for free; the open
   // run's box is omitted while it is being edited.
   _renderBoxes() {
+    this._renderSearch();
+    this._reportSelectionRect();
     this.boxesEl.innerHTML = "";
     this.actionsEl.style.display = "none";
     this.rotateBtn.style.display = "none";
@@ -2705,10 +3182,7 @@ export class PdfeEditor {
     // ...but NOT its action bar while the box is being dragged: any re-render
     // during a drag (a scroll, a zoom) would otherwise put it back on the old rect.
     if (sel && boxEl(sel.page, sel.bounds, "pdfe-parabox pdfe-selected")
-        && !this._draggingBox) {
-      this.editBtn.style.display = "";       // restored: a picture's bar hides it
-      this.rotateBarBtn.style.display = "none";  // text cannot be turned
-      this.deleteBtn.style.display = "";     // restored: a picture's bar may hide it
+        && !this._draggingBox && this._fillActions("text")) {
       this._placeActions(sel.page, sel.bounds, scaleCss);
     }
     // PICTURES. One faint outline EACH, exactly as every text block gets one:
@@ -2764,12 +3238,8 @@ export class PdfeEditor {
       // reason it is for a text box: a re-render would strand it on the old
       // rect. Turning a picture stays HOST chrome (rotateSelection).
       if (!this._draggingBox) {
-        this.editBtn.style.display = "none";
-        const rotateInBar = this._rotateBarShown();
-        this.rotateBarBtn.style.display = rotateInBar ? "" : "none";
-        this.deleteBtn.style.display = this._imageDeleteControl ? "" : "none";
         // Nothing left to offer: no bar at all, rather than an empty pill.
-        if (rotateInBar || this._imageDeleteControl) {
+        if (this._fillActions("image")) {
           this._placeActions(selImg.page, selImg.bounds, scaleCss);
         } else {
           this.actionsEl.style.display = "none";
@@ -2880,12 +3350,8 @@ export class PdfeEditor {
     // ...keyed by WHICH buttons show: a picture's bar (no Edit, maybe no Delete) is a
     // different width from a text box's, and a size measured for one parked the other
     // off-centre.
-    const sig = this.editBtn.style.display + "|" + this.rotateBarBtn.style.display +
-                "|" + this.deleteBtn.style.display;
-    if (!this._actionsSize || this._actionsSig !== sig) {
-      this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
-      this._actionsSig = sig;
-    }
+    // (_fillActions clears the cached size whenever the buttons or their look change.)
+    if (!this._actionsSize) this._actionsSize = [bar.offsetWidth, bar.offsetHeight];
     const [bw, bh] = this._actionsSize;
     let top = boxTop - bh - 6;
     if (top < rect.top) top = boxBot + 6;
@@ -2952,9 +3418,13 @@ export class PdfeEditor {
     // treats the press as a tap on the page and deselects the picture first.
     this._listen(this.rotateBtn, "pointerdown", swallow);
     this._listen(this.rotateBtn, "click", (ev) => { swallow(ev); this.rotateSelection(1); });
-    this._listen(this.rotateBarBtn, "click", (ev) => { swallow(ev); this.rotateSelection(1); });
-    this._listen(this.editBtn, "click", (ev) => { swallow(ev); this.editSelection(); });
-    this._listen(this.deleteBtn, "click", (ev) => { swallow(ev); this.deleteSelection(); });
+    // EVERY bar button — the SDK's and the app's own element's — by its data-pdfe-action.
+    this._listen(this.actionsEl, "click", (ev) => {
+      const b = ev.target.closest?.("[data-pdfe-action]");
+      if (!b || !this.actionsEl.contains(b)) return;
+      swallow(ev);
+      this._onActionPick(b.dataset.pdfeAction);
+    });
   }
 
   // ---- caret / selection overlays (§6): CORE page geometry -> CSS ----------
@@ -3588,7 +4058,11 @@ export class PdfeEditor {
       clearTimeout(this._sealTimer);
       this._sealTimer = setTimeout(() => this._post({ type: "sealHistory" }), 300);
     });
-    this._listen(this.sink, "blur", () => this._post({ type: "sealHistory" }));
+    this._listen(this.sink, "blur", () => {
+      this._post({ type: "sealHistory" });
+      this._emit("keyboard", { visible: false });     // 3.3.0: the typing target let go
+    });
+    this._listen(this.sink, "focus", () => this._emit("keyboard", { visible: true }));
     this._listen(this.sink, "keydown", (e) => {
       // Undo/redo FIRST — before every other binding. See _handleHistoryKey for
       // why its preventDefault is load-bearing.

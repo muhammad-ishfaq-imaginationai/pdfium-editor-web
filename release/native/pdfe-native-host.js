@@ -53,6 +53,24 @@ function detectTransport(name) {
  *                       telemetry: also forward per-keystroke timings.
  * @returns the object also published as window.PdfeNative.
  */
+/** base64 PNG/JPEG → an ImageBitmap, or null when it does not decode (W5a). */
+async function decodePicture(data) {
+  if (typeof data !== "string" || !data) return null;
+  try { return await createImageBitmap(new Blob([fromBase64(data)])); } catch { return null; }
+}
+
+/** A signature as JSON can carry it: a picture's pixels never cross the bridge (W4). */
+function bridgeSignature(sig) {
+  if (!sig) return null;
+  if (sig.type === "picture") return { type: "picture", width: sig.image?.width ?? 0, height: sig.image?.height ?? 0 };
+  return sig;
+}
+
+// The page-selection switches setSelectionOptions takes (W3) — PdfeEditorView's names.
+const SELECTION_BOOLS = ["viewTextSelectionEnabled", "viewSelectionMenuEnabled",
+  "annotateTextSelectionEnabled", "annotateSelectionMenuEnabled", "markupOnSelectionEnd",
+  "markupOnToolPick", "annotateDragSelectEnabled"];
+
 export function attachNativeHost(editor, opts = {}) {
   const send = detectTransport(opts.handlerName || "pdfe");
   let savedFile = null;
@@ -106,6 +124,23 @@ export function attachNativeHost(editor, opts = {}) {
                     // `rotated` and `addtextarmed` were, but a shell with an
                     // exhaustive switch over event names sees a name it has not seen.
                     "mode",
+                    // ANNOTATE MODE (annotations step 19, 3.15.0) — forwarded in the SAME
+                    // change as the commands below, the addtextarmed rule.
+                    "markuptool", "markupcolor", "markupcreated", "markupdeleted",
+                    "pagetextselection",
+                    // W3: a long-press (selected or only reported) and a words-menu pick. A
+                    // native shell cannot preventDefault in time, so — as with "action" — to
+                    // change what a built-in item does it lists its OWN id instead.
+                    "pagelongpress", "selectionmenuitem",
+                    // W4: signatures — the pick (turning off too), the start and end of a
+                    // placement, and the WHICH of a delete.
+                    "signaturetool", "signatureplacing", "signatureplaced", "signaturedeleted",
+                    // W5a: a picture armed for the next tap, or the arm spent / dropped.
+                    "imageinserting",
+                    // W5c: a finger moves / resizes / turns the selection (and when it is over).
+                    "selectiongesture",
+                    // W6: a tap on a web address in reading mode (the SDK opens nothing).
+                    "linktapped",
                     // THE CLIENT'S OWN DESIGN (3.3.0): a bar button was tapped. A native
                     // shell cannot answer in time to stop the SDK, so it routes by ID: an
                     // app's own id (an AI button, say) is only reported, and to change what a built-in
@@ -120,8 +155,14 @@ export function attachNativeHost(editor, opts = {}) {
                     "search"]) {
     // "select" carries WHERE the selection is on screen too (3.3.0), so a native shell
     // that turned the SDK's bar off (setActionBarEnabled) can put its own buttons there.
-    editor.on(ev, (detail) => emit(ev, ev === "select"
-      ? { ...detail, screenRect: editor.selectionScreenRect } : detail));
+    // "pagelongpress" carries the press ON SCREEN and "pagetextselection" the selection's
+    // screen rect (W3), so a native shell can put its own popup there without a round trip.
+    editor.on(ev, (detail) => emit(ev,
+      ev === "select" || ev === "pagetextselection" ? { ...detail, screenRect: editor.selectionScreenRect }
+      : ev === "pagelongpress" ? { ...detail, screen: editor.pageToScreen(detail.page, detail.xPt, detail.yPt) }
+      : ev === "selectionmenuitem" ? { item: detail.item, selection: detail.selection }
+      : ev === "signaturetool" ? { signature: bridgeSignature(detail.signature) }
+      : detail));
   }
   if (opts.telemetry) editor.on("edit", (d) => emit("edit", d));
 
@@ -139,11 +180,12 @@ export function attachNativeHost(editor, opts = {}) {
      * refused) — the native side raises ITS OWN prompt and calls `open` again
      * with the same url plus the password. Nothing here stores it.
      */
-    open: async ({ url, name, password }) => editor.open(url, { name, password }),
+    // `mode` (W2): open straight into "annotate" (Android's openPdfInAnnotateMode) or "text".
+    open: async ({ url, name, password, mode }) => editor.open(url, { name, password, mode }),
 
     /** Fallback path for small documents when no scheme handler is available. */
-    openBase64: async ({ data, name, password }) =>
-      editor.open(fromBase64(data), { name, password }),
+    openBase64: async ({ data, name, password, mode }) =>
+      editor.open(fromBase64(data), { name, password, mode }),
 
     /**
      * Commit + save. Returns the sizes only; the BYTES are pulled afterwards
@@ -248,6 +290,12 @@ export function attachNativeHost(editor, opts = {}) {
      */
     markSaved: () => { editor.markSaved(); return { dirty: editor.dirty }; },
     undo: () => { editor.undo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
+    /**
+     * Leave the mode, reverting everything done in it (W2). Answers once the page is
+     * reverted; refused with `discard-unavailable` when `canDiscard` (in `state` and on the
+     * `mode` event) is false. Ask the user first — it cannot be undone.
+     */
+    discardModeChanges: async () => { await editor.discardModeChanges(); return { mode: editor.mode }; },
     redo: () => { editor.redo(); return { canUndo: editor.canUndo, canRedo: editor.canRedo }; },
 
     setZoom: ({ zoom }) => { editor.setZoom(Number(zoom)); return { zoom: editor.zoom }; },
@@ -427,6 +475,128 @@ export function attachNativeHost(editor, opts = {}) {
       return { imageRotateControl: editor.imageRotateControl };
     },
 
+    // ---- ANNOTATE MODE (annotations step 19, 3.15.0) -------------------------
+    // The same names and payloads as the web API and Android (12-VOCABULARY §6–§8, §15,
+    // §19, §20). Each arm REPORTS ITSELF through its event (parity rule 14), so these
+    // commands return only what is already true when they return.
+    setMarkupTool: ({ tool } = {}) => {
+      editor.setMarkupTool(tool == null ? null : String(tool));
+      return { markupTool: editor.markupTool, markupColor: editor.markupColor };
+    },
+    setMarkupColor: ({ color } = {}) => {
+      editor.setMarkupColor(color);
+      return { markupColor: editor.markupColor, markupColors: editor.markupColors };
+    },
+    markupSelection: ({ tool, color, select } = {}) => { editor.markupSelection(String(tool), color, select === true); return { ok: true }; },
+    setSelectedMarkupColor: ({ color } = {}) => { editor.setSelectedMarkupColor(color); return { ok: true }; },
+    setMarkupAuthor: ({ name } = {}) => { editor.setMarkupAuthor(name); return { markupAuthor: editor.markupAuthor }; },
+    setMarkupLineRatio: ({ ratio, minWidth } = {}) => {
+      editor.setMarkupLineRatio(ratio, minWidth);
+      return { markupLineRatio: editor.markupLineRatio, markupLineMinWidth: editor.markupLineMinWidth };
+    },
+    /**
+     * The page-selection switches and the words menu, by name — any subset: the seven booleans
+     * (viewTextSelectionEnabled, viewSelectionMenuEnabled, annotateTextSelectionEnabled,
+     * annotateSelectionMenuEnabled, markupOnSelectionEnd, markupOnToolPick,
+     * annotateDragSelectEnabled), `selectionMenuItems` (ids) and the per-mode button lists
+     * `viewSelectionMenuActions` / `annotateSelectionMenuActions` ([{id, label?, icon?}] or
+     * null). The menu LAYOUTS are DOM elements and so web-only. Returns every value as it stands.
+     */
+    setSelectionOptions: (o = {}) => {
+      for (const k of SELECTION_BOOLS) if (k in o) editor[k] = !!o[k];
+      for (const k of ["selectionMenuItems", "viewSelectionMenuActions", "annotateSelectionMenuActions"])
+        if (k in o) editor[k] = o[k];
+      const out = {};
+      for (const k of [...SELECTION_BOOLS, "selectionMenuItems", "viewSelectionMenuActions",
+                       "annotateSelectionMenuActions"]) out[k] = editor[k];
+      return out;
+    },
+    /** A page point on screen, {x, y} in CSS px from the editor's top-left, or null. */
+    /**
+     * Pick what the next tap in annotate places (W4), or `{signature: null}` to turn it off.
+     * The shapes are the web's (`type` drawn / typed / text), and a picture travels as
+     * `{type: "picture", data: <base64 PNG or JPEG>}` — decoded here, then picked.
+     */
+    setSignatureTool: async ({ signature } = {}) => {
+      if (signature && signature.type === "picture" && typeof signature.data === "string") {
+        let bmp;
+        try { bmp = await createImageBitmap(new Blob([fromBase64(signature.data)])); }
+        catch (e) { throw Object.assign(new Error("the picture data could not be decoded"), { code: "signature-empty" }); }
+        editor.setSignatureTool({ type: "picture", image: bmp });
+      } else editor.setSignatureTool(signature ?? null);
+      return { signatureTool: bridgeSignature(editor.signatureTool) };
+    },
+    /**
+     * Put a picture on the page (W5a): `{data: <base64 PNG/JPEG>}` centred on what the reader
+     * sees, or with `page`, `xPt`, `yPt` (PDF points) there. Half the page, upright, selected,
+     * one undo step; switches to text mode. Replies `{ok}`; a bad picture is `ok: false`.
+     */
+    insertImage: async ({ data, page, xPt, yPt } = {}) => {
+      const bmp = await decodePicture(data);
+      if (!bmp) throw Object.assign(new Error("the picture data could not be decoded"), { code: "insert-failed" });
+      const ok = page == null ? (xPt == null ? editor.insertImage(bmp) : editor.insertImageAt(bmp, Number(xPt), Number(yPt)))
+                              : editor.insertImageAt(bmp, Number(page), Number(xPt), Number(yPt));
+      return { ok: !!ok };
+    },
+    /** Arm a picture `{data}`: the next tap in text mode places it. Reports `imageinserting`. */
+    armInsertImage: async ({ data } = {}) => {
+      const bmp = await decodePicture(data);
+      if (!bmp) throw Object.assign(new Error("the picture data could not be decoded"), { code: "insert-failed" });
+      editor.armInsertImage(bmp);
+      return { isInsertingImage: editor.isInsertingImage };
+    },
+    cancelInsertImage: () => { editor.cancelInsertImage(); return { isInsertingImage: editor.isInsertingImage }; },
+    // W5b: free resize / stretch / turn of the selected picture or signature, from code. Each
+    // replies {ok} — the change lands a moment later; read the geometry on `rotated` / `moved`,
+    // or with selectionGeometry.
+    rotateSelectionBy: ({ degrees } = {}) => ({ ok: editor.rotateSelectionBy(Number(degrees)) }),
+    setSelectionAngle: ({ degrees } = {}) => ({ ok: editor.setSelectionAngle(Number(degrees)) }),
+    resizeSelectionBy: ({ scale } = {}) => ({ ok: editor.resizeSelectionBy(Number(scale)) }),
+    stretchSelectionBy: ({ scaleX, scaleY } = {}) => ({ ok: editor.stretchSelectionBy(Number(scaleX), Number(scaleY)) }),
+    /** Where the selection is and how it is turned: corners (CSS px of the web view, own order BL,
+     *  BR, TR, TL), the top anchor, the angle (clockwise degrees) and whether it can turn. */
+    selectionGeometry: () => ({ corners: editor.selectionScreenCorners, topAnchor: editor.selectionTopAnchor,
+                                angle: editor.selectionAngle, canRotate: editor.canRotateSelection }),
+    /**
+     * W5c: the knobs of a selected picture and/or signature — `{imageHandles, signatureHandles}`,
+     * either may be left out. Each is a PdfeHandleConfig object: `corners`, `edges`,
+     * `cornerButton`, `pinch` ("none" | "resize" | "rotate" | "resizeAndRotate" | "stretch"),
+     * `cornerStyle`, `edgeStyle`, `knobs` ({topLeft: {job, filled, fillColor, …}, …}).
+     * Replies both as they stand (cleaned).
+     */
+    setSelectionHandles: ({ imageHandles, signatureHandles } = {}) => {
+      if (imageHandles !== undefined) editor.imageHandles = imageHandles;
+      if (signatureHandles !== undefined) editor.signatureHandles = signatureHandles;
+      return { imageHandles: editor.imageHandles, signatureHandles: editor.signatureHandles,
+               isSelectionGestureActive: editor.isSelectionGestureActive };
+    },
+    /**
+     * W6: the reader's switches, by name — any subset of `linksEnabled`, `nightMode`,
+     * `scrollEnabled`, `pageSpacingDp`, `scrollDirection` ("vertical" | "horizontal"), `pageSnap`,
+     * `uniformPageWidth`, `zoomConfig` ({minZoom, maxZoom, stretchBeyondLimits,
+     * stretchMin, stretchMax, springBackDurationMs, doubleTapEnabled, doubleTapZoom,
+     * doubleTapDurationMs, pinchMomentum, pinchMomentumDurationMs}). Replies all of them as they
+     * stand (zoomConfig corrected).
+     */
+    setReaderOptions: (o = {}) => {
+      for (const k of ["linksEnabled", "nightMode", "scrollEnabled", "pageSnap", "uniformPageWidth"]) if (k in o) editor[k] = !!o[k];
+      if ("pageSpacingDp" in o) editor.pageSpacingDp = Number(o.pageSpacingDp);
+      if ("zoomConfig" in o) editor.zoomConfig = o.zoomConfig;
+      if ("scrollDirection" in o) editor.scrollDirection = o.scrollDirection;
+      return { linksEnabled: editor.linksEnabled, nightMode: editor.nightMode, scrollEnabled: editor.scrollEnabled,
+               pageSpacingDp: editor.pageSpacingDp, zoomConfig: editor.zoomConfig,
+               scrollDirection: editor.scrollDirection, pageSnap: editor.pageSnap, uniformPageWidth: editor.uniformPageWidth };
+    },
+    /** The middle of what the reader sees, {page, xPt, yPt}, or null. */
+    visibleCenter: () => ({ point: editor.visibleCenter() }),
+    /** The two signature switches, by name — any subset. Returns both as they stand. */
+    setSignatureOptions: (o = {}) => {
+      for (const k of ["otherAppStampsEditable", "signatureToolSelectsExisting"]) if (k in o) editor[k] = !!o[k];
+      return { otherAppStampsEditable: editor.otherAppStampsEditable,
+               signatureToolSelectsExisting: editor.signatureToolSelectsExisting };
+    },
+    pageToScreen: ({ page, xPt, yPt } = {}) => ({ point: editor.pageToScreen(Number(page), Number(xPt), Number(yPt)) }),
+
     // ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------
     // Placing a NEW text box where the document has none. An ARMED mode, so this is
     // two commands and a report rather than one "insert" call: the SDK cannot know
@@ -455,7 +625,19 @@ export function attachNativeHost(editor, opts = {}) {
     // still reads false when this returns, and a shell trusting the result would decide
     // the arm had failed. The `addtextarmed` event is the truth; `state` is the re-sync.
     // Measured through this bridge, not reasoned about.
-    armAddText: () => ({ ok: editor.armAddText() }),
+    // W7a: with `{text}` the box placed by the next tap holds that text and closes (one undo step).
+    armAddText: ({ text } = {}) => ({ ok: editor.armAddText(text) }),
+    /** W7a: a box holding `text` at `{page, xPt, yPt}` right away, no tap. Replies {ok}. */
+    addTextAt: ({ text, page, xPt, yPt } = {}) => ({ ok: editor.addTextAt(String(text ?? ""), Number(page), Number(xPt), Number(yPt)) }),
+    /** W7a: a box holding `text` in the middle of what the reader sees. Replies {ok}. */
+    addTextAtCenter: ({ text } = {}) => ({ ok: editor.addTextAtCenter(String(text ?? "")) }),
+    /** W7a: `addTextPlaceholder` (the words an empty box shows, null = none) and
+     *  `addTextScreenSizeDp` (a new box's text size on screen, 0 = the point size), any subset. */
+    setAddTextOptions: (o = {}) => {
+      if ("addTextPlaceholder" in o) editor.addTextPlaceholder = o.addTextPlaceholder;
+      if ("addTextScreenSizeDp" in o) editor.addTextScreenSizeDp = Number(o.addTextScreenSizeDp);
+      return { addTextPlaceholder: editor.addTextPlaceholder, addTextScreenSizeDp: editor.addTextScreenSizeDp };
+    },
 
     /** Disarm ADD TEXT without placing anything. Safe when not armed. */
     cancelAddText: () => { editor.cancelAddText(); return {}; },
@@ -527,6 +709,7 @@ export function attachNativeHost(editor, opts = {}) {
     // Since 2026-09-29 (V2, the review fixes) this IS the web SDK's own state():
     // one key list for the web host and the iOS shell, which also gained canUndo /
     // canRedo here. Parity rule 13 reads the keys from pdfe-editor.js's state().
+    // (A picked picture's ImageData serialises as {} — its pixels never cross the bridge.)
     state: () => editor.state(),
   };
 

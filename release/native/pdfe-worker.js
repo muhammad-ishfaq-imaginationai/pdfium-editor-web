@@ -142,10 +142,87 @@ const ready = createPdfe({
   F.loadTextPage  = m.cwrap("pdfe_load_text_page", "number", ["number"]);
   F.closeTextPage = m.cwrap("pdfe_close_text_page", null, ["number"]);
   // text search (3.3.0): the engine's finder, and the quads a match paints (= a mark's)
+  // W6 (reader R2): the page's /Link annotations and a link's web address.
+  F.links   = m.cwrap("pdfe_links", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.linkUri = m.cwrap("pdfe_link_uri", "number", ["number", "number", "number", "number", "number"]);
   F.findOnPage    = m.cwrap("pdfe_find_on_page", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.markupQuads   = m.cwrap("pdfe_markup_quads_for_range", "number",
     ["number", "number", "number", "number", "number"]);
+  // ANNOTATE MODE (annotations step 19, the web shell): the page text model, the marks,
+  // and the markup journal. All of it is the core's; this file only marshals.
+  F.markupCount   = m.cwrap("pdfe_markup_count", "number", ["number", "number"]);
+  F.markupInfo    = m.cwrap("pdfe_markup_info", "number", ["number", "number", "number", "number"]);
+  F.markupQuad    = m.cwrap("pdfe_markup_quad", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupName    = m.cwrap("pdfe_markup_name", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupCreate  = m.cwrap("pdfe_markup_create", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupDelete  = m.cwrap("pdfe_markup_delete", "number", ["number", "number", "number", "number"]);
+  F.markupSetColor = m.cwrap("pdfe_markup_set_color", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupSetLineStyle = m.cwrap("pdfe_markup_set_line_style", "number", ["number", "number", "number"]);
+  F.markupStructSize = m.cwrap("pdfe_markup_struct_size", "number", []);
+  F.markupSpecSize = m.cwrap("pdfe_markup_spec_size", "number", []);
+  F.markupUndoPage = m.cwrap("pdfe_markup_undo_page", "number", ["number"]);
+  F.markupRedoPage = m.cwrap("pdfe_markup_redo_page", "number", ["number"]);
+  F.markupUndo    = m.cwrap("pdfe_markup_undo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupRedo    = m.cwrap("pdfe_markup_redo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupHistoryClear = m.cwrap("pdfe_markup_history_clear", null, ["number"]);
+  // THE MODE-ENTRY MARK (W2 = Android step 14b, pdfe.h "THE MODE-ENTRY MARK"), one per journal.
+  F.historySetMark = m.cwrap("pdfe_history_set_mark", null, ["number"]);
+  F.historyMarkSteps = m.cwrap("pdfe_history_mark_steps", "number", ["number", "number"]);
+  F.historyEndDiscard = m.cwrap("pdfe_history_end_discard", null, ["number"]);
+  F.markupHistorySetMark = m.cwrap("pdfe_markup_history_set_mark", null, ["number"]);
+  F.markupHistoryMarkSteps = m.cwrap("pdfe_markup_history_mark_steps", "number", ["number", "number"]);
+  F.markupHistoryEndDiscard = m.cwrap("pdfe_markup_history_end_discard", null, ["number"]);
+  // SIGNATURES (W4 = Android SG9/SG10): the stamp verbs, the same calls PdfSession makes.
+  F.stampStructSize = m.cwrap("pdfe_stamp_struct_size", "number", []);
+  F.stampSpecSize = m.cwrap("pdfe_stamp_spec_size", "number", []);
+  F.stampCount = m.cwrap("pdfe_stamp_count", "number", ["number", "number"]);
+  F.stampInfo = m.cwrap("pdfe_stamp_info", "number", ["number", "number", "number", "number"]);
+  F.stampTurn = m.cwrap("pdfe_stamp_turn", "number", ["number", "number", "number", "number"]);
+  F.stampName = m.cwrap("pdfe_stamp_name", "number", ["number", "number", "number", "number", "number"]);
+  F.stampCreate = m.cwrap("pdfe_stamp_create", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampDelete = m.cwrap("pdfe_stamp_delete", "number", ["number", "number", "number", "number"]);
+  F.stampSetRect = m.cwrap("pdfe_stamp_set_rect", "number", ["number", "number", "number", "number", "number"]);
+  F.stampLimits = m.cwrap("pdfe_stamp_limits", "number", ["number", "number", "number", "number", "number"]);
+  // W5a: a new picture (D45: PENDING in the core until a save — deleting it leaves no pixels).
+  // W5b: free resize / stretch / turn — a picture by a DELTA matrix, a stamp by an absolute angle.
+  F.imageApplyMatrix = m.cwrap("pdfe_image_apply_matrix", "number", ["number", "number", "number", "number", "number"]);
+  // W5c, the live drag: the page WITHOUT one item, and (flag 0x2) a picture ALONE on transparent.
+  F.renderHiding = m.cwrap("pdfe_render_hiding", "number",
+    ["number", "number", "number", "string", "number", "number", "number", "number", "number"]);
+  F.stampRotate = m.cwrap("pdfe_stamp_rotate", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.stampTransform = m.cwrap("pdfe_stamp_transform", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.imageInsert = m.cwrap("pdfe_image_insert", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.stampMoveToPage = m.cwrap("pdfe_stamp_move_to_page", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddStrokes = m.cwrap("pdfe_stamp_add_strokes", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.stampAddText = m.cwrap("pdfe_stamp_add_text", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddTextOutlines = m.cwrap("pdfe_stamp_add_text_outlines", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddPreparedPicture = m.cwrap("pdfe_stamp_add_prepared_picture", "number",
+    ["number", "number", "number", "number"]);
+  F.picturePrepare = m.cwrap("pdfe_picture_prepare", "number", ["number", "number", "number", "number", "number"]);
+  F.pictureFree = m.cwrap("pdfe_picture_free", null, ["number"]);
+  F.markupUndoOtherPage = m.cwrap("pdfe_markup_undo_other_page", "number", ["number"]);
+  F.markupRedoOtherPage = m.cwrap("pdfe_markup_redo_other_page", "number", ["number"]);
+  F.textModel     = m.cwrap("pdfe_text_model", "number", ["number", "number", "number"]);
+  F.textModelCharAt = m.cwrap("pdfe_text_model_char_at", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.textModelWord = m.cwrap("pdfe_text_model_word_range", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.textModelQuads = m.cwrap("pdfe_text_model_quads_for_range", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.textModelStructSize = m.cwrap("pdfe_text_model_struct_size", "number", []);
   F.group         = m.cwrap("pdfe_group_page", "number", ["number", "number", "number"]);
   F.paraInfo      = m.cwrap("pdfe_para_info", "number",
     ["number", "number", "number", "number", "number", "number"]);
@@ -259,6 +336,7 @@ const ready = createPdfe({
 
 // Close a page's handles in the required order: text page first, then page.
 function closePageHandles(i) {
+  dropTextModel(i);   // its snapshot belongs to the text page being closed
   const tp = textPages.get(i);
   if (tp) { F.closeTextPage(tp); textPages.delete(i); }
   const p = pageHandles.get(i);
@@ -274,7 +352,7 @@ function acquirePage(i) {
   // for an evicted page just re-acquire it — a reload cost, never a bug.
   if (pageHandles.size > MAX_OPEN_PAGES) {
     for (const k of pageHandles.keys()) {
-      if (k === i || k === editPage || dirtyPages.has(k)) continue;
+      if (k === i || k === editPage || dirtyPages.has(k) || markPinned.has(k)) continue;
       closePageHandles(k);
       break;
     }
@@ -373,6 +451,27 @@ function withU16(str, fn) {
 // document text only), and a null pointer means "no password" — the default. The
 // bytes are freed the moment the open returns; a password is never retained in
 // the heap, and the worker keeps no copy of it either.
+/** W6: page |page|'s links, [{rect [l,b,r,t] pt, kind 1 page / 2 address, page, uri}] in
+ *  /Annots order (PdfSession.linksOnPage). Read-only. */
+function pageLinks(page) {
+  if (!doc || page < 0 || page >= F.pageCount(doc)) return [];
+  const handle = acquirePage(page);
+  const n = F.links(doc, handle, 0, 0, 0, 0);
+  if (n <= 0) return [];
+  const rp = mod._malloc(n * 16), kp = mod._malloc(n * 4), pp = mod._malloc(n * 4), up = mod._malloc(2048);
+  const out = [];
+  try {
+    F.links(doc, handle, rp, kp, pp, n);
+    const f = hF32().slice(rp >> 2, (rp >> 2) + n * 4), k = hI32().slice(kp >> 2, (kp >> 2) + n), pg = hI32().slice(pp >> 2, (pp >> 2) + n);
+    for (let i = 0; i < n; i++) {
+      let uri = null;
+      if (k[i] === 2) { const len = F.linkUri(doc, handle, i, up, 2048); if (len > 0 && len < 2048) uri = cstr(up); }
+      if (k[i] === 1 || uri) out.push({ rect: [f[4 * i], f[4 * i + 1], f[4 * i + 2], f[4 * i + 3]], kind: k[i], page: k[i] === 1 ? pg[i] : -1, uri });
+    }
+  } finally { mod._free(rp); mod._free(kp); mod._free(pp); mod._free(up); }
+  return out;
+}
+
 function withUtf8(str, fn) {
   if (str === null || str === undefined || str === "") return fn(0);
   const bytes = new TextEncoder().encode(str);
@@ -937,6 +1036,7 @@ function cachedGroups(page) {
 // doc-wide) and stales the mutated PAGE's cached bounds. Other pages' bounds
 // stay valid — their objects did not move.
 function noteMutation(page) {
+  if (markPinning) markPinned.add(page);   // W2: a discard needs this page's parked objects
   coreGroupFresh = false;
   groupCache.delete(page);
   imageCache.delete(page);
@@ -1100,7 +1200,7 @@ function commitEditor() {
   const page = editPage;
   if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
   noteMutation(page);                      // indices/bounds may have shifted
-  editor = 0; editPage = -1; editParaBounds = null;
+  editor = 0; editPage = -1; editParaBounds = null; newBoxAnchor = null;
   postMessage({ type: "editClosed", page, ok: ok === 1 });
   // FORCED, not deduped. Entering a box and leaving it without typing changes
   // neither flag, so a deduped post sends nothing — and the shell is left holding
@@ -1120,6 +1220,25 @@ function commitEditor() {
 
 let lastHistory = "";   // "canUndo,canRedo" — so the event fires only on change
 
+// ---- the mode-entry mark (W2 = Android step 14b; PdfSession.markPinned) ----------------
+// ⚠️ THE PAGES A DISCARD WILL NEED STAY RESIDENT. A committed page is clean, so the LRU may
+// close it, and a reloaded page has lost its PARKED generations — an undo there degrades or
+// comes back UNAVAILABLE, so a discard after scrolling far away would be partial. While a mark
+// is set, every page mutated since it is pinned. Conditioned: no mark, nothing pinned.
+let markPinning = false;
+const markPinned = new Set();
+// The shell's generation of the newest mark: a history read posted before a newer mark would
+// otherwise overwrite the shell's "zero steps" with the old distance (Android's markGen).
+let markGen = 0;
+
+function markSteps(fn) {
+  const out = mod._malloc(4);
+  const kind = fn(doc, out);
+  const steps = hI32()[out >> 2];
+  mod._free(out);
+  return { kind, steps };
+}
+
 function historyState() {
   if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1, recording: false };
   const u = F.undoPage(doc), r = F.redoPage(doc);
@@ -1128,15 +1247,23 @@ function historyState() {
   // down" while not. Only the first one says the document is unmodified.
   // |evicted| (I103): text steps the caps dropped since the last clear; the editor latches
   // "untracked" on any, because an emptied stack no longer proves the document saved.
+  // The MARKUP journal's pages ride along (step 19): the shell decides which of the two
+  // the one Undo button drives, from its mode (pdf/HistoryScope.kt's rule).
+  // Each journal's distance to its mode-entry mark rides along (W2), so the shell's
+  // canDiscard is a pure read of the last answer, never a worker hop.
   return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r,
-           recording: !!F.historyEnabled(doc), evicted: F.historyEvicted(doc) };
+           recording: !!F.historyEnabled(doc), evicted: F.historyEvicted(doc),
+           markupUndoPage: F.markupUndoPage(doc), markupRedoPage: F.markupRedoPage(doc),
+           textMarkSteps: markSteps(F.historyMarkSteps).steps,
+           markupMarkSteps: markSteps(F.markupHistoryMarkSteps).steps, markGen };
 }
 
 // Re-query and post, but only when the pair actually changed: this is called
 // from every mutator tail, and a typing burst must not spam the shell.
 function postHistory(force) {
   const h = historyState();
-  const key = `${h.canUndo},${h.canRedo},${h.recording}`;
+  const key = `${h.canUndo},${h.canRedo},${h.recording},${h.markupUndoPage},${h.markupRedoPage},` +
+              `${h.textMarkSteps},${h.markupMarkSteps},${h.markGen}`;
   if (!force && key === lastHistory) return;
   lastHistory = key;
   postMessage({ type: "history", ...h });
@@ -1168,6 +1295,9 @@ function applyHistory(kind) {
   const dp = mod._malloc(16);
   const fp2 = mod._malloc(16);
   const tpp = mod._malloc(4);
+  // The pictures BEFORE the step: which one a step changed is decided by evidence, never by the
+  // selection (Android's ImageStepRule.between) — an inserted picture comes and goes this way.
+  const imgsBefore = cachedImages(page).map((im) => ({ index: im.index, key: im.quad.join(",") }));
   const code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp2, tpp);
   const dirty = readF32(dp, 4);
   // WHERE the run ended up, as distinct from what to repaint. Selecting on the
@@ -1229,6 +1359,19 @@ function applyHistory(kind) {
   // unrelated text box on every image undo. The list index is stable (nothing
   // adds or removes image objects), so the picture is re-read, not re-found.
   let imageStep = false;
+  {
+    const after = cachedImages(page);
+    const changed = after.find((im) => !imgsBefore.some((b) => b.index === im.index && b.key === im.quad.join(",")));
+    if (changed && !(selectedImage && selectedImage.page === page && selectedImage.index === changed.index)) {
+      selectedPara = null;
+      selectedImage = { page, index: changed.index, bounds: changed.bounds, quad: changed.quad,
+                        turns: changed.turns, flags: changed.flags };
+    } else if (selectedImage && selectedImage.page === page && !after.some((im) => im.index === selectedImage.index)) {
+      selectedImage = null;                      // the step took the selected picture away
+      imageStep = true;
+      postMessage({ type: "imageDeselected" });
+    }
+  }
   if (selectedImage && selectedImage.page === page) {
     const fresh = cachedImages(page).find((im) => im.index === selectedImage.index);
     if (fresh) {
@@ -1353,6 +1496,45 @@ function deleteParagraphAt(page, xPt, yPt) {
 
 // The shared tail: repaint, re-group, and re-find the picture we just changed so
 // it stays selected. |before| is its rect before the change.
+/**
+ * INSERT A PICTURE (W5a = PdfSession.insertImage): straight-alpha RGBA from the page becomes the
+ * BGRA the core copies, |m| maps the unit square onto the page (upright on screen). One undo step
+ * in the TEXT journal. The new picture is PENDING (PDFE_IMAGE_PENDING) — listed last — and is
+ * selected, as Android does; nothing scrolls.
+ */
+function insertImage(msg) {
+  if (!doc) return;
+  const page = msg.page;
+  if (editor) commitEditor();
+  const pg = acquirePage(page);
+  groupPage(page);
+  const px = msg.pixels, n = msg.width * msg.height * 4;
+  const bp = mod._malloc(n);
+  const h = mod.HEAPU8;
+  for (let i = 0; i < n; i += 4) { h[bp + i] = px[i + 2]; h[bp + i + 1] = px[i + 1]; h[bp + i + 2] = px[i]; h[bp + i + 3] = px[i + 3]; }
+  const mp = mod._malloc(24), dp = mod._malloc(16);
+  hF32().set(msg.m, mp >> 2);
+  const idx = F.imageInsert(doc, pg, bp, msg.width, msg.height, msg.width * 4, mp, dp);
+  const dirty = readF32(dp, 4);
+  for (const p of [bp, mp, dp]) mod._free(p);
+  let fresh = null;
+  if (idx >= 0) {
+    dirtyPages.add(page);
+    noteMutation(page);
+    renderDirtyStrip(page, dirty);
+    const imgs = cachedImages(page);
+    fresh = [...imgs].reverse().find((im) => im.flags & 8) || null;   // PDFE_IMAGE_PENDING
+    if (fresh) {
+      clearSelection();
+      selectedImage = { page, index: fresh.index, bounds: fresh.bounds, quad: fresh.quad, turns: fresh.turns, flags: fresh.flags };
+      postMessage({ type: "imageSelected", page, index: fresh.index, bounds: fresh.bounds,
+                    quad: fresh.quad, turns: fresh.turns, flags: fresh.flags });
+    }
+  }
+  postMessage({ type: "imageInserted", page, ok: !!fresh, images: cachedImages(page) });
+  postHistory(true);
+}
+
 function afterImageChange(page, before, kind) {
   dirtyPages.add(page);
   noteMutation(page);
@@ -1401,6 +1583,81 @@ function moveSelectedImage(dx, dy) {
   mod._free(dp);
   if (!ok) { postMessage({ type: "imageMoved", page, ok: false }); return; }
   afterImageChange(page, before, "imageMoved");
+}
+
+/**
+ * W5c, THE LIVE DRAG (PdfPageView's snapshot + setHidingRender, Android): page |page| at |w| x |h|
+ * px WITHOUT the item (picture |image| or the stamp |nm|), and the item's OWN pixels — a picture
+ * rendered alone (I157: a copy cut from the page carries the text printed on it), a stamp as
+ * where the page with it differs from the page without it (it is see-through) unless its ink
+ * covers most of its box. Both cut to |box| [x0, y0, x1, y1] px (the item's bounding box) and
+ * sent as ImageBitmaps. Changes nothing.
+ */
+async function liveItem(msg) {
+  const { page, w, h, seq } = msg;
+  const image = Number.isInteger(msg.image) ? msg.image : -1, nm = msg.nm || null;
+  const fail = () => postMessage({ type: "liveItem", seq, ok: false });
+  if (!doc || !(w > 0 && h > 0) || w * h > 6e6 || (image < 0 && !nm)) return fail();
+  if (image >= 0) ensureCoreGroup(page);
+  const handle = acquirePage(page);
+  const x0 = Math.max(0, Math.floor(msg.box[0])), y0 = Math.max(0, Math.floor(msg.box[1]));
+  const x1 = Math.min(w, Math.ceil(msg.box[2])), y1 = Math.min(h, Math.ceil(msg.box[3]));
+  const bw = x1 - x0, bh = y1 - y0;
+  if (bw <= 0 || bh <= 0) return fail();
+  const n = w * h * 4, ptr = mod._malloc(n);
+  const crop = () => {   // the box out of the full-page buffer (a fresh copy: the heap may move)
+    const u = mod.HEAPU8, out = new Uint8ClampedArray(bw * bh * 4);
+    for (let y = 0; y < bh; y++) out.set(u.subarray(ptr + ((y0 + y) * w + x0) * 4, ptr + ((y0 + y) * w + x1) * 4), y * bw * 4);
+    return out;
+  };
+  let bg = null, item = null;
+  try {
+    if (F.renderHiding(doc, handle, image, image >= 0 ? null : nm, ptr, w, h, w * 4, PDFE_RENDER_RGBA)) bg = crop();
+    if (bg && image >= 0) {
+      mod.HEAPU8.fill(0, ptr, ptr + n);
+      if (F.renderHiding(doc, handle, image, null, ptr, w, h, w * 4, PDFE_RENDER_RGBA | 0x2)) item = crop();
+    } else if (bg) {
+      F.render(handle, ptr, w, h, w * 4, PDFE_RENDER_RGBA);
+      item = crop();
+      // Inside the stamp's own outline (|quad|, px): which pixels the stamp changed.
+      const q = msg.quad, inQuad = (x, y) => {
+        let inside = false;
+        for (let i = 0, j = 3; i < 4; j = i++) {
+          const xi = q[2 * i], yi = q[2 * i + 1], xj = q[2 * j], yj = q[2 * j + 1];
+          if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+        }
+        return inside;
+      };
+      const diff = new Uint8Array(bw * bh);
+      let inside = 0, covered = 0;
+      for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+        if (!inQuad(x0 + x + 0.5, y0 + y + 0.5)) continue;
+        inside++;
+        const i = (y * bw + x) * 4;
+        if (Math.abs(item[i] - bg[i]) + Math.abs(item[i + 1] - bg[i + 1]) + Math.abs(item[i + 2] - bg[i + 2]) >= 24) { diff[y * bw + x] = 1; covered++; }
+      }
+      // shortcut: coverage threshold, not the stamp's real source kind (Android's same rule).
+      if (!(inside > 0 && covered > inside * 0.35)) for (let k = 0; k < diff.length; k++) if (!diff[k]) item[k * 4 + 3] = 0;
+    }
+  } finally { mod._free(ptr); }
+  if (!bg || !item) return fail();
+  const [b1, b2] = await Promise.all([createImageBitmap(new ImageData(bg, bw, bh)), createImageBitmap(new ImageData(item, bw, bh))]);
+  postMessage({ type: "liveItem", seq, ok: true, bg: b1, item: b2, box: [x0, y0, x1, y1] }, [b1, b2]);
+}
+
+/** W5b: the selected picture times |m| (a delta, post-applied; the clip follows) — one undo step,
+ *  reported as `imageRotated` like Android's onSelectionRotated. No page clamp: the shell owns it. */
+function applySelectedImageMatrix(m) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const mp = mod._malloc(24), dp = mod._malloc(16);
+  hF32().set(m, mp >> 2);
+  const ok = F.imageApplyMatrix(doc, acquirePage(page), selectedImage.index, mp, dp);
+  mod._free(mp); mod._free(dp);
+  if (!ok) { postMessage({ type: "imageRotated", page, ok: false }); return; }
+  afterImageChange(page, before, "imageRotated");
 }
 
 function rotateSelectedImage(turns) {
@@ -1574,10 +1831,19 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
 // routing and is CONSUMED by the tap it serves — one placement per arming, which is
 // also what makes the host's button state unambiguous.
 let addTextArmed = false;
+// W5a: a picture is armed — the next tap places it (the pixels stay in the shell).
+let imageInsertArmed = false;
 // The host's default look for new text (user decision 2026-08-24: "it will be on host
 // how he will provide this data"). Held here rather than passed per placement because
 // there is no placement CALL from the host — the gesture is a tap.
 let newTextStyle = { fontName: null, sizePt: 0, colorArgb: 0 };
+// W7a (Android 3.12.0 / 3.14.0): the APP's own text for the next box placed (null = an empty box
+// the user types in), and addTextScreenSizeDp as DEVICE px — turned into points at the page's
+// own paint scale where the box lands, so a new box's text looks that big on any page.
+let pendingAddText = null;
+let addTextScreenDev = 0;
+// Where the Add Text box that is open (and still empty) was placed — the move button re-places it.
+let newBoxAnchor = null;
 
 // AN ARM REPORTS ITSELF, ON ARM *AND* ON DISARM (parity rule 14 / I76). A host paints
 // its button from this; a spent arm that never reported would leave the button lit and
@@ -1612,8 +1878,13 @@ function placeNewBoxAt(page, xPt, yPt) {
     const h = newTextStyle.fontName
       ? (fontHandles.get(newTextStyle.fontName) || 0) : 0;
     new Uint32Array(mod.HEAPU8.buffer, sp + 20, 1)[0] = h;
-    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] = newTextStyle.sizePt || 0;
+    // addTextScreenSizeDp wins over the point size: points = device px / this page's paint scale.
+    const scale = pageScale.get(page) || 0;
+    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] =
+      addTextScreenDev > 0 && scale > 0 ? addTextScreenDev / scale : (newTextStyle.sizePt || 0);
     new Uint32Array(mod.HEAPU8.buffer, sp + 28, 1)[0] = (newTextStyle.colorArgb || 0) >>> 0;
+    const appText = pendingAddText;
+    pendingAddText = null;
     const ed = F.editBeginNew(doc, acquirePage(page), textPageOf(page), sp);
     if (!ed) {
       // The core refuses an off-page point (and a stale grouping). Say so rather than
@@ -1623,6 +1894,7 @@ function placeNewBoxAt(page, xPt, yPt) {
     }
     editor = ed;
     editPage = page;
+    newBoxAnchor = [xPt, yPt];
     // The "am I inside the open run" rect the tap router uses. At zero characters this
     // is the caret's own zero-width box (S66) — a later tap is therefore outside it and
     // commits, which is right: an empty box the user taps away from evaporates.
@@ -1650,6 +1922,14 @@ function placeNewBoxAt(page, xPt, yPt) {
       linePreserve: F.editLineMode(editor) === 1,
       style: readRangeStyle(0, 0),
     });
+    // W7a: the APP's text (armAddText(text) / addTextAt): typed in through the same pass a
+    // keystroke takes ("\n" a new line), then the box closes — one undo step, as a typed box.
+    if (appText) {
+      pendingEdit = { fullText: appText, caretIndex: appText.length, selStart: appText.length,
+                      selEnd: appText.length, generation: -1, postedAt: 0 };
+      drainLatch();
+      commitEditor();
+    }
   } finally {
     mod._free(sp);
   }
@@ -1669,6 +1949,7 @@ function openEditorAt(page, xPt, yPt, lineMode) {
                               hit.blockIndex, lineMode);
   if (!ed) return;
   editor = ed;
+  newBoxAnchor = null;     // an existing box, never a placement to redo (W7a)
   editPage = page;
   editParaBounds = hit.blockBounds;
   // A fresh session starts with no pick in flight — a pending same-index
@@ -1896,6 +2177,7 @@ async function saveDocument(forceInHeap) {
   // the export path — so every shell must call this here. The parity gate's
   // required-command list is what keeps a shell from forgetting.
   F.historyClear(doc);
+  F.markupHistoryClear(doc);   // two journals, two clears (12-VOCABULARY §7)
   postHistory(true);
   // A Blob/File clones as a reference — delivery (object-URL download /
   // showSaveFilePicker) is the main thread's job (§6).
@@ -2170,6 +2452,665 @@ function paintPage(job) {
   scheduleLatch();
 }
 
+// ---- ANNOTATE MODE (annotations step 19 — the web twin of Android's step 12–14) ----------
+// The page's text MODEL (pdfe_text_model) is the snapshot every selection rule reads; it is
+// built once per text page and kept here, in the worker, because the rules over it are core
+// functions and the heap is here. The main thread never re-derives a rule: it posts the
+// point, we answer with the quads it must paint (the same ones a mark will carry — what is
+// painted is what is saved). Android's twin: pdf/PageTextSelection.kt + PdfSession.textModel.
+const textModels = new Map();   // page -> { tp, ptr, count }
+let TEXT_CHAR_SIZE = 0;
+// Views over the CURRENT heap buffer: a wasm call may grow the heap and detach older views.
+const hI32 = () => new Int32Array(mod.HEAPU8.buffer);
+const hU32 = () => new Uint32Array(mod.HEAPU8.buffer);
+const hF32 = () => new Float32Array(mod.HEAPU8.buffer);
+const cstr = (p) => { const u = mod.HEAPU8; let e = p; while (u[e]) e++; return new TextDecoder().decode(u.slice(p, e)); };
+let pageSel = null;             // { page, start, end, pressStart, pressEnd, held }
+
+function dropTextModel(i) {
+  const m = textModels.get(i);
+  if (m) { mod._free(m.ptr); textModels.delete(i); }
+  if (pageSel && pageSel.page === i) pageSel = null;
+}
+function dropAllTextModels() {
+  for (const m of textModels.values()) mod._free(m.ptr);
+  textModels.clear();
+}
+
+function textModelOf(page) {
+  if (!doc || page < 0 || page >= pages.length) return null;
+  const tp = textPageOf(page);
+  if (!tp) return null;
+  let m = textModels.get(page);
+  if (m && m.tp === tp) return m;
+  if (m) { mod._free(m.ptr); textModels.delete(page); }
+  if (!TEXT_CHAR_SIZE) TEXT_CHAR_SIZE = F.textModelStructSize();
+  const n = F.textModel(tp, 0, 0);
+  if (n <= 0) return null;
+  const ptr = mod._malloc(n * TEXT_CHAR_SIZE);
+  const got = F.textModel(tp, ptr, n);
+  if (got <= 0) { mod._free(ptr); return null; }
+  m = { tp, ptr, count: Math.min(n, got) };
+  textModels.set(page, m);
+  return m;
+}
+
+function modelCharBox(m, i) {
+  if (i < 0 || i >= m.count) return null;
+  const o = (m.ptr + i * TEXT_CHAR_SIZE) >> 2;
+  const f = hF32();
+  const b = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
+  return b[2] > b[0] && b[3] > b[1] ? b : null;
+}
+
+function modelText(m, s, e) {
+  let out = "";
+  for (let i = Math.max(0, s); i < Math.min(m.count, e); i++) {
+    const c = hI32()[(m.ptr + i * TEXT_CHAR_SIZE) >> 2];
+    if (c) out += String.fromCharCode(c);
+  }
+  return out;
+}
+
+function modelQuads(m, s, e) {
+  const n = F.textModelQuads(m.ptr, m.count, s, e, 0, 0);
+  if (n <= 0) return [];
+  const qb = mod._malloc(n * 32);
+  const got = F.textModelQuads(m.ptr, m.count, s, e, qb, n);
+  const out = Array.from(hF32().subarray(qb >> 2, (qb >> 2) + Math.max(0, got) * 8));
+  mod._free(qb);
+  return out;
+}
+
+function modelCharAt(m, x, y, tol) { return F.textModelCharAt(m.ptr, m.count, x, y, tol); }
+
+function modelWord(m, c) {
+  const b = mod._malloc(8);
+  const ok = F.textModelWord(m.ptr, m.count, c, b, b + 4);
+  const s = hI32()[b >> 2], e = hI32()[(b >> 2) + 1];
+  mod._free(b);
+  return ok && e > s ? [s, e] : null;
+}
+
+/** Post the selection as the shell paints it — or `page: -1` when there is none. */
+function postPageSel(extra = {}) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  if (!s || !m) { postMessage({ type: "pageSel", page: -1, ...extra }); return; }
+  const quads = modelQuads(m, s.start, s.end);
+  let a0 = null, a1 = null;
+  for (let i = s.start; i < s.end && !a0; i++) {
+    const b = modelCharBox(m, i);
+    if (b) a0 = [b[0], b[1], b[3]];               // x, bottom, top of the first letter
+  }
+  for (let i = s.end - 1; i >= s.start && !a1; i--) {
+    const b = modelCharBox(m, i);
+    if (b) a1 = [b[2], b[1], b[3]];               // x, bottom, top of the last letter
+  }
+  let l = Infinity, b = Infinity, r = -Infinity, t = -Infinity;
+  for (let k = 0; k + 8 <= quads.length; k += 8) {
+    for (let j = 0; j < 8; j += 2) {
+      l = Math.min(l, quads[k + j]); r = Math.max(r, quads[k + j]);
+      b = Math.min(b, quads[k + j + 1]); t = Math.max(t, quads[k + j + 1]);
+    }
+  }
+  postMessage({ type: "pageSel", page: s.page, start: s.start, end: s.end, quads,
+                anchors: [a0, a1], text: modelText(m, s.start, s.end),
+                bounds: quads.length ? [l, b, r, t] : null, held: s.held, ...extra });
+}
+
+// PageTextSelection.dragHandle, transcribed. A held press grows from the pressed word in
+// both directions; afterwards each knob moves its own end and they swap when they cross.
+function dragPageSel(which, x, y) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  if (!m) return which;
+  const c = modelCharAt(m, x, y, -1);
+  if (c < 0 || c >= m.count) return which;
+  let ns, ne, now;
+  if (s.held) {
+    if (c < s.pressStart) { ns = c; ne = s.pressEnd; now = 0; }
+    else { ns = s.pressStart; ne = Math.max(c + 1, s.pressEnd); now = 1; }
+  } else if (which === 1) {
+    const stay = s.start;
+    if (c + 1 > stay) { ns = stay; ne = c + 1; now = 1; } else { ns = c; ne = stay; now = 0; }
+  } else {
+    const stay = s.end;
+    if (c < stay) { ns = c; ne = stay; now = 0; } else { ns = stay; ne = c + 1; now = 1; }
+  }
+  s.start = ns; s.end = ne;
+  return now;
+}
+
+function pressPageSel(page, x, y, tol, unit) {
+  pageSel = null;
+  const m = textModelOf(page);
+  if (!m) return false;
+  const c = modelCharAt(m, x, y, tol);
+  if (c < 0 || c >= m.count) return false;
+  const w = unit === "word" ? modelWord(m, c) : null;
+  const s = w ? w[0] : c, e = w ? w[1] : c + 1;
+  pageSel = { page, start: s, end: e, pressStart: s, pressEnd: e, held: true };
+  return true;
+}
+
+const MARKUP_KIND_NAMES = ["highlight", "underline", "squiggle", "strikeout"];
+
+/** Every text markup on |page|, as the shell hit-tests and outlines it. */
+function readMarkups(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  const pg = acquirePage(page);
+  const n = F.markupCount(doc, pg);
+  if (n <= 0) return [];
+  const size = F.markupStructSize();
+  const buf = mod._malloc(Math.max(size, 64));
+  const qb = mod._malloc(32);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.markupInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const kind = hI32()[o], qc = hI32()[o + 1], flags = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 4, o + 8));
+    const color = hU32()[o + 8];
+    const quads = [];
+    for (let q = 0; q < qc; q++) {
+      if (F.markupQuad(doc, pg, i, q, qb)) quads.push(...hF32().subarray(qb >> 2, (qb >> 2) + 8));
+    }
+    const len = F.markupName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.markupName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    out.push({ index: i, kind, tool: MARKUP_KIND_NAMES[kind] ?? null, flags, rect, quads,
+               color: flags & 1 ? null : color, nm });
+  }
+  mod._free(buf);
+  mod._free(qb);
+  return out;
+}
+
+const quadBox = (q, k) => [Math.min(q[k], q[k + 2], q[k + 4], q[k + 6]),
+                           Math.min(q[k + 1], q[k + 3], q[k + 5], q[k + 7]),
+                           Math.max(q[k], q[k + 2], q[k + 4], q[k + 6]),
+                           Math.max(q[k + 1], q[k + 3], q[k + 5], q[k + 7])];
+
+// MarkupHit.subtractCoveredQuads, transcribed: what an existing mark of the SAME tool already
+// covers on a line is cut out of the new one, so marking twice never stacks a second mark.
+function subtractCovered(newQ, existing) {
+  if (!newQ.length || !existing.length) return newQ;
+  const out = [];
+  for (let k = 0; k + 8 <= newQ.length; k += 8) {
+    const [nl, nb, nr, nt] = quadBox(newQ, k);
+    const h = nt - nb;
+    const covered = [];
+    for (const q of existing) {
+      for (let j = 0; j + 8 <= q.length; j += 8) {
+        const [el, eb, er, et] = quadBox(q, j);
+        const vo = Math.max(0, Math.min(nt, et) - Math.max(nb, eb));
+        if (h > 0 && vo >= 0.5 * Math.min(h, et - eb)) {
+          const cl = Math.max(nl, el), cr = Math.min(nr, er);
+          if (cr > cl) covered.push([cl, cr]);
+        }
+      }
+    }
+    covered.sort((a, b) => a[0] - b[0]);
+    const emit = (l, r) => { if (r - l >= 0.5) out.push(l, nt, r, nt, l, nb, r, nb); };
+    let x = nl;
+    for (const c of covered) { if (c[0] > x) emit(x, c[0]); if (c[1] > x) x = c[1]; }
+    if (nr > x) emit(x, nr);
+  }
+  return out;
+}
+
+function repaintRect(page, r) {
+  if (r && r[2] > r[0] && r[3] > r[1]) renderDirtyStrip(page, [r[0] - 2, r[1] - 2, r[2] + 2, r[3] + 2]);
+}
+
+function createMarkupFromSel(msg) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  pageSel = null;
+  postPageSel();
+  if (!s || !m || s.end <= s.start) {
+    postMessage({ type: "markupCreated", ok: false, code: "markup-no-text", page: s ? s.page : -1 });
+    return;
+  }
+  const page = s.page;
+  const kind = Number(msg.kind) | 0;
+  const before = readMarkups(page);
+  const quads = subtractCovered(modelQuads(m, s.start, s.end),
+                                before.filter((k) => k.kind === kind).map((k) => k.quads));
+  if (!quads.length) {   // already marked: nothing to write, and nothing went wrong
+    postMessage({ type: "markupCreated", ok: true, nothing: true, page, marks: before });
+    return;
+  }
+  const pg = acquirePage(page);
+  F.markupSetLineStyle(doc, Number(msg.lineRatio) || 0, Number(msg.lineMinWidth) || 0);
+  const specSize = F.markupSpecSize();
+  if (specSize !== 32) {   // the wasm32 layout written below; never guess at another one
+    postMessage({ type: "markupCreated", ok: false, code: "markup-failed", page, marks: before });
+    return;
+  }
+  const spec = mod._malloc(specSize);
+  const qp = mod._malloc(quads.length * 4);
+  hF32().set(quads, qp >> 2);
+  const nmBuf = mod._malloc(128);
+  const rect = mod._malloc(16);
+  const ok = withUtf8(msg.author || "", (author) => {
+    mod.HEAPU8.fill(0, spec, spec + specSize);
+    const o = spec >> 2;
+    hI32()[o] = kind;
+    hU32()[o + 1] = (Number(msg.color) >>> 0);
+    hU32()[o + 2] = qp;
+    hI32()[o + 3] = quads.length / 8;
+    hU32()[o + 5] = author;   // nm (o+4), contents, date stay NULL: the core mints/stamps them
+    return F.markupCreate(doc, pg, spec, nmBuf, 128, rect);
+  });
+  const nm = ok ? cstr(nmBuf) : null;
+  const r = readF32(rect, 4);
+  for (const p of [spec, qp, nmBuf, rect]) mod._free(p);
+  if (ok) repaintRect(page, r);
+  postMessage({ type: "markupCreated", ok: !!ok, page, nm, kind, color: Number(msg.color) >>> 0,
+                code: ok ? undefined : "markup-failed", marks: readMarkups(page), select: !!msg.select });
+  postHistory(true);
+}
+
+function deleteMarkupByName(page, nm) {
+  const pg = acquirePage(page);
+  const rect = mod._malloc(16);
+  const ok = withUtf8(nm, (p) => F.markupDelete(doc, pg, p, rect));
+  const r = readF32(rect, 4);
+  mod._free(rect);
+  if (ok) repaintRect(page, r);
+  return !!ok;
+}
+
+function applyMarkupHistory(kind) {
+  if (!doc) return;
+  const undo = kind === "undo";
+  const page = undo ? F.markupUndoPage(doc) : F.markupRedoPage(doc);
+  if (page < 0) { postHistory(true); return; }
+  const otherPage = undo ? F.markupUndoOtherPage(doc) : F.markupRedoOtherPage(doc);
+  const pg = acquirePage(page);
+  const rect = mod._malloc(16), nmBuf = mod._malloc(128), pres = mod._malloc(4);
+  const code = (undo ? F.markupUndo : F.markupRedo)(doc, pg, rect, nmBuf, 128, pres);
+  const r = readF32(rect, 4);
+  const nm = cstr(nmBuf);
+  const present = hI32()[pres >> 2] === 1;
+  for (const p of [rect, nmBuf, pres]) mod._free(p);
+  // I135: a stamp moved across pages changes a second page too (W4) — and the step's rect is on
+  // ONE of them, so both are repainted whole (measured: a redo left the old copy on screen).
+  const twoPages = code > 0 && otherPage >= 0 && otherPage !== page;
+  if (twoPages) {
+    // refreshAfterCrossPage: a saved block is page CONTENT, so both text pages are reloaded.
+    for (const p of [page, otherPage]) {
+      const tp = textPages.get(p);
+      if (tp && p !== editPage) { dropTextModel(p); F.closeTextPage(tp); textPages.delete(p); }
+      noteMutation(p);
+    }
+    renderDirtyStrip(page, [0, 0, pages[page].w, pages[page].h]);
+  }
+  else if (code > 0) repaintRect(page, r);
+  let other = null;
+  if (twoPages) {
+    acquirePage(otherPage);
+    renderDirtyStrip(otherPage, [0, 0, pages[otherPage].w, pages[otherPage].h]);
+    other = { page: otherPage, marks: readMarkups(otherPage), stamps: readStamps(otherPage) };
+  }
+  postMessage({ type: "markupHistoryApplied", kind, page, ok: code > 0, code, nm, present,
+                focus: r, marks: readMarkups(page), stamps: readStamps(page), other });
+  postHistory(true);
+}
+
+/**
+ * THE DISCARD'S REWIND (W2 = PdfSession.rewindToMark, transcribed) — ONE worker task. Asks the
+ * core how far |journal| is from its mode-entry mark and takes that many undo (or redo) steps
+ * WITHOUT a render per step; each touched page is repainted once at the end.
+ *  - S0/S2 for the whole batch: the keystroke latch is drained (the last keystroke must be a
+ *    step before it can be rewound), then any open session is CANCELLED, never committed (a
+ *    commit can write identity marks the rewind would keep).
+ *  - The page is re-grouped only when a step's page differs from the previous step's.
+ *  - It STOPS on the first step that does not apply and never skips ahead.
+ *  - Then the core finishes the discard (redo born after the mark is dropped) and pins stop.
+ */
+function rewindToMark(journal) {
+  const text = journal === "text";
+  let kind = 0, steps = 0, done = 0, code = 1;
+  const touched = new Set();
+  const t0 = performance.now();
+  if (doc && (text || journal === "markup")) {
+    if (pendingEdit) drainLatch();
+    ({ kind, steps } = markSteps(text ? F.historyMarkSteps : F.markupHistoryMarkSteps));
+    if (editor) {
+      const tp = F.editCancel(editor);
+      if (tp) textPages.set(editPage, tp);
+      noteMutation(editPage);
+      editor = 0; editPage = -1; editParaBounds = null;
+    }
+    const undo = steps > 0;
+    let lastGrouped = -1;
+    for (let i = 0; i < Math.abs(steps); i++) {
+      const page = text ? (undo ? F.undoPage(doc) : F.redoPage(doc))
+                        : (undo ? F.markupUndoPage(doc) : F.markupRedoPage(doc));
+      if (page < 0) { code = 0; break; }
+      if (!text) {   // I135: a stamp moved across pages changes a second page too
+        const other = undo ? F.markupUndoOtherPage(doc) : F.markupRedoOtherPage(doc);
+        if (other >= 0) touched.add(other);
+      }
+      const pg = acquirePage(page);
+      if (text) {
+        if (page !== lastGrouped) { groupPage(page); lastGrouped = page; }
+        const tp = textPageOf(page);
+        const dp = mod._malloc(16), fp = mod._malloc(16), tpp = mod._malloc(4);
+        code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp, tpp);
+        const newTp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+        mod._free(dp); mod._free(fp); mod._free(tpp);
+        if (newTp) textPages.set(page, newTp);   // S6, unconditionally
+        if (code > 0) { dirtyPages.delete(page); noteMutation(page); }
+      } else {
+        const rect = mod._malloc(16), nmBuf = mod._malloc(128), pres = mod._malloc(4);
+        code = (undo ? F.markupUndo : F.markupRedo)(doc, pg, rect, nmBuf, 128, pres);
+        for (const p of [rect, nmBuf, pres]) mod._free(p);
+      }
+      if (code <= 0) break;
+      touched.add(page);
+      done++;
+    }
+    (text ? F.historyEndDiscard : F.markupHistoryEndDiscard)(doc);
+  }
+  // ONCE per touched page: repaint it whole, and hand the shell the lists it re-adopts.
+  const out = [];
+  for (const p of touched) {
+    acquirePage(p);
+    renderDirtyStrip(p, [0, 0, pages[p].w, pages[p].h]);
+    out.push(text ? { page: p, blocks: groupPage(p), images: cachedImages(p) }
+                  : { page: p, marks: readMarkups(p) });
+  }
+  markPinned.clear(); markPinning = false;
+  postMessage({ type: "discarded", journal, kind, wanted: Math.abs(steps), done,
+                code, pages: out, ms: performance.now() - t0 });
+  postHistory(true);
+}
+
+// ---- SIGNATURES (W4 = Android SG9/SG10; PdfSession.createStamp / stampsOnPage) -------------
+const STAMP_KIND_NAMES = ["signature", "signaturetext", "stamp"];   // PDFE_STAMP_* -> selection kind
+const HANDWRITING_FACES = new Set(["DancingScript-Regular", "GreatVibes-Regular", "Caveat-Regular",
+                                   "MrDafoe-Regular"]);   // PdfeSignatureFonts.HANDWRITING
+let preparedPicture = { id: 0, handle: 0 };   // the picked picture, prepared once at pick
+const stagedFaces = new Map();               // face name -> Promise<boolean>, per document
+
+/** Every stamp on |page|: {index, kind, flags, annotIndex, rect, nm, turn} (PdfiumBridge.stampsOnPage). */
+function readStamps(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  if (F.stampStructSize() !== 28) throw new Error("PdfeStamp layout changed");
+  const pg = acquirePage(page);
+  const n = F.stampCount(doc, pg);
+  if (n <= 0) return [];
+  const buf = mod._malloc(28), tb = mod._malloc(12);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.stampInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const kind = hI32()[o], flags = hI32()[o + 1], annotIndex = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 3, o + 7));
+    const len = F.stampName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.stampName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    const turn = F.stampTurn(doc, pg, i, tb) ? Array.from(hF32().subarray(tb >> 2, (tb >> 2) + 3)) : null;
+    out.push({ index: i, kind, kindName: STAMP_KIND_NAMES[kind] ?? "stamp", flags, annotIndex, rect, nm, turn });
+  }
+  mod._free(buf); mod._free(tb);
+  return out;
+}
+
+/** A handwriting face is LOADED (never registered — text editing can never pick it), once per
+ *  document, the first time a signature needs it (PdfeEditorView.stageHandwriting). */
+function stageFace(name) {
+  if (!name || !HANDWRITING_FACES.has(name) || fontHandles.has(name)) return Promise.resolve(true);
+  if (stagedFaces.has(name)) return stagedFaces.get(name);
+  const docAt = doc;
+  const p = (async () => {
+    try {
+      const base = new URL(fontsBaseUrl || "./fonts/", self.location.href);
+      const src = new Uint8Array(await (await fetch(new URL(name + ".ttf", base))).arrayBuffer());
+      if (doc !== docAt) return false;
+      const bp = mod._malloc(src.length);
+      mod.HEAPU8.set(src, bp);
+      const h = withUtf8(name, (np) => F.loadAssetFont(doc, np, bp, src.length));
+      mod._free(bp);
+      if (h) fontHandles.set(name, h);
+      return !!h;
+    } catch { return false; }
+  })();
+  stagedFaces.set(name, p);
+  return p;
+}
+
+/** The picked picture, prepared ONCE (straight-alpha RGBA from ImageData: flags 0). */
+function preparePicture(id, w, h, px) {
+  if (preparedPicture.handle) F.pictureFree(preparedPicture.handle);
+  preparedPicture = { id: 0, handle: 0 };
+  if (!px || w <= 0 || h <= 0) return;
+  const bp = mod._malloc(px.length);
+  mod.HEAPU8.set(px, bp);
+  const handle = F.picturePrepare(bp, w, h, w * 4, 0);
+  mod._free(bp);
+  preparedPicture = { id, handle };
+}
+
+/** Fill a just-created stamp with |sig| — one content call (PdfeEditorView.fillSignature). */
+function fillSignature(pg, nm, sig) {
+  return withUtf8(nm, (nmp) => {
+    if (sig.type === "drawn") {
+      const strokes = (sig.strokes || []).filter((s) => s.points && s.points.length >= 2);
+      const xy = [], counts = [], widths = [], colors = [];
+      for (const s of strokes) {
+        const n = Math.floor(s.points.length / 2);
+        for (let i = 0; i < n * 2; i++) xy.push(+s.points[i]);
+        counts.push(n); widths.push(+s.width || 1); colors.push((s.color ?? 0xff000000) >>> 0);
+      }
+      if (!counts.length) return 0;
+      const xp = mod._malloc(xy.length * 4), cp = mod._malloc(counts.length * 4),
+            wp = mod._malloc(counts.length * 4), kp = mod._malloc(counts.length * 4), fp = mod._malloc(16);
+      hF32().set(xy, xp >> 2); hI32().set(counts, cp >> 2); hF32().set(widths, wp >> 2);
+      hU32().set(colors, kp >> 2); hF32().set([0, 0, +sig.frameWidth, +sig.frameHeight], fp >> 2);
+      const ok = F.stampAddStrokes(doc, pg, nmp, xp, cp, counts.length, wp, kp, fp, 1 /* Y_DOWN */);
+      for (const p of [xp, cp, wp, kp, fp]) mod._free(p);
+      return ok;
+    }
+    if (sig.type === "picture") {
+      return preparedPicture.handle && preparedPicture.id === sig.pictureId
+        ? F.stampAddPreparedPicture(doc, pg, nmp, preparedPicture.handle) : 0;
+    }
+    const argb = (sig.color ?? 0xff000000) >>> 0;
+    const face = sig.fontName || (sig.type === "typed" ? "LiberationSerif-Regular" : null);
+    return withUtf8(sig.text || "", (tp) => {
+      if (sig.type === "typed") return withUtf8(face, (fp) => F.stampAddTextOutlines(doc, pg, nmp, tp, fp, argb));
+      return face ? withUtf8(face, (fp) => F.stampAddText(doc, pg, nmp, tp, fp, argb))
+                  : F.stampAddText(doc, pg, nmp, tp, 0, argb);
+    });
+  });
+}
+
+/** Create + fill, all or nothing (PdfSession.createStamp). Replies "signaturePlaced". */
+async function placeSignature(msg) {
+  const sig = msg.signature || {};
+  if (sig.type === "typed" || sig.type === "text") await stageFace(sig.fontName);
+  if (!doc) return;
+  if (F.stampSpecSize() !== 32) throw new Error("PdfeStampSpec layout changed");
+  const page = msg.page;
+  const pg = acquirePage(page);
+  const spec = mod._malloc(32), out = mod._malloc(128), rect = mod._malloc(16);
+  hI32()[spec >> 2] = msg.kind | 0;
+  hF32().set(msg.rect, (spec >> 2) + 1);
+  const ap = msg.author ? (() => { const b = new TextEncoder().encode(msg.author + "\0");
+    const p = mod._malloc(b.length); mod.HEAPU8.set(b, p); return p; })() : 0;
+  hU32()[(spec >> 2) + 5] = 0; hU32()[(spec >> 2) + 6] = ap; hU32()[(spec >> 2) + 7] = 0;
+  const made = F.stampCreate(doc, pg, spec, out, 128, rect);
+  let nm = made ? cstr(out) : "";
+  for (const p of [spec, out, rect, ap]) if (p) mod._free(p);
+  if (nm && fillSignature(pg, nm, sig) !== 1) {
+    const r = mod._malloc(16);
+    withUtf8(nm, (p) => F.stampDelete(doc, pg, p, r));
+    mod._free(r);
+    nm = "";
+  }
+  noteMutation(page);
+  repaintRect(page, msg.rect);
+  postMessage({ type: "signaturePlaced", page, ok: !!nm, nm, stamps: readStamps(page) });
+  postHistory(true);
+}
+
+/** Move/resize (set_rect) or delete a stamp by /NM; replies "stampChanged". */
+function stampOp(msg) {
+  if (!doc) return;
+  const pg = acquirePage(msg.page);
+  const dirty = mod._malloc(16);
+  let ok = 0;
+  withUtf8(msg.nm || "", (np) => {
+    if (msg.type === "stampDelete") ok = F.stampDelete(doc, pg, np, dirty);
+    else if (msg.type === "stampRotate") ok = F.stampRotate(doc, pg, np, msg.angle, msg.scale, dirty);
+    else if (msg.type === "stampTransform") {
+      const cp = mod._malloc(8);
+      hF32().set(msg.centre, cp >> 2);
+      ok = F.stampTransform(doc, pg, np, msg.angle, msg.sx, msg.sy, cp, dirty);
+      mod._free(cp);
+    } else {
+      const rp = mod._malloc(16);
+      hF32().set(msg.rect, rp >> 2);
+      ok = F.stampSetRect(doc, pg, np, rp, dirty);
+      mod._free(rp);
+    }
+  });
+  const d = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, d); }
+  postMessage({ type: "stampChanged", op: msg.type, page: msg.page, nm: msg.nm, ok: !!ok,
+                stamps: readStamps(msg.page) });
+  postHistory(true);
+}
+
+/** A signature dropped on ANOTHER page (W4b = I135, PdfSession.moveStampToPage): one core call,
+ *  then both pages are repainted whole and their text pages reloaded (refreshAfterCrossPage). */
+function stampMoveToPage(msg) {
+  if (!doc) return;
+  const from = acquirePage(msg.from), to = acquirePage(msg.to);
+  const rp = mod._malloc(16);
+  hF32().set(msg.rect, rp >> 2);
+  const ok = withUtf8(msg.nm || "", (np) => F.stampMoveToPage(doc, from, np, to, rp, 0));
+  mod._free(rp);
+  for (const p of [msg.from, msg.to]) {
+    if (ok) {
+      const tp = textPages.get(p);
+      if (tp && p !== editPage) { dropTextModel(p); F.closeTextPage(tp); textPages.delete(p); }
+      noteMutation(p);
+    }
+    renderDirtyStrip(p, [0, 0, pages[p].w, pages[p].h]);
+  }
+  postMessage({ type: "stampMovedToPage", from: msg.from, to: msg.to, nm: msg.nm, ok: !!ok,
+                fromStamps: readStamps(msg.from), toStamps: readStamps(msg.to),
+                fromMarks: readMarkups(msg.from), toMarks: readMarkups(msg.to) });
+  postHistory(true);
+}
+
+/** The drag's clamp range, taken once at touch-down (pdfe_stamp_limits). */
+function stampLimits(msg) {
+  if (!doc) return;
+  const pg = acquirePage(msg.page);
+  const mv = mod._malloc(16), pb = mod._malloc(16);
+  const ok = withUtf8(msg.nm || "", (np) => F.stampLimits(doc, pg, np, mv, pb));
+  const limits = ok ? readF32(mv, 4) : null;
+  mod._free(mv); mod._free(pb);
+  postMessage({ type: "stampLimits", page: msg.page, nm: msg.nm, limits });
+}
+
+/** The annotate-mode messages. Returns true when |msg| was one of them. */
+function handleAnnotateMessage(msg) {
+  switch (msg.type) {
+    case "signaturePick":          // W4: a picture is prepared once, at the pick
+      preparePicture(msg.pictureId | 0, msg.width | 0, msg.height | 0, msg.pixels || null);
+      if (msg.fontName) stageFace(msg.fontName);
+      return true;
+    case "signaturePlace": placeSignature(msg); return true;
+    case "stampSetRect": case "stampDelete": case "stampRotate": case "stampTransform": stampOp(msg); return true;
+    case "stampLimits": stampLimits(msg); return true;
+    case "stampMoveToPage": stampMoveToPage(msg); return true;
+    case "annotateReset":          // a mode change: every snapshot is re-taken on demand
+      dropAllTextModels();
+      pageSel = null;
+      return true;
+    case "marks":
+      if (doc) postMessage({ type: "marks", page: msg.page, marks: readMarkups(msg.page),
+                             stamps: readStamps(msg.page), matrix: pageMatrix(msg.page) });
+      return true;
+    case "pageSelPress": {
+      if (!doc) return true;
+      pressPageSel(msg.page, msg.xPt, msg.yPt, msg.tolPt, msg.unit);
+      postPageSel({ reason: "press", lp: msg.lp });
+      return true;
+    }
+    case "pageSelDragFrom": {      // a one-finger drag with a tool armed (§23)
+      if (!doc) return true;
+      if (!pressPageSel(msg.page, msg.ax, msg.ay, msg.tolPt, "char") &&
+          !pressPageSel(msg.page, msg.xPt, msg.yPt, msg.tolPt, "char")) {
+        postPageSel({ reason: "drag" });
+        return true;
+      }
+      dragPageSel(1, msg.xPt, msg.yPt);
+      postPageSel({ reason: "drag" });
+      return true;
+    }
+    case "pageSelDrag": {
+      if (!pageSel) return true;
+      const now = dragPageSel(msg.which | 0, msg.xPt, msg.yPt);
+      postPageSel({ reason: "drag", which: now });
+      return true;
+    }
+    case "pageSelEnd":
+      if (pageSel) pageSel.held = false;
+      postPageSel({ reason: "end", settled: true });
+      return true;
+    case "pageSelClear":
+      if (!pageSel) return true;
+      pageSel = null;
+      postPageSel({ reason: "clear" });
+      return true;
+    case "markupSelection":
+      if (doc) createMarkupFromSel(msg);
+      return true;
+    case "markupDelete": {
+      if (!doc) return true;
+      const ok = deleteMarkupByName(msg.page, msg.nm || "");
+      postMessage({ type: "markupDeleted", ok, page: msg.page, nm: msg.nm, kind: msg.kind,
+                    marks: readMarkups(msg.page) });
+      postHistory(true);
+      return true;
+    }
+    case "markupRecolor": {
+      if (!doc) return true;
+      const pg = acquirePage(msg.page);
+      const rect = mod._malloc(16);
+      const ok = withUtf8(msg.nm || "", (p) => F.markupSetColor(doc, pg, p, Number(msg.color) >>> 0, rect));
+      const r = readF32(rect, 4);
+      mod._free(rect);
+      if (ok) repaintRect(msg.page, r);
+      postMessage({ type: "markupRecolored", ok: !!ok, page: msg.page, nm: msg.nm,
+                    marks: readMarkups(msg.page) });
+      postHistory(true);
+      return true;
+    }
+  }
+  return false;
+}
+
 onmessage = async (e) => {
   await ready;
   const msg = e.data;
@@ -2182,6 +3123,8 @@ onmessage = async (e) => {
         if (tp) textPages.set(editPage, tp);
         editor = 0; editPage = -1; editParaBounds = null;
       }
+      dropAllTextModels();
+      pageSel = null;
       for (const tp of textPages.values()) F.closeTextPage(tp);
       textPages.clear();
       for (const p of pageHandles.values()) F.closePage(p);
@@ -2190,6 +3133,8 @@ onmessage = async (e) => {
       groupQueue.length = 0; groupQueued.clear(); groupCache.clear(); imageCache.clear();
       matrixCache.clear();
       coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
+      markPinned.clear(); markPinning = false;   // the mark died with the document
+      stagedFaces.clear();                       // loaded faces are DOCUMENT-owned
       // Font handles are DOCUMENT-owned (pdfe_close_doc frees them), so the registry
       // must not outlive the doc — a stale handle applied to the next file is a
       // use-after-free. A host re-registers its faces after opening.
@@ -2380,6 +3325,16 @@ onmessage = async (e) => {
       placeNewBoxAt(msg.page, msg.xPt, msg.yPt);
       return;
     }
+    // [tap-rung: arm-insert-image]
+    // A picture is armed (armInsertImage): the tap is where it goes. The arm is spent here and the
+    // shell, which holds the pixels, inserts it centred on the tap (PdfPageView.onPlaceImage).
+    if (imageInsertArmed) {
+      imageInsertArmed = false;
+      if (editor) commitEditor();
+      clearSelection();
+      postMessage({ type: "imageArmTap", page: msg.page, xPt: msg.xPt, yPt: msg.yPt });
+      return;
+    }
     // [tap-rung: caret-in-open-run]
     if (editor && msg.page === editPage && editParaBounds &&
         msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
@@ -2466,6 +3421,12 @@ onmessage = async (e) => {
     moveSelectedImage(Number(msg.dx) || 0, Number(msg.dy) || 0);
     return;
   }
+  if (msg.type === "liveItem") { liveItem(msg); return; }
+  if (msg.type === "imageApplyMatrix") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
+    applySelectedImageMatrix(msg.m);
+    return;
+  }
   if (msg.type === "rotateImage") {
     if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
     rotateSelectedImage(Number(msg.turns) || 0);
@@ -2484,8 +3445,42 @@ onmessage = async (e) => {
   }
 
   // ---- ADD TEXT ------------------------------------------------------------
-  if (msg.type === "armAddText") { setAddTextArmed(true); return; }
-  if (msg.type === "cancelAddText") { setAddTextArmed(false); return; }
+  if (msg.type === "armAddText") {
+    pendingAddText = typeof msg.text === "string" && msg.text ? msg.text : null;
+    setAddTextArmed(true);
+    return;
+  }
+  if (msg.type === "cancelAddText") { pendingAddText = null; setAddTextArmed(false); return; }
+  // W7a: the MOVE button above the box being typed in (PdfeEditorView.moveOpenBox): an empty new
+  // box is placed again at the new point; a box with text is committed, moved (one undo step, as a
+  // drag) and reopened where it landed.
+  if (msg.type === "moveOpenBox") {
+    if (!doc || !editor) return;
+    const dx = Number(msg.dx) || 0, dy = Number(msg.dy) || 0, page = editPage;
+    const anchor = newBoxAnchor, b = editParaBounds && editParaBounds.slice();
+    if (anchor && readEditorText() === "") {
+      commitEditor();                       // an empty box leaves nothing behind
+      placeNewBoxAt(page, anchor[0] + dx, anchor[1] + dy);
+      return;
+    }
+    if (!b) return;
+    commitEditor();
+    const cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2;
+    moveBlockAt(page, cx, cy, dx, dy, b);
+    openEditorAt(page, cx + dx, cy + dy, -1);
+    return;
+  }
+  if (msg.type === "addTextScreenSize") { addTextScreenDev = Math.max(0, Number(msg.dev) || 0); return; }
+  // W7a: a box holding the app's text at a page point, no tap (addTextAt / addTextAtCenter).
+  if (msg.type === "addTextAt") {
+    if (!doc || !msg.text) return;
+    setAddTextArmed(false);
+    if (editor) commitEditor();
+    clearSelection();
+    pendingAddText = msg.text;
+    placeNewBoxAt(Number(msg.page), Number(msg.xPt), Number(msg.yPt));
+    return;
+  }
   if (msg.type === "setNewTextStyle") {
     // Every field is optional and independent, so a host can set only the colour and
     // leave the face and size on the core's floor. null/0 means "not specified".
@@ -2498,8 +3493,32 @@ onmessage = async (e) => {
 
   // Undo/redo take NO arguments: the core knows which page each step belongs
   // to, and a shell that passed one could pass a stale one.
-  if (msg.type === "undo") { applyHistory("undo"); return; }
-  if (msg.type === "redo") { applyHistory("redo"); return; }
+  // The shell names the journal (its mode decides, 12-VOCABULARY §7). No scope = text,
+  // which is what every message before step 19 meant.
+  if (msg.type === "undo") {
+    if (msg.scope === "markup") applyMarkupHistory("undo"); else applyHistory("undo");
+    return;
+  }
+  if (msg.type === "redo") {
+    if (msg.scope === "markup") applyMarkupHistory("redo"); else applyHistory("redo");
+    return;
+  }
+  if (handleAnnotateMessage(msg)) return;
+  // W2: a mode was entered — mark "here" in the journal it drives (FIFO with every edit the
+  // user then makes), and pin the pages changed from now on.
+  if (msg.type === "setHistoryMark") {
+    markGen = msg.gen | 0;
+    if (doc && (msg.journal === "text" || msg.journal === "markup")) {
+      (msg.journal === "text" ? F.historySetMark : F.markupHistorySetMark)(doc);
+      markPinned.clear(); markPinning = true;
+    }
+    postHistory(true);
+    return;
+  }
+  // The mode was left KEEPING its work: stop pinning. The core's mark stays until the next
+  // entry replaces it, which is harmless — nothing records in view mode.
+  if (msg.type === "releaseMarkPins") { markPinned.clear(); markPinning = false; return; }
+  if (msg.type === "discard") { rewindToMark(msg.journal); return; }
   // Phase 5: the SDK's ~300 ms idle debounce (and blur) says "the pause
   // happened" — the next keystroke starts a fresh word-level undo entry.
   if (msg.type === "sealHistory") { if (doc) F.historySeal(doc); return; }
@@ -2509,7 +3528,7 @@ onmessage = async (e) => {
   // 2026-08-24 with Android's markSaved(): the SDK cannot see where a host puts
   // the bytes, so only the host can say a save happened (I78).
   if (msg.type === "markSaved") {
-    if (doc) { F.historyClear(doc); postHistory(true); }
+    if (doc) { F.historyClear(doc); F.markupHistoryClear(doc); postHistory(true); }
     postMessage({ type: "markedSaved" });
     return;
   }
@@ -3129,6 +4148,9 @@ onmessage = async (e) => {
     return;
   }
 
+  if (msg.type === "insertImage") { insertImage(msg); return; }
+  if (msg.type === "armInsertImage") { imageInsertArmed = !!msg.armed; return; }
+
   if (msg.type === "commit") {
     commitEditor();
     return;
@@ -3146,6 +4168,21 @@ onmessage = async (e) => {
 
   // TEXT SEARCH (3.3.0): pages in the order given, one per task turn, so a newer
   // search or a clear (a higher gen) stops this one after at most one page.
+  // W7b: the magnifier — a region of the displayed page (device px |x|, |y| of the page scaled by
+  // |scale|) as an ImageBitmap. Read-only.
+  if (msg.type === "loupe") {
+    const w = msg.w | 0, h = msg.h | 0;
+    if (!doc || w <= 0 || h <= 0 || w * h > 1e6) { postMessage({ type: "loupe", seq: msg.seq, ok: false }); return; }
+    const ptr = mod._malloc(w * h * 4);
+    try {
+      mod.HEAPU8.fill(255, ptr, ptr + w * h * 4);
+      F.renderRegion(acquirePage(msg.page), ptr, w, h, w * 4, msg.scale, msg.x, msg.y, PDFE_RENDER_RGBA);
+      const img = new ImageData(new Uint8ClampedArray(mod.HEAPU8.slice(ptr, ptr + w * h * 4).buffer), w, h);
+      createImageBitmap(img).then((bitmap) => postMessage({ type: "loupe", seq: msg.seq, ok: true, bitmap }, [bitmap]));
+    } finally { mod._free(ptr); }
+    return;
+  }
+  if (msg.type === "links") { postMessage({ type: "links", page: msg.page, links: pageLinks(msg.page) }); return; }
   if (msg.type === "search") {
     searchGen = msg.gen;
     await runSearch(msg);

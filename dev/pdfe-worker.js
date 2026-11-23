@@ -82,6 +82,27 @@ const groupCache = new Map();
 // dropped by noteMutation, evicted with it.
 //   pageIndex -> [{ index, bounds:[l,b,r,t], quad:[x1,y1..x4,y4], turns, flags }]
 const imageCache = new Map();
+// Each page's user -> display map (pdfe_page_view_matrix, docs/KNOWN_ISSUES.md I99), or
+// null for an ordinary page. It needs a LOADED page, and pages are measured WITHOUT loading
+// (pdfe_page_size_at, the tier-2 lazy load), so it is asked for the first time a page's
+// groups are — which is the first moment the shell draws anything over that page.
+const matrixCache = new Map();
+function pageMatrix(i) {
+  if (matrixCache.has(i)) return matrixCache.get(i);
+  const p = acquirePage(i);
+  let out = null;
+  if (p && pages[i]) {
+    const buf = mod._malloc(24);
+    F.pageViewMatrix(p, buf);
+    const v = Array.from(new Float32Array(mod.HEAPU8.buffer, buf, 6));
+    mod._free(buf);
+    const identity = v[0] === 1 && v[1] === 0 && v[2] === 0 && v[3] === -1 && v[4] === 0 &&
+                     v[5] === pages[i].h;
+    out = identity ? null : v;
+  }
+  matrixCache.set(i, out);
+  return out;
+}
 const MAX_GROUP_CACHE = 300;      // bounds are tiny; this only caps pathology
 let coreGroupedPage = -1;         // page the CORE's one-slot grouping holds
 let coreGroupFresh = false;       // no object mutation since that grouping
@@ -113,16 +134,119 @@ const ready = createPdfe({
   F.pageSize     = m.cwrap("pdfe_page_size", "number", ["number", "number", "number"]);
   F.pageSizeAt   = m.cwrap("pdfe_page_size_at", "number",
     ["number", "number", "number", "number"]);
+  F.pageViewMatrix = m.cwrap("pdfe_page_view_matrix", "number", ["number", "number"]);
   F.render       = m.cwrap("pdfe_render", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.renderRegion = m.cwrap("pdfe_render_region", "number",
     ["number", "number", "number", "number", "number", "number", "number", "number", "number"]);
   F.loadTextPage  = m.cwrap("pdfe_load_text_page", "number", ["number"]);
   F.closeTextPage = m.cwrap("pdfe_close_text_page", null, ["number"]);
+  // text search (3.3.0): the engine's finder, and the quads a match paints (= a mark's)
+  // W6 (reader R2): the page's /Link annotations and a link's web address.
+  F.links   = m.cwrap("pdfe_links", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.linkUri = m.cwrap("pdfe_link_uri", "number", ["number", "number", "number", "number", "number"]);
+  // TEXT CHECK (3.16.0): the first page a highlight can land on, and one page's kind
+  F.findTextPage  = m.cwrap("pdfe_find_text_page", "number", ["number", "number", "number"]);
+  F.pageKind      = m.cwrap("pdfe_page_kind", "number", ["number", "number"]);
+  F.findOnPage    = m.cwrap("pdfe_find_on_page", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupQuads   = m.cwrap("pdfe_markup_quads_for_range", "number",
+    ["number", "number", "number", "number", "number"]);
+  // ANNOTATE MODE (annotations step 19, the web shell): the page text model, the marks,
+  // and the markup journal. All of it is the core's; this file only marshals.
+  F.markupCount   = m.cwrap("pdfe_markup_count", "number", ["number", "number"]);
+  F.markupInfo    = m.cwrap("pdfe_markup_info", "number", ["number", "number", "number", "number"]);
+  F.markupQuad    = m.cwrap("pdfe_markup_quad", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupName    = m.cwrap("pdfe_markup_name", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupCreate  = m.cwrap("pdfe_markup_create", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupDelete  = m.cwrap("pdfe_markup_delete", "number", ["number", "number", "number", "number"]);
+  F.markupSetColor = m.cwrap("pdfe_markup_set_color", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.markupSetLineStyle = m.cwrap("pdfe_markup_set_line_style", "number", ["number", "number", "number"]);
+  F.markupStructSize = m.cwrap("pdfe_markup_struct_size", "number", []);
+  F.markupSpecSize = m.cwrap("pdfe_markup_spec_size", "number", []);
+  F.markupUndoPage = m.cwrap("pdfe_markup_undo_page", "number", ["number"]);
+  F.markupUndoKind = m.cwrap("pdfe_markup_undo_kind", "number", ["number"]);
+  F.markupRedoKind = m.cwrap("pdfe_markup_redo_kind", "number", ["number"]);
+  F.markupRedoPage = m.cwrap("pdfe_markup_redo_page", "number", ["number"]);
+  F.markupUndo    = m.cwrap("pdfe_markup_undo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupRedo    = m.cwrap("pdfe_markup_redo", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.markupHistoryClear = m.cwrap("pdfe_markup_history_clear", null, ["number"]);
+  // THE MODE-ENTRY MARK (W2 = Android step 14b, pdfe.h "THE MODE-ENTRY MARK"), one per journal.
+  F.historySetMark = m.cwrap("pdfe_history_set_mark", null, ["number"]);
+  F.historyMarkSteps = m.cwrap("pdfe_history_mark_steps", "number", ["number", "number"]);
+  F.historyEndDiscard = m.cwrap("pdfe_history_end_discard", null, ["number"]);
+  F.markupHistorySetMark = m.cwrap("pdfe_markup_history_set_mark", null, ["number"]);
+  F.markupHistoryMarkSteps = m.cwrap("pdfe_markup_history_mark_steps", "number", ["number", "number"]);
+  F.markupHistoryEndDiscard = m.cwrap("pdfe_markup_history_end_discard", null, ["number"]);
+  // SIGNATURES (W4 = Android SG9/SG10): the stamp verbs, the same calls PdfSession makes.
+  F.stampStructSize = m.cwrap("pdfe_stamp_struct_size", "number", []);
+  F.stampSpecSize = m.cwrap("pdfe_stamp_spec_size", "number", []);
+  F.stampCount = m.cwrap("pdfe_stamp_count", "number", ["number", "number"]);
+  F.stampInfo = m.cwrap("pdfe_stamp_info", "number", ["number", "number", "number", "number"]);
+  F.stampTurn = m.cwrap("pdfe_stamp_turn", "number", ["number", "number", "number", "number"]);
+  F.stampName = m.cwrap("pdfe_stamp_name", "number", ["number", "number", "number", "number", "number"]);
+  F.stampCreate = m.cwrap("pdfe_stamp_create", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampDelete = m.cwrap("pdfe_stamp_delete", "number", ["number", "number", "number", "number"]);
+  F.stampSetRect = m.cwrap("pdfe_stamp_set_rect", "number", ["number", "number", "number", "number", "number"]);
+  F.stampLimits = m.cwrap("pdfe_stamp_limits", "number", ["number", "number", "number", "number", "number"]);
+  // W5a: a new picture (D45: PENDING in the core until a save — deleting it leaves no pixels).
+  // W5b: free resize / stretch / turn — a picture by a DELTA matrix, a stamp by an absolute angle.
+  F.imageApplyMatrix = m.cwrap("pdfe_image_apply_matrix", "number", ["number", "number", "number", "number", "number"]);
+  // W5c, the live drag: the page WITHOUT one item, and (flag 0x2) a picture ALONE on transparent.
+  F.renderHiding = m.cwrap("pdfe_render_hiding", "number",
+    ["number", "number", "number", "string", "number", "number", "number", "number", "number"]);
+  F.stampRotate = m.cwrap("pdfe_stamp_rotate", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.stampTransform = m.cwrap("pdfe_stamp_transform", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.imageInsert = m.cwrap("pdfe_image_insert", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.stampMoveToPage = m.cwrap("pdfe_stamp_move_to_page", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddStrokes = m.cwrap("pdfe_stamp_add_strokes", "number",
+    ["number", "number", "number", "number", "number", "number", "number", "number", "number", "number"]);
+  F.stampAddText = m.cwrap("pdfe_stamp_add_text", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddTextOutlines = m.cwrap("pdfe_stamp_add_text_outlines", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.stampAddPreparedPicture = m.cwrap("pdfe_stamp_add_prepared_picture", "number",
+    ["number", "number", "number", "number"]);
+  F.picturePrepare = m.cwrap("pdfe_picture_prepare", "number", ["number", "number", "number", "number", "number"]);
+  // DRAWING (DR3 = the core's pdfe_ink_*, docs/annotations/19-DRAWING.md).
+  F.inkStructSize = m.cwrap("pdfe_ink_struct_size", "number", []);
+  F.inkSpecSize = m.cwrap("pdfe_ink_spec_size", "number", []);
+  F.inkCount = m.cwrap("pdfe_ink_count", "number", ["number", "number"]);
+  F.inkInfo = m.cwrap("pdfe_ink_info", "number", ["number", "number", "number", "number"]);
+  F.inkName = m.cwrap("pdfe_ink_name", "number", ["number", "number", "number", "number", "number"]);
+  F.inkPath = m.cwrap("pdfe_ink_path", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkCreate = m.cwrap("pdfe_ink_create", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkDelete = m.cwrap("pdfe_ink_delete", "number", ["number", "number", "number", "number"]);
+  F.inkTransform = m.cwrap("pdfe_ink_transform", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkSetStyle = m.cwrap("pdfe_ink_set_style", "number", ["number", "number", "number", "number", "number", "number", "number"]);
+  F.inkErase = m.cwrap("pdfe_ink_erase", "number", ["number", "number", "number", "number", "number", "number", "number"]);
+  F.inkSmooth = m.cwrap("pdfe_ink_smooth", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.pictureFree = m.cwrap("pdfe_picture_free", null, ["number"]);
+  F.markupUndoOtherPage = m.cwrap("pdfe_markup_undo_other_page", "number", ["number"]);
+  F.markupRedoOtherPage = m.cwrap("pdfe_markup_redo_other_page", "number", ["number"]);
+  F.textModel     = m.cwrap("pdfe_text_model", "number", ["number", "number", "number"]);
+  F.textModelCharAt = m.cwrap("pdfe_text_model_char_at", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.textModelWord = m.cwrap("pdfe_text_model_word_range", "number",
+    ["number", "number", "number", "number", "number"]);
+  F.textModelQuads = m.cwrap("pdfe_text_model_quads_for_range", "number",
+    ["number", "number", "number", "number", "number", "number"]);
+  F.textModelStructSize = m.cwrap("pdfe_text_model_struct_size", "number", []);
   F.group         = m.cwrap("pdfe_group_page", "number", ["number", "number", "number"]);
   F.paraInfo      = m.cwrap("pdfe_para_info", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.blockCount    = m.cwrap("pdfe_block_count", "number", ["number"]);
+  F.blockText     = m.cwrap("pdfe_block_text", "number",
+                            ["number", "number", "number", "number", "number"]);
   F.blockInfo     = m.cwrap("pdfe_block_info", "number",
     ["number", "number", "number", "number", "number"]);
   F.moveBlock     = m.cwrap("pdfe_move_block", "number",
@@ -157,6 +281,7 @@ const ready = createPdfe({
   // Asked, never assumed: the SDK clears its unsaved-changes flag from an empty
   // undo stack, and that inference is only valid while recording is ON.
   F.historyEnabled = m.cwrap("pdfe_history_enabled", "number", ["number"]);
+  F.historyEvicted = m.cwrap("pdfe_history_evicted", "number", ["number"]);   // I103
   F.historyDescribe = m.cwrap("pdfe_history_describe", "number",
     ["number", "number", "number"]);
   F.editCaretIndex = m.cwrap("pdfe_edit_caret_index", "number", ["number"]);
@@ -213,23 +338,10 @@ const ready = createPdfe({
   F.loadStandardFont = m.cwrap("pdfe_load_standard_font", "number", ["number", "number"]);
   F.registerFace  = m.cwrap("pdfe_register_face", "number", ["number", "number"]);
   F.editCommit    = m.cwrap("pdfe_edit_commit", "number", ["number", "number"]);
-  // DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md). The public name on this surface is
-  // `documentReflow`, never "reflow" — that word already means the LINE-mode wrap
-  // inside a paragraph, and two meanings for one word in one API is a support ticket.
-  F.flowEnable    = m.cwrap("pdfe_flow_enable", "number", ["number", "number"]);
-  F.flowSettle    = m.cwrap("pdfe_flow_settle", "number", ["number", "number", "number", "number"]);
-  F.flowRefresh   = m.cwrap("pdfe_flow_refresh_page", "number", ["number", "number", "number"]);
-  F.flowFrame     = m.cwrap("pdfe_flow_page_frame", "number", ["number", "number", "number"]);
-  F.flowUndo      = m.cwrap("pdfe_flow_undo", "number", ["number", "number", "number"]);
-  F.flowUndoPage  = m.cwrap("pdfe_flow_undo_page", "number", ["number"]);
-  F.flowCanUndo   = m.cwrap("pdfe_flow_can_undo", "number", ["number"]);
-  F.flowRedo      = m.cwrap("pdfe_flow_redo", "number", ["number", "number", "number"]);
-  F.flowRedoPage  = m.cwrap("pdfe_flow_redo_page", "number", ["number"]);
-  F.flowCanRedo   = m.cwrap("pdfe_flow_can_redo", "number", ["number"]);
-  F.pageAdopt     = m.cwrap("pdfe_page_adopt", "number", ["number", "number", "number"]);
   F.editCancel    = m.cwrap("pdfe_edit_cancel", "number", ["number"]);
   F.generateContent = m.cwrap("pdfe_generate_content", "number", ["number"]);
   F.wasmSave      = m.cwrap("pdfe_wasm_save", "number", ["number"]);
+  F.wasmExportFlat = m.cwrap("pdfe_wasm_export_flattened", "number", ["number"]);
   F.init(0);
   // Probe the save sink BEFORE announcing readiness: the shell must know up
   // front whether saves will stream (OPFS) or fall back to in-heap, because
@@ -242,12 +354,10 @@ const ready = createPdfe({
 
 // Close a page's handles in the required order: text page first, then page.
 function closePageHandles(i) {
+  dropTextModel(i);   // its snapshot belongs to the text page being closed
   const tp = textPages.get(i);
   if (tp) { F.closeTextPage(tp); textPages.delete(i); }
   const p = pageHandles.get(i);
-  // NOTHING TO UN-ADOPT: pdfe_close_page drops any adopted registry entry naming this
-  // handle, refcount or not — the handle is going away, so an entry pointing at it must go
-  // with it, which is exactly the stale view adoption exists to prevent.
   if (p) { F.closePage(p); pageHandles.delete(i); }
 }
 
@@ -256,19 +366,11 @@ function acquirePage(i) {
   if (p) { pageHandles.delete(i); pageHandles.set(i, p); return p; } // LRU touch
   p = F.loadPage(doc, i);
   pageHandles.set(i, p);
-  // ADOPT IT INTO THE CORE'S PAGE REGISTRY, so the flow layer resolves this index to THIS
-  // handle instead of opening a second view of the page. pdfe_load_page does not cache, and
-  // two views of one page are two independent object lists — the measured 3600-vs-3578
-  // divergence, and the direct cause of three separate flow bugs (the cascade stopping at
-  // its first destination, an undo restoring onto a view nobody was watching, and a page
-  // that could not be deleted). Adoption makes those unconstructible rather than guarded
-  // against. Dropped again by closePageHandles below; harmless when flow is off.
-  if (p && F.pageAdopt) F.pageAdopt(doc, i, p);
   // LRU backstop: evict the oldest evictable handle. Queued tile/paint jobs
   // for an evicted page just re-acquire it — a reload cost, never a bug.
   if (pageHandles.size > MAX_OPEN_PAGES) {
     for (const k of pageHandles.keys()) {
-      if (k === i || k === editPage || dirtyPages.has(k)) continue;
+      if (k === i || k === editPage || dirtyPages.has(k) || markPinned.has(k)) continue;
       closePageHandles(k);
       break;
     }
@@ -296,6 +398,62 @@ function blitRegion(ctx, pageHandle, scale, x, y, w, h) {
 }
 
 // ---- edit-session helpers ------------------------------------------------------
+
+// ---- text search (3.3.0) -------------------------------------------------------
+let searchGen = 0;
+
+/** One page's matches, each as its quads (unrotated page points, 8 per quad, Z order). */
+function findOnPage(page, query, flags) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  const tp = textPageOf(page);
+  if (!tp || !query) return [];
+  const qp = mod._malloc(query.length * 2);
+  for (let i = 0; i < query.length; i++) mod.HEAPU16[(qp >> 1) + i] = query.charCodeAt(i);
+  const hits = [];
+  const n = F.findOnPage(tp, qp, query.length, flags, 0, 0);
+  if (n > 0) {
+    const rb = mod._malloc(n * 8);
+    const got = F.findOnPage(tp, qp, query.length, flags, rb, n);
+    const ranges = Array.from(mod.HEAP32.subarray(rb >> 2, (rb >> 2) + 2 * got));
+    mod._free(rb);
+    for (let k = 0; k < got; k++) {
+      const c = F.markupQuads(tp, ranges[2 * k], ranges[2 * k + 1], 0, 0);
+      if (c <= 0) continue;
+      const qb = mod._malloc(c * 32);
+      F.markupQuads(tp, ranges[2 * k], ranges[2 * k + 1], qb, c);
+      hits.push(Array.from(mod.HEAPF32.subarray(qb >> 2, (qb >> 2) + c * 8)));
+      mod._free(qb);
+    }
+  }
+  mod._free(qp);
+  return hits;
+}
+
+// TEXT CHECK (3.16.0, docs/api/text-check.md): slices of 16 pages, yielding between them so
+// renders and edits are never held up; stops at the first page with text. A document replaced
+// meanwhile ends it as `superseded` (the editor drops it when it already said so at "opened").
+async function runTextCheck(msg) {
+  const d = doc, n = d ? F.pageCount(d) : 0;
+  for (let from = 0; d && from < n; from += 16) {
+    if (from) await new Promise((r) => setTimeout(r, 0));
+    if (doc !== d) break;
+    const r = F.findTextPage(d, from, 16);
+    if (r >= 0) { postMessage({ type: "textChecked", gen: msg.gen, hasText: true }); return; }
+    if (r !== -1) break;
+  }
+  postMessage(!d ? { type: "textChecked", gen: msg.gen, error: "no-document" }
+    : doc !== d ? { type: "textChecked", gen: msg.gen, error: "superseded" }
+    : { type: "textChecked", gen: msg.gen, hasText: false });
+}
+
+async function runSearch(msg) {
+  for (const page of msg.order) {
+    await new Promise((r) => setTimeout(r, 0));   // let a newer search / clear in first
+    if (searchGen !== msg.gen || !doc) return;
+    const hits = findOnPage(page, msg.query, msg.flags);
+    postMessage({ type: "searchPage", gen: msg.gen, page, hits });
+  }
+}
 
 function textPageOf(i) {
   let tp = textPages.get(i);
@@ -328,6 +486,27 @@ function withU16(str, fn) {
 // document text only), and a null pointer means "no password" — the default. The
 // bytes are freed the moment the open returns; a password is never retained in
 // the heap, and the worker keeps no copy of it either.
+/** W6: page |page|'s links, [{rect [l,b,r,t] pt, kind 1 page / 2 address, page, uri}] in
+ *  /Annots order (PdfSession.linksOnPage). Read-only. */
+function pageLinks(page) {
+  if (!doc || page < 0 || page >= F.pageCount(doc)) return [];
+  const handle = acquirePage(page);
+  const n = F.links(doc, handle, 0, 0, 0, 0);
+  if (n <= 0) return [];
+  const rp = mod._malloc(n * 16), kp = mod._malloc(n * 4), pp = mod._malloc(n * 4), up = mod._malloc(2048);
+  const out = [];
+  try {
+    F.links(doc, handle, rp, kp, pp, n);
+    const f = hF32().slice(rp >> 2, (rp >> 2) + n * 4), k = hI32().slice(kp >> 2, (kp >> 2) + n), pg = hI32().slice(pp >> 2, (pp >> 2) + n);
+    for (let i = 0; i < n; i++) {
+      let uri = null;
+      if (k[i] === 2) { const len = F.linkUri(doc, handle, i, up, 2048); if (len > 0 && len < 2048) uri = cstr(up); }
+      if (k[i] === 1 || uri) out.push({ rect: [f[4 * i], f[4 * i + 1], f[4 * i + 2], f[4 * i + 3]], kind: k[i], page: k[i] === 1 ? pg[i] : -1, uri });
+    }
+  } finally { mod._free(rp); mod._free(kp); mod._free(pp); mod._free(up); }
+  return out;
+}
+
 function withUtf8(str, fn) {
   if (str === null || str === undefined || str === "") return fn(0);
   const bytes = new TextEncoder().encode(str);
@@ -344,6 +523,23 @@ function openErrorCode(err) {
   if (err === 100) return "password-required";  // PDFE_OPEN_ERR_PASSWORD_REQUIRED
   if (err === 4) return "password-wrong";       // PDFE_OPEN_ERR_PASSWORD
   return "open-failed";
+}
+
+// The plain text of block |b| as the box shows it (pdfe_block_text, 3.1.0), read
+// while the core's grouping is this page's and fresh — i.e. only from groupPage.
+// Cached WITH the block, so "the text of the selected box" costs no core pass when
+// the box is tapped. null when the core refuses (stale grouping) — never a guess.
+function readBlockText(page, b) {
+  const n = F.blockText(doc, acquirePage(page), b, 0, 0);
+  if (n < 0) return null;
+  if (n === 0) return "";
+  const ptr = mod._malloc(n * 2);
+  F.blockText(doc, acquirePage(page), b, ptr, n);
+  let s = "";
+  const v = new Uint16Array(mod.HEAPU8.buffer, ptr, n);   // re-derived post-call (§10)
+  for (let i = 0; i < n; i += 8192) s += String.fromCharCode(...v.subarray(i, i + 8192));
+  mod._free(ptr);
+  return s;
 }
 
 function readEditorText() {
@@ -820,7 +1016,7 @@ function groupPage(page) {
       for (let p = first; p < first + count; p++) {
         if (paraBounds[p]) paras.push({ index: p, bounds: paraBounds[p] });
       }
-      if (paras.length) blockList.push({ index: b, bounds, paras });
+      if (paras.length) blockList.push({ index: b, bounds, paras, text: readBlockText(page, b) });
     }
     mod._free(ip);
     mod._free(bp);
@@ -875,6 +1071,7 @@ function cachedGroups(page) {
 // doc-wide) and stales the mutated PAGE's cached bounds. Other pages' bounds
 // stay valid — their objects did not move.
 function noteMutation(page) {
+  if (markPinning) markPinned.add(page);   // W2: a discard needs this page's parked objects
   coreGroupFresh = false;
   groupCache.delete(page);
   imageCache.delete(page);
@@ -907,7 +1104,8 @@ function hitParagraph(page, xPt, yPt) {
   const hit = pickPara(block.b, xPt, yPt);
   if (!hit) return null;
   return { index: hit.index, bounds: hit.bounds,
-           blockIndex: block.b.index, blockBounds: block.b.bounds };
+           blockIndex: block.b.index, blockBounds: block.b.bounds,
+           blockText: block.b.text ?? null };
 }
 
 // ONE TAP, TWO KINDS — and TEXT WINS. The core has this rule too
@@ -1037,19 +1235,7 @@ function commitEditor() {
   const page = editPage;
   if (ok === 1) dirtyPages.delete(page);   // the core commit flushed this page
   noteMutation(page);                      // indices/bounds may have shifted
-  editor = 0; editPage = -1; editParaBounds = null;
-  // DOCUMENT REFLOW runs HERE — after the commit, before the shell is told the box
-  // closed. §2.2's rule is that the editor never sees a split paragraph: the live
-  // preview may legally hang past the page bottom while the user types, and the page
-  // is re-settled at commit. This is that commit.
-  // GUARDED, because a throw here would swallow the editClosed message below and leave
-  // the shell's overlays up with no way to recover. An experimental layer must not be
-  // able to wedge the editor.
-  let flowed = null;
-  if (flowOn) {
-    try { flowed = settleAfterCommit(page); }
-    catch (err) { console.error("[pdfe] documentReflow: settle threw —", err); }
-  }
+  editor = 0; editPage = -1; editParaBounds = null; newBoxAnchor = null;
   postMessage({ type: "editClosed", page, ok: ok === 1 });
   // FORCED, not deduped. Entering a box and leaving it without typing changes
   // neither flag, so a deduped post sends nothing — and the shell is left holding
@@ -1057,292 +1243,6 @@ function commitEditor() {
   // undo stack contradicting it. The close is exactly when the shell needs the
   // stack's answer, whether or not the answer changed (the S15 rule).
   postHistory(true);
-}
-
-// ---- document reflow --------------------------------------------------------
-// The settle walk lives in the core (core/src/flow.cpp) for the same reason the undo
-// journal does: web, Android and iOS must behave identically from one implementation.
-// This function is only the shell contract around it — group, settle, invalidate,
-// re-group, tell the host.
-let flowOn = false;
-
-// THE CASCADE LIVES HERE, NOT IN THE CORE, and that is deliberate. pdfe_flow_settle
-// settles exactly ONE page and says so: content arriving on the next page is seated
-// below what is already there and is not itself re-settled. That keeps the core verb
-// small and predictable — but a document does not stop at one page, so somebody has to
-// walk the chain, and the shell is the right somebody: it owns the page handles, the
-// text-page cache and the caches that go stale, and it can stop.
-//
-// WHY IT MATTERS THAT IT EXISTS AT ALL: without it, overflow leaving page 3 lands under
-// page 4's own content, which on a full page means off the bottom of it — correct in the
-// model and invisible to the user. With it, the ripple continues until a page has room
-// or a new one is appended, which is what "document reflow" means to anybody watching.
-//
-// BOUNDED, because an unbounded reflow loop on a bad document is a hung tab: it stops
-// when a settle moves nothing, and never runs more than CASCADE_MAX pages.
-const CASCADE_MAX = 24;
-
-// ONE USER UNDO REVERSES ONE CASCADE, not one page of it. A cascade creates a flow
-// transaction PER PAGE it settles, so this stack records how many each commit produced and
-// the undo pops that many. Without it, pressing undo after a reflow that rippled across six
-// pages would un-ripple exactly one of them and leave the document half-reflowed — which
-// looks far more broken than not undoing at all.
-//
-// THE APPROXIMATION, stated because it is one: this pairs each cascade with the text step
-// that caused it, and the text journal coalesces keystrokes on its own schedule. So "undo"
-// means "reverse the last reflow and the last text step", which is right for the case the
-// feature exists for (type, commit, reflow) and is not a general reconciliation of two
-// independent histories. That reconciliation is the real Phase 6.
-let flowGroups = [];
-// The same bookkeeping for the other direction. undoFlowGroup moves a group here; a settle
-// clears it, mirroring the core's own rule that a new settle drops the redo stack (a
-// transaction recorded against geometry that has since changed cannot be replayed onto it).
-let flowRedoGroups = [];
-
-function settlePageOnce(p) {
-  // The settle reads this page's LINES, so its grouping must be fresh. The TEXT page is
-  // reloaded; the PAGE handle is deliberately kept — see the note in the cascade below.
-  const tpOld = textPages.get(p);
-  if (tpOld) { F.closeTextPage(tpOld); textPages.delete(p); }
-  groupPage(p);
-  const sp = mod._malloc(16);
-  const ok = F.flowSettle(doc, p, acquirePage(p), sp);
-  const st = Array.from(new Int32Array(mod.HEAPU8.buffer, sp, 4));
-  mod._free(sp);
-  if (ok !== 1) return null;
-  return { nudged: st[0], linesMigrated: st[1], itemsMigrated: st[2], pagesAdded: st[3] };
-}
-
-function settleAfterCommit(page) {
-  if (!doc || !flowOn || page < 0) return null;
-  const txnsBefore = F.flowCanUndo(doc);
-  const total = { nudged: 0, linesMigrated: 0, itemsMigrated: 0, pagesAdded: 0 };
-  const touched = new Set();
-  let p = page, rounds = 0, moved = false;
-
-  while (rounds++ < CASCADE_MAX) {
-    const st = settlePageOnce(p);
-    if (!st) { console.warn("[pdfe] documentReflow: settle refused on page", p); break; }
-    total.nudged += st.nudged;
-    total.linesMigrated += st.linesMigrated;
-    total.itemsMigrated += st.itemsMigrated;
-    total.pagesAdded += st.pagesAdded;
-    touched.add(p);
-    if (st.nudged || st.linesMigrated || st.itemsMigrated || st.pagesAdded) moved = true;
-
-    // INVALIDATE both sides. A migration removes page objects, which invalidates every
-    // text page for the source page (a documented engine fact, not an observed symptom)
-    // and stales our cached bounds for both.
-    noteMutation(p);
-    dirtyPages.delete(p);            // the settle regenerated the content stream itself
-    if (!st.linesMigrated && !st.itemsMigrated) break;   // nothing left this page: done
-    touched.add(p + 1);
-    noteMutation(p + 1);
-    dirtyPages.delete(p + 1);
-    // NO HANDLE DANCE HERE ANY MORE, and its absence is the point.
-    //
-    // This is where the worker used to close and re-load the destination page's handle,
-    // because pdfe_flow_settle migrated onto a REGISTRY handle — a different CPDF_Page from
-    // the one this worker holds — so our view of page p+1 could not see what had just
-    // landed on it and the cascade stopped dead at its first destination.
-    //
-    // acquirePage now ADOPTS every handle it loads into the core's page registry, so the
-    // registry resolves this index to OUR handle and there is only ever one view. The
-    // workaround is not merely unnecessary, it is gone — which is the falsification that
-    // matters: if adoption did not work, the cascade would stop again and
-    // flow_settle_test §6 would go red.
-    p = p + 1;
-    if (p >= F.pageCount(doc)) break;
-  }
-  if (rounds > CASCADE_MAX)
-    console.warn("[pdfe] documentReflow: cascade hit its", CASCADE_MAX, "page bound");
-  const txnsAdded = F.flowCanUndo(doc) - txnsBefore;
-  if (txnsAdded > 0) {
-    flowGroups.push(txnsAdded);
-    // A NEW SETTLE DROPS THE REDO GROUPS, mirroring what the core just did to its own redo
-    // stack. Leaving them would leave this shell counting transactions that no longer exist.
-    flowRedoGroups.length = 0;
-  }
-  if (!moved) return null;
-
-  coreGroupedPage = -1; coreGroupFresh = false;
-
-  // Re-group and refresh the model for every page the cascade touched — the contract
-  // pdfe_flow_settle documents. Without it the model's object lists are a guess.
-  for (const q of touched) {
-    const tp = textPages.get(q);
-    if (tp) { F.closeTextPage(tp); textPages.delete(q); }
-    groupPage(q);
-    F.flowRefresh(doc, q, acquirePage(q));
-  }
-
-  // The page count may have grown. Measure the new pages WITHOUT loading them.
-  const n = F.pageCount(doc);
-  let pagesChanged = false;
-  if (n !== pages.length) {
-    const dims = mod._malloc(8);
-    for (let i = pages.length; i < n; i++) {
-      F.pageSizeAt(doc, i, dims, dims + 4);
-      const v = new Float32Array(mod.HEAPU8.buffer, dims, 2);
-      pages.push({ w: v[0], h: v[1] });
-    }
-    mod._free(dims);
-    pagesChanged = true;
-  }
-
-  const out = { type: "documentReflowed", page, ...total, pagesChanged,
-                cascadedPages: [...touched].sort((a, b) => a - b), pages: pages.slice() };
-  postMessage(out);
-  return out;
-}
-
-// Reverse every flow transaction the last cascade produced, newest first (the core's own
-// stack is already LIFO, so repeated calls unwind in the right order).
-function undoFlowGroup() {
-  const n = flowGroups.pop();
-  if (!n) return;
-  // LET GO OF THE TAIL PAGES FIRST. pdfe_delete_page refuses a page anything holds a live
-  // handle on — which is exactly the protection we want, and which this worker trips on its
-  // own: it acquires a page handle to PAINT it, so the page a reflow appended is being held
-  // by the very act of showing it to the user. Measured in the browser: the undo restored
-  // every object correctly and the extra page stayed, empty, on screen.
-  //
-  // Closing them here is safe: a page handle is a cache, and anything that still needs one
-  // re-acquires it. Only pages after the anchor are dropped, so the page being edited keeps
-  // the handle its own identity registry is scoped to.
-  const anchor = F.flowUndoPage(doc);
-  if (anchor >= 0)
-    for (const k of [...pageHandles.keys()]) if (k > anchor) closePageHandles(k);
-  const touched = new Set();
-  let reversed = 0;
-  for (let k = 0; k < n; k++) {
-    const pi = F.flowUndoPage(doc);
-    if (pi < 0) break;
-    // Our OWN handle for that page — the same rule the settle follows, and the reason
-    // pdfe_flow_undo takes one at all: a registry handle is a different object list, so an
-    // undo that resolved the page itself would put the objects back where nobody is
-    // looking (measured — the page reported the same object count before and after a
-    // "successful" undo).
-    const ok = F.flowUndo(doc, pi, acquirePage(pi));
-    if (ok !== 1) break;
-    ++reversed;
-    touched.add(pi);
-    touched.add(pi + 1);
-  }
-  // HAND THE GROUP TO THE REDO SIDE — and hand across what was ACTUALLY reversed, not what
-  // was asked for. The core pushed exactly |reversed| transactions onto its redo stack, so a
-  // count taken before the loop would make the shell ask for transactions that are not there.
-  if (reversed > 0) flowRedoGroups.push(reversed);
-  for (const p of touched) {
-    const tp = textPages.get(p);
-    if (tp) { F.closeTextPage(tp); textPages.delete(p); }
-    noteMutation(p);
-    dirtyPages.delete(p);
-  }
-  coreGroupedPage = -1; coreGroupFresh = false;
-
-  // The page count may have SHRUNK — a reflow that appended a page has just had it taken
-  // away again.
-  const count = F.pageCount(doc);
-  let pagesChanged = false;
-  if (count !== pages.length) { pages.length = count; pagesChanged = true; }
-
-  for (const p of touched) {
-    if (p >= count) continue;
-    groupPage(p);
-    F.flowRefresh(doc, p, acquirePage(p));
-  }
-  postMessage({ type: "documentReflowed", page: [...touched][0] ?? 0, nudged: 0,
-                linesMigrated: 0, itemsMigrated: 0, pagesAdded: 0, undone: true,
-                pagesChanged, cascadedPages: [...touched].sort((a, b) => a - b),
-                pages: pages.slice() });
-}
-
-// Replay every flow transaction the last undo reversed, OLDEST FIRST — and that order is
-// not the mirror of undoFlowGroup's, it is the opposite of it.
-//
-// ⚠️ WHY OLDEST-FIRST. A cascade settles pages 0,1,2 and stacks T0,T1,T2. The undo unwinds
-// newest-first (T2,T1,T0), which is right: the last page's arrivals have to leave before the
-// page before it can take its own content back. A redo has to put them back the way the
-// cascade did, which is T0,T1,T2 — replaying newest-first would seat page 2's content on a
-// page 1 that has not yet given anything up.
-//
-// It needs NO bookkeeping here, because the two core stacks already produce it: the undo
-// pushed T2,T1,T0 onto the redo stack in that order, so popping it yields T0,T1,T2.
-//
-// AND IT NEEDS NO HANDLE DANCE. undoFlowGroup drops the tail pages' handles first, because
-// pdfe_delete_page refuses a page anything holds a live handle on and the worker holds one
-// to paint it. A redo APPENDS instead of deleting, and appending at the tail touches no
-// existing page — so there is nothing to let go of. The pages array is grown afterwards
-// instead, exactly as settleAfterCommit grows it.
-function redoFlowGroup() {
-  const n = flowRedoGroups.pop();
-  if (!n) return;
-  const touched = new Set();
-  let replayed = 0;
-  for (let k = 0; k < n; k++) {
-    const pi = F.flowRedoPage(doc);
-    if (pi < 0) break;
-    // Our OWN handle for that page — the same rule the settle and the undo follow, and for
-    // the same reason: a registry handle is a different object list, so a replay that
-    // resolved the page itself would put the content where nobody is looking.
-    const ok = F.flowRedo(doc, pi, acquirePage(pi));
-    if (ok !== 1) {
-      // A REFUSAL IS REPORTED, NEVER RETRIED. The core refuses when a page the transaction
-      // created is no longer the tail of the document; retrying or forcing it would put a
-      // page's worth of content somewhere the user did not put it.
-      console.warn("[pdfe] documentReflow: redo refused on page", pi,
-                   "— the replay is partial and the rest of the group is left stacked");
-      break;
-    }
-    ++replayed;
-    touched.add(pi);
-    touched.add(pi + 1);
-  }
-  // AND GIVE THE GROUP BACK TO THE UNDO SIDE, or the pair only round-trips ONCE.
-  //
-  // FOUND IN CHROME, NOT HEADLESSLY, and it could not have been found headlessly: the suite
-  // calls pdfe_flow_undo/_redo directly, and the core already hands its own transaction back
-  // and forth between its two stacks correctly. This counter is the SHELL's half of that, and
-  // without it the second undo of a sequence found flowGroups empty and silently did nothing
-  // — measured: undo, redo, undo left the document exactly as the redo had, 8 pages and all.
-  if (replayed > 0) flowGroups.push(replayed);
-  for (const p of touched) {
-    const tp = textPages.get(p);
-    if (tp) { F.closeTextPage(tp); textPages.delete(p); }
-    noteMutation(p);
-    dirtyPages.delete(p);
-  }
-  coreGroupedPage = -1; coreGroupFresh = false;
-
-  // The page count may have GROWN again — a redo re-creates the page its undo removed.
-  // Measured WITHOUT loading the new pages, exactly as the settle does.
-  const count = F.pageCount(doc);
-  let pagesChanged = false;
-  if (count !== pages.length) {
-    if (count > pages.length) {
-      const dims = mod._malloc(8);
-      for (let i = pages.length; i < count; i++) {
-        F.pageSizeAt(doc, i, dims, dims + 4);
-        const v = new Float32Array(mod.HEAPU8.buffer, dims, 2);
-        pages.push({ w: v[0], h: v[1] });
-      }
-      mod._free(dims);
-    } else {
-      pages.length = count;
-    }
-    pagesChanged = true;
-  }
-
-  for (const p of touched) {
-    if (p >= count) continue;
-    groupPage(p);
-    F.flowRefresh(doc, p, acquirePage(p));
-  }
-  postMessage({ type: "documentReflowed", page: [...touched][0] ?? 0, nudged: 0,
-                linesMigrated: 0, itemsMigrated: 0, pagesAdded: 0, redone: true,
-                pagesChanged, cascadedPages: [...touched].sort((a, b) => a - b),
-                pages: pages.slice() });
 }
 
 // ---- undo / redo ------------------------------------------------------------
@@ -1355,21 +1255,50 @@ function redoFlowGroup() {
 
 let lastHistory = "";   // "canUndo,canRedo" — so the event fires only on change
 
+// ---- the mode-entry mark (W2 = Android step 14b; PdfSession.markPinned) ----------------
+// ⚠️ THE PAGES A DISCARD WILL NEED STAY RESIDENT. A committed page is clean, so the LRU may
+// close it, and a reloaded page has lost its PARKED generations — an undo there degrades or
+// comes back UNAVAILABLE, so a discard after scrolling far away would be partial. While a mark
+// is set, every page mutated since it is pinned. Conditioned: no mark, nothing pinned.
+let markPinning = false;
+const markPinned = new Set();
+// The shell's generation of the newest mark: a history read posted before a newer mark would
+// otherwise overwrite the shell's "zero steps" with the old distance (Android's markGen).
+let markGen = 0;
+
+function markSteps(fn) {
+  const out = mod._malloc(4);
+  const kind = fn(doc, out);
+  const steps = hI32()[out >> 2];
+  mod._free(out);
+  return { kind, steps };
+}
+
 function historyState() {
   if (!doc) return { canUndo: false, canRedo: false, undoPage: -1, redoPage: -1, recording: false };
   const u = F.undoPage(doc), r = F.redoPage(doc);
   // |recording| rides along because an empty stack means two different things:
   // "everything has been undone" while recording, and "nothing was ever written
   // down" while not. Only the first one says the document is unmodified.
+  // |evicted| (I103): text steps the caps dropped since the last clear; the editor latches
+  // "untracked" on any, because an emptied stack no longer proves the document saved.
+  // The MARKUP journal's pages ride along (step 19): the shell decides which of the two
+  // the one Undo button drives, from its mode (pdf/HistoryScope.kt's rule).
+  // Each journal's distance to its mode-entry mark rides along (W2), so the shell's
+  // canDiscard is a pure read of the last answer, never a worker hop.
   return { canUndo: u >= 0, canRedo: r >= 0, undoPage: u, redoPage: r,
-           recording: !!F.historyEnabled(doc) };
+           recording: !!F.historyEnabled(doc), evicted: F.historyEvicted(doc),
+           markupUndoPage: F.markupUndoPage(doc), markupRedoPage: F.markupRedoPage(doc),
+           textMarkSteps: markSteps(F.historyMarkSteps).steps,
+           markupMarkSteps: markSteps(F.markupHistoryMarkSteps).steps, markGen };
 }
 
 // Re-query and post, but only when the pair actually changed: this is called
 // from every mutator tail, and a typing burst must not spam the shell.
 function postHistory(force) {
   const h = historyState();
-  const key = `${h.canUndo},${h.canRedo},${h.recording}`;
+  const key = `${h.canUndo},${h.canRedo},${h.recording},${h.markupUndoPage},${h.markupRedoPage},` +
+              `${h.textMarkSteps},${h.markupMarkSteps},${h.markGen}`;
   if (!force && key === lastHistory) return;
   lastHistory = key;
   postMessage({ type: "history", ...h });
@@ -1385,26 +1314,9 @@ function applyHistory(kind) {
   // core anything.
   if (pendingEdit) drainLatch();
 
-  // DOCUMENT REFLOW, AND THE ORDER IS THE OPPOSITE IN EACH DIRECTION. This is the one part
-  // of redo that is NOT a mirror of undo, and getting it backwards is silent rather than
-  // loud — the replay would still report success.
-  //
-  // UNDO REVERSES THE FLOW FIRST: the reflow was caused by the text step about to be undone,
-  // so the geometry has to come back before the text that justified it disappears. Reversing
-  // it afterwards would be reversing a settle of a page that no longer looks like the one
-  // that was settled.
-  //
-  // REDO REPLAYS THE FLOW LAST, for the mirror of that reason: the transaction was recorded
-  // against POST-edit geometry, so replaying it before the text is back would replay it onto
-  // a page that does not match what was recorded.
-  const replayFlow = () => { if (!undo && flowOn && flowRedoGroups.length) redoFlowGroup(); };
-  if (undo && flowOn && flowGroups.length) undoFlowGroup();
-
   // S1. Which page? This IS canUndo — never cache a separate flag.
   const page = undo ? F.undoPage(doc) : F.redoPage(doc);
-  // Nothing left in the TEXT journal does not mean nothing left in the FLOW one — the two
-  // are paired by convention, not reconciled — so a pending replay still runs.
-  if (page < 0) { replayFlow(); postHistory(true); return; }
+  if (page < 0) { postHistory(true); return; }
 
   // S2. A session on ANOTHER page must be committed; one on this page stays
   // open, which is what makes the in-place fast path (code 2) reachable.
@@ -1418,6 +1330,9 @@ function applyHistory(kind) {
   const dp = mod._malloc(16);
   const fp2 = mod._malloc(16);
   const tpp = mod._malloc(4);
+  // The pictures BEFORE the step: which one a step changed is decided by evidence, never by the
+  // selection (Android's ImageStepRule.between) — an inserted picture comes and goes this way.
+  const imgsBefore = cachedImages(page).map((im) => ({ index: im.index, key: im.quad.join(",") }));
   const code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp2, tpp);
   const dirty = readF32(dp, 4);
   // WHERE the run ended up, as distinct from what to repaint. Selecting on the
@@ -1479,6 +1394,19 @@ function applyHistory(kind) {
   // unrelated text box on every image undo. The list index is stable (nothing
   // adds or removes image objects), so the picture is re-read, not re-found.
   let imageStep = false;
+  {
+    const after = cachedImages(page);
+    const changed = after.find((im) => !imgsBefore.some((b) => b.index === im.index && b.key === im.quad.join(",")));
+    if (changed && !(selectedImage && selectedImage.page === page && selectedImage.index === changed.index)) {
+      selectedPara = null;
+      selectedImage = { page, index: changed.index, bounds: changed.bounds, quad: changed.quad,
+                        turns: changed.turns, flags: changed.flags };
+    } else if (selectedImage && selectedImage.page === page && !after.some((im) => im.index === selectedImage.index)) {
+      selectedImage = null;                      // the step took the selected picture away
+      imageStep = true;
+      postMessage({ type: "imageDeselected" });
+    }
+  }
   if (selectedImage && selectedImage.page === page) {
     const fresh = cachedImages(page).find((im) => im.index === selectedImage.index);
     if (fresh) {
@@ -1496,7 +1424,8 @@ function applyHistory(kind) {
     if (hit) {
       selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt: cx, yPt: cy };
       selection = { index: hit.index, bounds: hit.blockBounds,
-                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy };
+                    blockIndex: hit.blockIndex, xPt: cx, yPt: cy,
+                    text: hit.blockText ?? null };
     } else {
       selectedPara = null;
     }
@@ -1509,11 +1438,6 @@ function applyHistory(kind) {
     // Present only on the live path — the shell re-seeds its sink from these.
     ...(liveState || {}),
   });
-  // …AND ONLY NOW THE FLOW REPLAY: the text is back, so the geometry the transaction was
-  // recorded against is back with it. (A text redo that FAILED deliberately does not reach
-  // here — the group stays stacked rather than being replayed onto a page that never
-  // changed.)
-  replayFlow();
   // S14/S15 (dirty flag + button state) are the SDK's half.
   postHistory(true);
 }
@@ -1527,7 +1451,7 @@ function selectPara(page, hit, xPt, yPt) {
   // unit Edit opens and Delete removes.
   selectedPara = { page, index: hit.index, bounds: hit.blockBounds, xPt, yPt };
   postMessage({ type: "paraSelected", page, index: hit.index,
-                bounds: hit.blockBounds,
+                bounds: hit.blockBounds, text: hit.blockText ?? null,
                 blockIndex: hit.blockIndex, blockBounds: hit.blockBounds });
 }
 
@@ -1607,6 +1531,45 @@ function deleteParagraphAt(page, xPt, yPt) {
 
 // The shared tail: repaint, re-group, and re-find the picture we just changed so
 // it stays selected. |before| is its rect before the change.
+/**
+ * INSERT A PICTURE (W5a = PdfSession.insertImage): straight-alpha RGBA from the page becomes the
+ * BGRA the core copies, |m| maps the unit square onto the page (upright on screen). One undo step
+ * in the TEXT journal. The new picture is PENDING (PDFE_IMAGE_PENDING) — listed last — and is
+ * selected, as Android does; nothing scrolls.
+ */
+function insertImage(msg) {
+  if (!doc) return;
+  const page = msg.page;
+  if (editor) commitEditor();
+  const pg = acquirePage(page);
+  groupPage(page);
+  const px = msg.pixels, n = msg.width * msg.height * 4;
+  const bp = mod._malloc(n);
+  const h = mod.HEAPU8;
+  for (let i = 0; i < n; i += 4) { h[bp + i] = px[i + 2]; h[bp + i + 1] = px[i + 1]; h[bp + i + 2] = px[i]; h[bp + i + 3] = px[i + 3]; }
+  const mp = mod._malloc(24), dp = mod._malloc(16);
+  hF32().set(msg.m, mp >> 2);
+  const idx = F.imageInsert(doc, pg, bp, msg.width, msg.height, msg.width * 4, mp, dp);
+  const dirty = readF32(dp, 4);
+  for (const p of [bp, mp, dp]) mod._free(p);
+  let fresh = null;
+  if (idx >= 0) {
+    dirtyPages.add(page);
+    noteMutation(page);
+    renderDirtyStrip(page, dirty);
+    const imgs = cachedImages(page);
+    fresh = [...imgs].reverse().find((im) => im.flags & 8) || null;   // PDFE_IMAGE_PENDING
+    if (fresh) {
+      clearSelection();
+      selectedImage = { page, index: fresh.index, bounds: fresh.bounds, quad: fresh.quad, turns: fresh.turns, flags: fresh.flags };
+      postMessage({ type: "imageSelected", page, index: fresh.index, bounds: fresh.bounds,
+                    quad: fresh.quad, turns: fresh.turns, flags: fresh.flags });
+    }
+  }
+  postMessage({ type: "imageInserted", page, ok: !!fresh, images: cachedImages(page) });
+  postHistory(true);
+}
+
 function afterImageChange(page, before, kind) {
   dirtyPages.add(page);
   noteMutation(page);
@@ -1655,6 +1618,81 @@ function moveSelectedImage(dx, dy) {
   mod._free(dp);
   if (!ok) { postMessage({ type: "imageMoved", page, ok: false }); return; }
   afterImageChange(page, before, "imageMoved");
+}
+
+/**
+ * W5c, THE LIVE DRAG (PdfPageView's snapshot + setHidingRender, Android): page |page| at |w| x |h|
+ * px WITHOUT the item (picture |image| or the stamp |nm|), and the item's OWN pixels — a picture
+ * rendered alone (I157: a copy cut from the page carries the text printed on it), a stamp as
+ * where the page with it differs from the page without it (it is see-through) unless its ink
+ * covers most of its box. Both cut to |box| [x0, y0, x1, y1] px (the item's bounding box) and
+ * sent as ImageBitmaps. Changes nothing.
+ */
+async function liveItem(msg) {
+  const { page, w, h, seq } = msg;
+  const image = Number.isInteger(msg.image) ? msg.image : -1, nm = msg.nm || null;
+  const fail = () => postMessage({ type: "liveItem", seq, ok: false });
+  if (!doc || !(w > 0 && h > 0) || w * h > 6e6 || (image < 0 && !nm)) return fail();
+  if (image >= 0) ensureCoreGroup(page);
+  const handle = acquirePage(page);
+  const x0 = Math.max(0, Math.floor(msg.box[0])), y0 = Math.max(0, Math.floor(msg.box[1]));
+  const x1 = Math.min(w, Math.ceil(msg.box[2])), y1 = Math.min(h, Math.ceil(msg.box[3]));
+  const bw = x1 - x0, bh = y1 - y0;
+  if (bw <= 0 || bh <= 0) return fail();
+  const n = w * h * 4, ptr = mod._malloc(n);
+  const crop = () => {   // the box out of the full-page buffer (a fresh copy: the heap may move)
+    const u = mod.HEAPU8, out = new Uint8ClampedArray(bw * bh * 4);
+    for (let y = 0; y < bh; y++) out.set(u.subarray(ptr + ((y0 + y) * w + x0) * 4, ptr + ((y0 + y) * w + x1) * 4), y * bw * 4);
+    return out;
+  };
+  let bg = null, item = null;
+  try {
+    if (F.renderHiding(doc, handle, image, image >= 0 ? null : nm, ptr, w, h, w * 4, PDFE_RENDER_RGBA)) bg = crop();
+    if (bg && image >= 0) {
+      mod.HEAPU8.fill(0, ptr, ptr + n);
+      if (F.renderHiding(doc, handle, image, null, ptr, w, h, w * 4, PDFE_RENDER_RGBA | 0x2)) item = crop();
+    } else if (bg) {
+      F.render(handle, ptr, w, h, w * 4, PDFE_RENDER_RGBA);
+      item = crop();
+      // Inside the stamp's own outline (|quad|, px): which pixels the stamp changed.
+      const q = msg.quad, inQuad = (x, y) => {
+        let inside = false;
+        for (let i = 0, j = 3; i < 4; j = i++) {
+          const xi = q[2 * i], yi = q[2 * i + 1], xj = q[2 * j], yj = q[2 * j + 1];
+          if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+        }
+        return inside;
+      };
+      const diff = new Uint8Array(bw * bh);
+      let inside = 0, covered = 0;
+      for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) {
+        if (!inQuad(x0 + x + 0.5, y0 + y + 0.5)) continue;
+        inside++;
+        const i = (y * bw + x) * 4;
+        if (Math.abs(item[i] - bg[i]) + Math.abs(item[i + 1] - bg[i + 1]) + Math.abs(item[i + 2] - bg[i + 2]) >= 24) { diff[y * bw + x] = 1; covered++; }
+      }
+      // shortcut: coverage threshold, not the stamp's real source kind (Android's same rule).
+      if (!(inside > 0 && covered > inside * 0.35)) for (let k = 0; k < diff.length; k++) if (!diff[k]) item[k * 4 + 3] = 0;
+    }
+  } finally { mod._free(ptr); }
+  if (!bg || !item) return fail();
+  const [b1, b2] = await Promise.all([createImageBitmap(new ImageData(bg, bw, bh)), createImageBitmap(new ImageData(item, bw, bh))]);
+  postMessage({ type: "liveItem", seq, ok: true, bg: b1, item: b2, box: [x0, y0, x1, y1] }, [b1, b2]);
+}
+
+/** W5b: the selected picture times |m| (a delta, post-applied; the clip follows) — one undo step,
+ *  reported as `imageRotated` like Android's onSelectionRotated. No page clamp: the shell owns it. */
+function applySelectedImageMatrix(m) {
+  if (editor) commitEditor();
+  const page = selectedImage.page;
+  ensureCoreGroup(page);
+  const before = selectedImage.bounds.slice();
+  const mp = mod._malloc(24), dp = mod._malloc(16);
+  hF32().set(m, mp >> 2);
+  const ok = F.imageApplyMatrix(doc, acquirePage(page), selectedImage.index, mp, dp);
+  mod._free(mp); mod._free(dp);
+  if (!ok) { postMessage({ type: "imageRotated", page, ok: false }); return; }
+  afterImageChange(page, before, "imageRotated");
 }
 
 function rotateSelectedImage(turns) {
@@ -1781,7 +1819,8 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
     const para = pickPara(movedBlock, dropX, dropY);
     if (para) {
       reHit = { index: para.index, bounds: para.bounds,
-                blockIndex: movedBlock.index, blockBounds: movedBlock.bounds };
+                blockIndex: movedBlock.index, blockBounds: movedBlock.bounds,
+                blockText: movedBlock.text ?? null };
     }
   }
   if (!reHit) reHit = hitParagraph(page, dropX, dropY);
@@ -1792,7 +1831,7 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
     const ax = Math.min(Math.max(dropX, rb[0]), rb[2]);
     const ay = Math.min(Math.max(dropY, rb[1]), rb[3]);
     selectedPara = { page, index: reHit.index, bounds: reHit.blockBounds,
-                     xPt: ax, yPt: ay };
+                     xPt: ax, yPt: ay, text: reHit.blockText ?? null };
   } else {
     selectedPara = null;
   }
@@ -1808,7 +1847,8 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
           // The CLAMPED anchor, the same one selectedPara holds — reporting the raw
           // drop point would leave the shell and the worker disagreeing about where
           // the selection lives the moment the drop lands over a neighbour.
-          xPt: selectedPara.xPt, yPt: selectedPara.yPt }
+          xPt: selectedPara.xPt, yPt: selectedPara.yPt,
+          text: selectedPara.text ?? null }
       : null,
   });
   postHistory();
@@ -1826,10 +1866,19 @@ function moveBlockAt(page, xPt, yPt, dx, dy, wantBounds) {
 // routing and is CONSUMED by the tap it serves — one placement per arming, which is
 // also what makes the host's button state unambiguous.
 let addTextArmed = false;
+// W5a: a picture is armed — the next tap places it (the pixels stay in the shell).
+let imageInsertArmed = false;
 // The host's default look for new text (user decision 2026-08-24: "it will be on host
 // how he will provide this data"). Held here rather than passed per placement because
 // there is no placement CALL from the host — the gesture is a tap.
 let newTextStyle = { fontName: null, sizePt: 0, colorArgb: 0 };
+// W7a (Android 3.12.0 / 3.14.0): the APP's own text for the next box placed (null = an empty box
+// the user types in), and addTextScreenSizeDp as DEVICE px — turned into points at the page's
+// own paint scale where the box lands, so a new box's text looks that big on any page.
+let pendingAddText = null;
+let addTextScreenDev = 0;
+// Where the Add Text box that is open (and still empty) was placed — the move button re-places it.
+let newBoxAnchor = null;
 
 // AN ARM REPORTS ITSELF, ON ARM *AND* ON DISARM (parity rule 14 / I76). A host paints
 // its button from this; a spent arm that never reported would leave the button lit and
@@ -1864,8 +1913,13 @@ function placeNewBoxAt(page, xPt, yPt) {
     const h = newTextStyle.fontName
       ? (fontHandles.get(newTextStyle.fontName) || 0) : 0;
     new Uint32Array(mod.HEAPU8.buffer, sp + 20, 1)[0] = h;
-    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] = newTextStyle.sizePt || 0;
+    // addTextScreenSizeDp wins over the point size: points = device px / this page's paint scale.
+    const scale = pageScale.get(page) || 0;
+    new Float32Array(mod.HEAPU8.buffer, sp + 24, 1)[0] =
+      addTextScreenDev > 0 && scale > 0 ? addTextScreenDev / scale : (newTextStyle.sizePt || 0);
     new Uint32Array(mod.HEAPU8.buffer, sp + 28, 1)[0] = (newTextStyle.colorArgb || 0) >>> 0;
+    const appText = pendingAddText;
+    pendingAddText = null;
     const ed = F.editBeginNew(doc, acquirePage(page), textPageOf(page), sp);
     if (!ed) {
       // The core refuses an off-page point (and a stale grouping). Say so rather than
@@ -1875,6 +1929,7 @@ function placeNewBoxAt(page, xPt, yPt) {
     }
     editor = ed;
     editPage = page;
+    newBoxAnchor = [xPt, yPt];
     // The "am I inside the open run" rect the tap router uses. At zero characters this
     // is the caret's own zero-width box (S66) — a later tap is therefore outside it and
     // commits, which is right: an empty box the user taps away from evaporates.
@@ -1902,6 +1957,14 @@ function placeNewBoxAt(page, xPt, yPt) {
       linePreserve: F.editLineMode(editor) === 1,
       style: readRangeStyle(0, 0),
     });
+    // W7a: the APP's text (armAddText(text) / addTextAt): typed in through the same pass a
+    // keystroke takes ("\n" a new line), then the box closes — one undo step, as a typed box.
+    if (appText) {
+      pendingEdit = { fullText: appText, caretIndex: appText.length, selStart: appText.length,
+                      selEnd: appText.length, generation: -1, postedAt: 0 };
+      drainLatch();
+      commitEditor();
+    }
   } finally {
     mod._free(sp);
   }
@@ -1921,6 +1984,7 @@ function openEditorAt(page, xPt, yPt, lineMode) {
                               hit.blockIndex, lineMode);
   if (!ed) return;
   editor = ed;
+  newBoxAnchor = null;     // an existing box, never a placement to redo (W7a)
   editPage = page;
   editParaBounds = hit.blockBounds;
   // A fresh session starts with no pick in flight — a pending same-index
@@ -2148,6 +2212,7 @@ async function saveDocument(forceInHeap) {
   // the export path — so every shell must call this here. The parity gate's
   // required-command list is what keeps a shell from forgetting.
   F.historyClear(doc);
+  F.markupHistoryClear(doc);   // two journals, two clears (12-VOCABULARY §7)
   postHistory(true);
   // A Blob/File clones as a reference — delivery (object-URL download /
   // showSaveFilePicker) is the main thread's job (§6).
@@ -2157,6 +2222,46 @@ async function saveDocument(forceInHeap) {
     io: { ...ioStat },   // tier 2: the source re-reads SaveAsCopy did
     heapMB: Math.round((mod.HEAPU8.length / (1024 * 1024)) * 10) / 10,
   });
+}
+
+// exportFlattened (3.2.0): a COPY with every printable annotation burned into the page,
+// for printing (pdfe_export_flattened). Unlike saveDocument it is ALWAYS in memory (the
+// host asked for bytes) and it is NOT a save: no history clear, no dirty change, no
+// staged OPFS file. It commits and flushes first, as a save does, so the copy carries the
+// open box's typing.
+function exportFlattened() {
+  const refuse = (code, detail) => postMessage({ type: "flattenFailed", code, detail });
+  if (!doc) return refuse("no-document", "no document");
+  if (sourceSize > IN_HEAP_MAX) {
+    return refuse("save-too-large", `the copy is made in memory; the document is over ${IN_HEAP_MAX / 1048576} MB`);
+  }
+  if (editor) commitEditor();
+  for (const p of dirtyPages) F.generateContent(acquirePage(p));
+  dirtyPages.clear();
+  const t0 = performance.now();
+  const prevHandle = saveHandle, prevChunks = saveChunks;
+  saveHandle = null;
+  saveChunks = [];
+  let written, chunks;
+  try {
+    written = F.wasmExportFlat(doc);
+    chunks = saveChunks;
+  } catch (e) {
+    // A trap must still ANSWER the export (its own message, never the generic `error`,
+    // which unrelated refusals such as add-text share).
+    return refuse("engine-error", `the engine failed to write the copy: ${e}`);
+  } finally {
+    saveHandle = prevHandle; saveChunks = prevChunks;
+  }
+  if (written < 0) {
+    return written === -2
+      ? refuse("flatten-failed", "a page of the copy could not be flattened")
+      : refuse("engine-error", "the engine failed to write the copy");
+  }
+  const bytes = new Uint8Array(written);
+  let o = 0;
+  for (const c of chunks) { bytes.set(c, o); o += c.length; }
+  postMessage({ type: "flattened", bytes, ms: Math.round(performance.now() - t0) }, [bytes.buffer]);
 }
 
 // ---- single-flight, newest-wins latch (docs/WEB_VIEWER.md §9) ----------------
@@ -2329,7 +2434,7 @@ function drainLatch() {
     groupQueued.delete(page);
     if (doc && canvases.has(page)) {
       postMessage({ type: "groups", page, blocks: cachedGroups(page),
-                    images: cachedImages(page) });
+                    images: cachedImages(page), matrix: pageMatrix(page) });
     }
   }
   if (tileQueue.length || paintQueue.length || groupQueue.length || pendingEdit) {
@@ -2382,6 +2487,795 @@ function paintPage(job) {
   scheduleLatch();
 }
 
+// ---- ANNOTATE MODE (annotations step 19 — the web twin of Android's step 12–14) ----------
+// The page's text MODEL (pdfe_text_model) is the snapshot every selection rule reads; it is
+// built once per text page and kept here, in the worker, because the rules over it are core
+// functions and the heap is here. The main thread never re-derives a rule: it posts the
+// point, we answer with the quads it must paint (the same ones a mark will carry — what is
+// painted is what is saved). Android's twin: pdf/PageTextSelection.kt + PdfSession.textModel.
+const textModels = new Map();   // page -> { tp, ptr, count }
+let TEXT_CHAR_SIZE = 0;
+// Views over the CURRENT heap buffer: a wasm call may grow the heap and detach older views.
+const hI32 = () => new Int32Array(mod.HEAPU8.buffer);
+const hU32 = () => new Uint32Array(mod.HEAPU8.buffer);
+const hF32 = () => new Float32Array(mod.HEAPU8.buffer);
+const cstr = (p) => { const u = mod.HEAPU8; let e = p; while (u[e]) e++; return new TextDecoder().decode(u.slice(p, e)); };
+let pageSel = null;             // { page, start, end, pressStart, pressEnd, held }
+
+function dropTextModel(i) {
+  const m = textModels.get(i);
+  if (m) { mod._free(m.ptr); textModels.delete(i); }
+  if (pageSel && pageSel.page === i) pageSel = null;
+}
+function dropAllTextModels() {
+  for (const m of textModels.values()) mod._free(m.ptr);
+  textModels.clear();
+}
+
+function textModelOf(page) {
+  if (!doc || page < 0 || page >= pages.length) return null;
+  const tp = textPageOf(page);
+  if (!tp) return null;
+  let m = textModels.get(page);
+  if (m && m.tp === tp) return m;
+  if (m) { mod._free(m.ptr); textModels.delete(page); }
+  if (!TEXT_CHAR_SIZE) TEXT_CHAR_SIZE = F.textModelStructSize();
+  const n = F.textModel(tp, 0, 0);
+  if (n <= 0) return null;
+  const ptr = mod._malloc(n * TEXT_CHAR_SIZE);
+  const got = F.textModel(tp, ptr, n);
+  if (got <= 0) { mod._free(ptr); return null; }
+  m = { tp, ptr, count: Math.min(n, got) };
+  textModels.set(page, m);
+  return m;
+}
+
+function modelCharBox(m, i) {
+  if (i < 0 || i >= m.count) return null;
+  const o = (m.ptr + i * TEXT_CHAR_SIZE) >> 2;
+  const f = hF32();
+  const b = [f[o + 2], f[o + 3], f[o + 4], f[o + 5]];
+  return b[2] > b[0] && b[3] > b[1] ? b : null;
+}
+
+function modelText(m, s, e) {
+  let out = "";
+  for (let i = Math.max(0, s); i < Math.min(m.count, e); i++) {
+    const c = hI32()[(m.ptr + i * TEXT_CHAR_SIZE) >> 2];
+    if (c) out += String.fromCharCode(c);
+  }
+  return out;
+}
+
+function modelQuads(m, s, e) {
+  const n = F.textModelQuads(m.ptr, m.count, s, e, 0, 0);
+  if (n <= 0) return [];
+  const qb = mod._malloc(n * 32);
+  const got = F.textModelQuads(m.ptr, m.count, s, e, qb, n);
+  const out = Array.from(hF32().subarray(qb >> 2, (qb >> 2) + Math.max(0, got) * 8));
+  mod._free(qb);
+  return out;
+}
+
+function modelCharAt(m, x, y, tol) { return F.textModelCharAt(m.ptr, m.count, x, y, tol); }
+
+function modelWord(m, c) {
+  const b = mod._malloc(8);
+  const ok = F.textModelWord(m.ptr, m.count, c, b, b + 4);
+  const s = hI32()[b >> 2], e = hI32()[(b >> 2) + 1];
+  mod._free(b);
+  return ok && e > s ? [s, e] : null;
+}
+
+/** Post the selection as the shell paints it — or `page: -1` when there is none. */
+function postPageSel(extra = {}) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  if (!s || !m) { postMessage({ type: "pageSel", page: -1, ...extra }); return; }
+  const quads = modelQuads(m, s.start, s.end);
+  let a0 = null, a1 = null;
+  for (let i = s.start; i < s.end && !a0; i++) {
+    const b = modelCharBox(m, i);
+    if (b) a0 = [b[0], b[1], b[3]];               // x, bottom, top of the first letter
+  }
+  for (let i = s.end - 1; i >= s.start && !a1; i--) {
+    const b = modelCharBox(m, i);
+    if (b) a1 = [b[2], b[1], b[3]];               // x, bottom, top of the last letter
+  }
+  let l = Infinity, b = Infinity, r = -Infinity, t = -Infinity;
+  for (let k = 0; k + 8 <= quads.length; k += 8) {
+    for (let j = 0; j < 8; j += 2) {
+      l = Math.min(l, quads[k + j]); r = Math.max(r, quads[k + j]);
+      b = Math.min(b, quads[k + j + 1]); t = Math.max(t, quads[k + j + 1]);
+    }
+  }
+  postMessage({ type: "pageSel", page: s.page, start: s.start, end: s.end, quads,
+                anchors: [a0, a1], text: modelText(m, s.start, s.end),
+                bounds: quads.length ? [l, b, r, t] : null, held: s.held, ...extra });
+}
+
+// PageTextSelection.dragHandle, transcribed. A held press grows from the pressed word in
+// both directions; afterwards each knob moves its own end and they swap when they cross.
+function dragPageSel(which, x, y) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  if (!m) return which;
+  const c = modelCharAt(m, x, y, -1);
+  if (c < 0 || c >= m.count) return which;
+  let ns, ne, now;
+  if (s.held) {
+    if (c < s.pressStart) { ns = c; ne = s.pressEnd; now = 0; }
+    else { ns = s.pressStart; ne = Math.max(c + 1, s.pressEnd); now = 1; }
+  } else if (which === 1) {
+    const stay = s.start;
+    if (c + 1 > stay) { ns = stay; ne = c + 1; now = 1; } else { ns = c; ne = stay; now = 0; }
+  } else {
+    const stay = s.end;
+    if (c < stay) { ns = c; ne = stay; now = 0; } else { ns = stay; ne = c + 1; now = 1; }
+  }
+  s.start = ns; s.end = ne;
+  return now;
+}
+
+function pressPageSel(page, x, y, tol, unit) {
+  pageSel = null;
+  const m = textModelOf(page);
+  if (!m) return false;
+  const c = modelCharAt(m, x, y, tol);
+  if (c < 0 || c >= m.count) return false;
+  const w = unit === "word" ? modelWord(m, c) : null;
+  const s = w ? w[0] : c, e = w ? w[1] : c + 1;
+  pageSel = { page, start: s, end: e, pressStart: s, pressEnd: e, held: true };
+  return true;
+}
+
+const MARKUP_KIND_NAMES = ["highlight", "underline", "squiggle", "strikeout"];
+
+/** Every text markup on |page|, as the shell hit-tests and outlines it. */
+function readMarkups(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  const pg = acquirePage(page);
+  const n = F.markupCount(doc, pg);
+  if (n <= 0) return [];
+  const size = F.markupStructSize();
+  const buf = mod._malloc(Math.max(size, 64));
+  const qb = mod._malloc(32);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.markupInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const kind = hI32()[o], qc = hI32()[o + 1], flags = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 4, o + 8));
+    const color = hU32()[o + 8];
+    const quads = [];
+    for (let q = 0; q < qc; q++) {
+      if (F.markupQuad(doc, pg, i, q, qb)) quads.push(...hF32().subarray(qb >> 2, (qb >> 2) + 8));
+    }
+    const len = F.markupName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.markupName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    out.push({ index: i, kind, tool: MARKUP_KIND_NAMES[kind] ?? null, flags, rect, quads,
+               color: flags & 1 ? null : color, nm });
+  }
+  mod._free(buf);
+  mod._free(qb);
+  return out;
+}
+
+const quadBox = (q, k) => [Math.min(q[k], q[k + 2], q[k + 4], q[k + 6]),
+                           Math.min(q[k + 1], q[k + 3], q[k + 5], q[k + 7]),
+                           Math.max(q[k], q[k + 2], q[k + 4], q[k + 6]),
+                           Math.max(q[k + 1], q[k + 3], q[k + 5], q[k + 7])];
+
+// MarkupHit.subtractCoveredQuads, transcribed: what an existing mark of the SAME tool already
+// covers on a line is cut out of the new one, so marking twice never stacks a second mark.
+function subtractCovered(newQ, existing) {
+  if (!newQ.length || !existing.length) return newQ;
+  const out = [];
+  for (let k = 0; k + 8 <= newQ.length; k += 8) {
+    const [nl, nb, nr, nt] = quadBox(newQ, k);
+    const h = nt - nb;
+    const covered = [];
+    for (const q of existing) {
+      for (let j = 0; j + 8 <= q.length; j += 8) {
+        const [el, eb, er, et] = quadBox(q, j);
+        const vo = Math.max(0, Math.min(nt, et) - Math.max(nb, eb));
+        if (h > 0 && vo >= 0.5 * Math.min(h, et - eb)) {
+          const cl = Math.max(nl, el), cr = Math.min(nr, er);
+          if (cr > cl) covered.push([cl, cr]);
+        }
+      }
+    }
+    covered.sort((a, b) => a[0] - b[0]);
+    const emit = (l, r) => { if (r - l >= 0.5) out.push(l, nt, r, nt, l, nb, r, nb); };
+    let x = nl;
+    for (const c of covered) { if (c[0] > x) emit(x, c[0]); if (c[1] > x) x = c[1]; }
+    if (nr > x) emit(x, nr);
+  }
+  return out;
+}
+
+function repaintRect(page, r) {
+  if (r && r[2] > r[0] && r[3] > r[1]) renderDirtyStrip(page, [r[0] - 2, r[1] - 2, r[2] + 2, r[3] + 2]);
+}
+
+function createMarkupFromSel(msg) {
+  const s = pageSel;
+  const m = s && textModels.get(s.page);
+  pageSel = null;
+  postPageSel();
+  if (!s || !m || s.end <= s.start) {
+    postMessage({ type: "markupCreated", ok: false, code: "markup-no-text", page: s ? s.page : -1 });
+    return;
+  }
+  const page = s.page;
+  const kind = Number(msg.kind) | 0;
+  const before = readMarkups(page);
+  const quads = subtractCovered(modelQuads(m, s.start, s.end),
+                                before.filter((k) => k.kind === kind).map((k) => k.quads));
+  if (!quads.length) {   // already marked: nothing to write, and nothing went wrong
+    postMessage({ type: "markupCreated", ok: true, nothing: true, page, marks: before });
+    return;
+  }
+  const pg = acquirePage(page);
+  F.markupSetLineStyle(doc, Number(msg.lineRatio) || 0, Number(msg.lineMinWidth) || 0);
+  const specSize = F.markupSpecSize();
+  if (specSize !== 32) {   // the wasm32 layout written below; never guess at another one
+    postMessage({ type: "markupCreated", ok: false, code: "markup-failed", page, marks: before });
+    return;
+  }
+  const spec = mod._malloc(specSize);
+  const qp = mod._malloc(quads.length * 4);
+  hF32().set(quads, qp >> 2);
+  const nmBuf = mod._malloc(128);
+  const rect = mod._malloc(16);
+  const ok = withUtf8(msg.author || "", (author) => {
+    mod.HEAPU8.fill(0, spec, spec + specSize);
+    const o = spec >> 2;
+    hI32()[o] = kind;
+    hU32()[o + 1] = (Number(msg.color) >>> 0);
+    hU32()[o + 2] = qp;
+    hI32()[o + 3] = quads.length / 8;
+    hU32()[o + 5] = author;   // nm (o+4), contents, date stay NULL: the core mints/stamps them
+    return F.markupCreate(doc, pg, spec, nmBuf, 128, rect);
+  });
+  const nm = ok ? cstr(nmBuf) : null;
+  const r = readF32(rect, 4);
+  for (const p of [spec, qp, nmBuf, rect]) mod._free(p);
+  if (ok) repaintRect(page, r);
+  postMessage({ type: "markupCreated", ok: !!ok, page, nm, kind, color: Number(msg.color) >>> 0,
+                code: ok ? undefined : "markup-failed", marks: readMarkups(page), select: !!msg.select });
+  postHistory(true);
+}
+
+function deleteMarkupByName(page, nm) {
+  const pg = acquirePage(page);
+  const rect = mod._malloc(16);
+  const ok = withUtf8(nm, (p) => F.markupDelete(doc, pg, p, rect));
+  const r = readF32(rect, 4);
+  mod._free(rect);
+  if (ok) repaintRect(page, r);
+  return !!ok;
+}
+
+function applyMarkupHistory(kind) {
+  if (!doc) return;
+  const undo = kind === "undo";
+  const page = undo ? F.markupUndoPage(doc) : F.markupRedoPage(doc);
+  if (page < 0) { postHistory(true); return; }
+  const otherPage = undo ? F.markupUndoOtherPage(doc) : F.markupRedoOtherPage(doc);
+  const stepKind = undo ? F.markupUndoKind(doc) : F.markupRedoKind(doc);   // 2 = an INK step (DR3)
+  const pg = acquirePage(page);
+  const rect = mod._malloc(16), nmBuf = mod._malloc(128), pres = mod._malloc(4);
+  const code = (undo ? F.markupUndo : F.markupRedo)(doc, pg, rect, nmBuf, 128, pres);
+  const r = readF32(rect, 4);
+  const nm = cstr(nmBuf);
+  const present = hI32()[pres >> 2] === 1;
+  for (const p of [rect, nmBuf, pres]) mod._free(p);
+  // I135: a stamp moved across pages changes a second page too (W4) — and the step's rect is on
+  // ONE of them, so both are repainted whole (measured: a redo left the old copy on screen).
+  const twoPages = code > 0 && otherPage >= 0 && otherPage !== page;
+  if (twoPages) {
+    // refreshAfterCrossPage: a saved block is page CONTENT, so both text pages are reloaded.
+    for (const p of [page, otherPage]) {
+      const tp = textPages.get(p);
+      if (tp && p !== editPage) { dropTextModel(p); F.closeTextPage(tp); textPages.delete(p); }
+      noteMutation(p);
+    }
+    renderDirtyStrip(page, [0, 0, pages[page].w, pages[page].h]);
+  }
+  else if (code > 0) repaintRect(page, r);
+  let other = null;
+  if (twoPages) {
+    acquirePage(otherPage);
+    renderDirtyStrip(otherPage, [0, 0, pages[otherPage].w, pages[otherPage].h]);
+    other = { page: otherPage, marks: readMarkups(otherPage), stamps: readStamps(otherPage), inks: readInks(otherPage) };
+  }
+  postMessage({ type: "markupHistoryApplied", kind, page, ok: code > 0, code, nm, present,
+                stepKind, focus: r, marks: readMarkups(page), stamps: readStamps(page), inks: readInks(page), other });
+  postHistory(true);
+}
+
+/**
+ * THE DISCARD'S REWIND (W2 = PdfSession.rewindToMark, transcribed) — ONE worker task. Asks the
+ * core how far |journal| is from its mode-entry mark and takes that many undo (or redo) steps
+ * WITHOUT a render per step; each touched page is repainted once at the end.
+ *  - S0/S2 for the whole batch: the keystroke latch is drained (the last keystroke must be a
+ *    step before it can be rewound), then any open session is CANCELLED, never committed (a
+ *    commit can write identity marks the rewind would keep).
+ *  - The page is re-grouped only when a step's page differs from the previous step's.
+ *  - It STOPS on the first step that does not apply and never skips ahead.
+ *  - Then the core finishes the discard (redo born after the mark is dropped) and pins stop.
+ */
+function rewindToMark(journal) {
+  const text = journal === "text";
+  let kind = 0, steps = 0, done = 0, code = 1;
+  const touched = new Set();
+  const t0 = performance.now();
+  if (doc && (text || journal === "markup")) {
+    if (pendingEdit) drainLatch();
+    ({ kind, steps } = markSteps(text ? F.historyMarkSteps : F.markupHistoryMarkSteps));
+    if (editor) {
+      const tp = F.editCancel(editor);
+      if (tp) textPages.set(editPage, tp);
+      noteMutation(editPage);
+      editor = 0; editPage = -1; editParaBounds = null;
+    }
+    const undo = steps > 0;
+    let lastGrouped = -1;
+    for (let i = 0; i < Math.abs(steps); i++) {
+      const page = text ? (undo ? F.undoPage(doc) : F.redoPage(doc))
+                        : (undo ? F.markupUndoPage(doc) : F.markupRedoPage(doc));
+      if (page < 0) { code = 0; break; }
+      if (!text) {   // I135: a stamp moved across pages changes a second page too
+        const other = undo ? F.markupUndoOtherPage(doc) : F.markupRedoOtherPage(doc);
+        if (other >= 0) touched.add(other);
+      }
+      const pg = acquirePage(page);
+      if (text) {
+        if (page !== lastGrouped) { groupPage(page); lastGrouped = page; }
+        const tp = textPageOf(page);
+        const dp = mod._malloc(16), fp = mod._malloc(16), tpp = mod._malloc(4);
+        code = (undo ? F.undo : F.redo)(doc, pg, tp, dp, fp, tpp);
+        const newTp = new Uint32Array(mod.HEAPU8.buffer, tpp, 1)[0];
+        mod._free(dp); mod._free(fp); mod._free(tpp);
+        if (newTp) textPages.set(page, newTp);   // S6, unconditionally
+        if (code > 0) { dirtyPages.delete(page); noteMutation(page); }
+      } else {
+        const rect = mod._malloc(16), nmBuf = mod._malloc(128), pres = mod._malloc(4);
+        code = (undo ? F.markupUndo : F.markupRedo)(doc, pg, rect, nmBuf, 128, pres);
+        for (const p of [rect, nmBuf, pres]) mod._free(p);
+      }
+      if (code <= 0) break;
+      touched.add(page);
+      done++;
+    }
+    (text ? F.historyEndDiscard : F.markupHistoryEndDiscard)(doc);
+  }
+  // ONCE per touched page: repaint it whole, and hand the shell the lists it re-adopts.
+  const out = [];
+  for (const p of touched) {
+    acquirePage(p);
+    renderDirtyStrip(p, [0, 0, pages[p].w, pages[p].h]);
+    out.push(text ? { page: p, blocks: groupPage(p), images: cachedImages(p) }
+                  : { page: p, marks: readMarkups(p), inks: readInks(p) });
+  }
+  markPinned.clear(); markPinning = false;
+  postMessage({ type: "discarded", journal, kind, wanted: Math.abs(steps), done,
+                code, pages: out, ms: performance.now() - t0 });
+  postHistory(true);
+}
+
+// ---- SIGNATURES (W4 = Android SG9/SG10; PdfSession.createStamp / stampsOnPage) -------------
+const STAMP_KIND_NAMES = ["signature", "signaturetext", "stamp"];   // PDFE_STAMP_* -> selection kind
+const HANDWRITING_FACES = new Set(["DancingScript-Regular", "GreatVibes-Regular", "Caveat-Regular",
+                                   "MrDafoe-Regular"]);   // PdfeSignatureFonts.HANDWRITING
+let preparedPicture = { id: 0, handle: 0 };   // the picked picture, prepared once at pick
+const stagedFaces = new Map();               // face name -> Promise<boolean>, per document
+
+/** Every stamp on |page|: {index, kind, flags, annotIndex, rect, nm, turn} (PdfiumBridge.stampsOnPage). */
+function readStamps(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  if (F.stampStructSize() !== 28) throw new Error("PdfeStamp layout changed");
+  const pg = acquirePage(page);
+  const n = F.stampCount(doc, pg);
+  if (n <= 0) return [];
+  const buf = mod._malloc(28), tb = mod._malloc(12);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.stampInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const kind = hI32()[o], flags = hI32()[o + 1], annotIndex = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 3, o + 7));
+    const len = F.stampName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.stampName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    const turn = F.stampTurn(doc, pg, i, tb) ? Array.from(hF32().subarray(tb >> 2, (tb >> 2) + 3)) : null;
+    out.push({ index: i, kind, kindName: STAMP_KIND_NAMES[kind] ?? "stamp", flags, annotIndex, rect, nm, turn });
+  }
+  mod._free(buf); mod._free(tb);
+  return out;
+}
+
+// ---- DRAWING (DR3 = the core's pdfe_ink_*; 19-DRAWING.md) ----------------------------------
+
+/** Every ink on |page|: {index, flags, foreign, annotIndex, rect, widthPt, color, colorKnown, nm,
+ *  paths} — the shell hit-tests a stroke by its points (pdfe_ink_distance's rule, in JS). */
+function readInks(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  if (F.inkStructSize() !== 40) throw new Error("PdfeInk layout changed");
+  const pg = acquirePage(page);
+  const n = F.inkCount(doc, pg);
+  if (n <= 0) return [];
+  const buf = mod._malloc(40);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.inkInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const flags = hI32()[o], annotIndex = hI32()[o + 1], pathCount = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 4, o + 8));
+    const widthPt = hF32()[o + 8], color = hU32()[o + 9] >>> 0;
+    const len = F.inkName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.inkName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    const paths = [];
+    for (let k = 0; k < pathCount; k++) {
+      const c = F.inkPath(doc, pg, i, k, 0, 0);
+      if (c <= 0) { paths.push([]); continue; }
+      const pp = mod._malloc(c * 8);
+      F.inkPath(doc, pg, i, k, pp, c);
+      paths.push(Array.from(hF32().subarray(pp >> 2, (pp >> 2) + c * 2)));
+      mod._free(pp);
+    }
+    out.push({ index: i, flags, foreign: (flags & 1) !== 0, annotIndex, rect, widthPt, color,
+               colorKnown: (flags & 8) === 0, nm, paths });
+  }
+  mod._free(buf);
+  return out;
+}
+
+/** The finger's path (page points), smoothed by THE core rule, written as one ink. */
+function inkCreate(msg) {
+  if (F.inkSpecSize() !== 32) throw new Error("PdfeInkSpec layout changed");
+  const raw = (msg.points || []).map(Number);
+  const n = raw.length >> 1;
+  const pg = acquirePage(msg.page);
+  let nm = "", ok = 0;
+  const dirty = mod._malloc(16);
+  if (n >= 1) {
+    const ip = mod._malloc(n * 8);
+    hF32().set(raw.slice(0, n * 2), ip >> 2);
+    const m = F.inkSmooth(ip, n, msg.minDistPt, msg.pieceLenPt, 0, 0);
+    const sp = mod._malloc(m * 8);
+    F.inkSmooth(ip, n, msg.minDistPt, msg.pieceLenPt, sp, m);
+    const cp = mod._malloc(4), spec = mod._malloc(32), out = mod._malloc(64);
+    hI32()[cp >> 2] = m;
+    const ap = msg.author ? (() => { const b = new TextEncoder().encode(msg.author + "\0");
+      const p = mod._malloc(b.length); mod.HEAPU8.set(b, p); return p; })() : 0;
+    const o = spec >> 2;
+    hU32()[o] = sp; hU32()[o + 1] = cp; hI32()[o + 2] = 1; hF32()[o + 3] = msg.widthPt;
+    hU32()[o + 4] = Number(msg.color) >>> 0; hU32()[o + 5] = 0; hU32()[o + 6] = ap; hU32()[o + 7] = 0;
+    ok = F.inkCreate(doc, pg, spec, out, 64, dirty);
+    if (ok) nm = cstr(out);
+    for (const p of [ip, sp, cp, spec, out, ap]) if (p) mod._free(p);
+  }
+  const r = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  postMessage({ type: "inkChanged", op: "create", page: msg.page, ok: !!ok, nm, inks: readInks(msg.page) });
+  postHistory(true);
+}
+
+/** One eraser pass; replies which inks it changed and which it deleted (by /NM). */
+function inkErase(msg) {
+  const before = readInks(msg.page);
+  const raw = (msg.points || []).map(Number);
+  const n = raw.length >> 1;
+  const pg = acquirePage(msg.page);
+  const ep = mod._malloc(Math.max(1, n) * 8), dirty = mod._malloc(16);
+  hF32().set(raw.slice(0, n * 2), ep >> 2);
+  const flags = (msg.whole ? 1 : 0) | (msg.foreign ? 2 : 0);
+  const done = n >= 1 ? F.inkErase(doc, pg, ep, n, msg.radiusPt, flags, dirty) : 0;
+  const r = readF32(dirty, 4);
+  mod._free(ep); mod._free(dirty);
+  if (done > 0) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  const inks = readInks(msg.page);
+  const now = new Map(inks.map((k) => [k.nm, k]));
+  const deleted = [], changed = [];
+  for (const b of before) {
+    if (!b.nm) continue;
+    const a = now.get(b.nm);
+    if (!a) deleted.push(b.nm);
+    else if (a.annotIndex !== b.annotIndex || a.paths.length !== b.paths.length) changed.push(b.nm);
+  }
+  postMessage({ type: "inkChanged", op: "erase", page: msg.page, ok: done >= 0, count: done,
+                changed: done > 0 ? changed : [], deleted: done > 0 ? deleted : [], inks });
+  postHistory(true);
+}
+
+/** Delete / move-resize / restyle one ink by /NM; replies "inkChanged". */
+function inkOp(msg) {
+  const pg = acquirePage(msg.page);
+  const dirty = mod._malloc(16);
+  let ok = 0;
+  withUtf8(msg.nm || "", (np) => {
+    if (msg.type === "inkDelete") ok = F.inkDelete(doc, pg, np, dirty);
+    else if (msg.type === "inkTransform") {
+      const mp = mod._malloc(24);
+      hF32().set(msg.m.map(Number), mp >> 2);
+      ok = F.inkTransform(doc, pg, np, mp, msg.scaleWidth ? 1 : 0, dirty);
+      mod._free(mp);
+    } else {
+      ok = F.inkSetStyle(doc, pg, np, msg.what | 0, Number(msg.color ?? 0) >>> 0, Number(msg.widthPt ?? 0), dirty);
+    }
+  });
+  const r = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  const op = msg.type === "inkDelete" ? "delete" : msg.type === "inkTransform" ? "transform" : "style";
+  postMessage({ type: "inkChanged", op, page: msg.page, ok: !!ok, nm: msg.nm, what: msg.what | 0,
+                change: msg.change || null, inks: readInks(msg.page) });
+  postHistory(true);
+}
+
+/** A handwriting face is LOADED (never registered — text editing can never pick it), once per
+ *  document, the first time a signature needs it (PdfeEditorView.stageHandwriting). */
+function stageFace(name) {
+  if (!name || !HANDWRITING_FACES.has(name) || fontHandles.has(name)) return Promise.resolve(true);
+  if (stagedFaces.has(name)) return stagedFaces.get(name);
+  const docAt = doc;
+  const p = (async () => {
+    try {
+      const base = new URL(fontsBaseUrl || "./fonts/", self.location.href);
+      const src = new Uint8Array(await (await fetch(new URL(name + ".ttf", base))).arrayBuffer());
+      if (doc !== docAt) return false;
+      const bp = mod._malloc(src.length);
+      mod.HEAPU8.set(src, bp);
+      const h = withUtf8(name, (np) => F.loadAssetFont(doc, np, bp, src.length));
+      mod._free(bp);
+      if (h) fontHandles.set(name, h);
+      return !!h;
+    } catch { return false; }
+  })();
+  stagedFaces.set(name, p);
+  return p;
+}
+
+/** The picked picture, prepared ONCE (straight-alpha RGBA from ImageData: flags 0). */
+function preparePicture(id, w, h, px) {
+  if (preparedPicture.handle) F.pictureFree(preparedPicture.handle);
+  preparedPicture = { id: 0, handle: 0 };
+  if (!px || w <= 0 || h <= 0) return;
+  const bp = mod._malloc(px.length);
+  mod.HEAPU8.set(px, bp);
+  const handle = F.picturePrepare(bp, w, h, w * 4, 0);
+  mod._free(bp);
+  preparedPicture = { id, handle };
+}
+
+/** Fill a just-created stamp with |sig| — one content call (PdfeEditorView.fillSignature). */
+function fillSignature(pg, nm, sig) {
+  return withUtf8(nm, (nmp) => {
+    if (sig.type === "drawn") {
+      const strokes = (sig.strokes || []).filter((s) => s.points && s.points.length >= 2);
+      const xy = [], counts = [], widths = [], colors = [];
+      for (const s of strokes) {
+        const n = Math.floor(s.points.length / 2);
+        for (let i = 0; i < n * 2; i++) xy.push(+s.points[i]);
+        counts.push(n); widths.push(+s.width || 1); colors.push((s.color ?? 0xff000000) >>> 0);
+      }
+      if (!counts.length) return 0;
+      const xp = mod._malloc(xy.length * 4), cp = mod._malloc(counts.length * 4),
+            wp = mod._malloc(counts.length * 4), kp = mod._malloc(counts.length * 4), fp = mod._malloc(16);
+      hF32().set(xy, xp >> 2); hI32().set(counts, cp >> 2); hF32().set(widths, wp >> 2);
+      hU32().set(colors, kp >> 2); hF32().set([0, 0, +sig.frameWidth, +sig.frameHeight], fp >> 2);
+      const ok = F.stampAddStrokes(doc, pg, nmp, xp, cp, counts.length, wp, kp, fp, 1 /* Y_DOWN */);
+      for (const p of [xp, cp, wp, kp, fp]) mod._free(p);
+      return ok;
+    }
+    if (sig.type === "picture") {
+      return preparedPicture.handle && preparedPicture.id === sig.pictureId
+        ? F.stampAddPreparedPicture(doc, pg, nmp, preparedPicture.handle) : 0;
+    }
+    const argb = (sig.color ?? 0xff000000) >>> 0;
+    const face = sig.fontName || (sig.type === "typed" ? "LiberationSerif-Regular" : null);
+    return withUtf8(sig.text || "", (tp) => {
+      if (sig.type === "typed") return withUtf8(face, (fp) => F.stampAddTextOutlines(doc, pg, nmp, tp, fp, argb));
+      return face ? withUtf8(face, (fp) => F.stampAddText(doc, pg, nmp, tp, fp, argb))
+                  : F.stampAddText(doc, pg, nmp, tp, 0, argb);
+    });
+  });
+}
+
+/** Create + fill, all or nothing (PdfSession.createStamp). Replies "signaturePlaced". */
+async function placeSignature(msg) {
+  const sig = msg.signature || {};
+  if (sig.type === "typed" || sig.type === "text") await stageFace(sig.fontName);
+  if (!doc) return;
+  if (F.stampSpecSize() !== 32) throw new Error("PdfeStampSpec layout changed");
+  const page = msg.page;
+  const pg = acquirePage(page);
+  const spec = mod._malloc(32), out = mod._malloc(128), rect = mod._malloc(16);
+  hI32()[spec >> 2] = msg.kind | 0;
+  hF32().set(msg.rect, (spec >> 2) + 1);
+  const ap = msg.author ? (() => { const b = new TextEncoder().encode(msg.author + "\0");
+    const p = mod._malloc(b.length); mod.HEAPU8.set(b, p); return p; })() : 0;
+  hU32()[(spec >> 2) + 5] = 0; hU32()[(spec >> 2) + 6] = ap; hU32()[(spec >> 2) + 7] = 0;
+  const made = F.stampCreate(doc, pg, spec, out, 128, rect);
+  let nm = made ? cstr(out) : "";
+  for (const p of [spec, out, rect, ap]) if (p) mod._free(p);
+  if (nm && fillSignature(pg, nm, sig) !== 1) {
+    const r = mod._malloc(16);
+    withUtf8(nm, (p) => F.stampDelete(doc, pg, p, r));
+    mod._free(r);
+    nm = "";
+  }
+  noteMutation(page);
+  repaintRect(page, msg.rect);
+  postMessage({ type: "signaturePlaced", page, ok: !!nm, nm, stamps: readStamps(page) });
+  postHistory(true);
+}
+
+/** Move/resize (set_rect) or delete a stamp by /NM; replies "stampChanged". */
+function stampOp(msg) {
+  if (!doc) return;
+  const pg = acquirePage(msg.page);
+  const dirty = mod._malloc(16);
+  let ok = 0;
+  withUtf8(msg.nm || "", (np) => {
+    if (msg.type === "stampDelete") ok = F.stampDelete(doc, pg, np, dirty);
+    else if (msg.type === "stampRotate") ok = F.stampRotate(doc, pg, np, msg.angle, msg.scale, dirty);
+    else if (msg.type === "stampTransform") {
+      const cp = mod._malloc(8);
+      hF32().set(msg.centre, cp >> 2);
+      ok = F.stampTransform(doc, pg, np, msg.angle, msg.sx, msg.sy, cp, dirty);
+      mod._free(cp);
+    } else {
+      const rp = mod._malloc(16);
+      hF32().set(msg.rect, rp >> 2);
+      ok = F.stampSetRect(doc, pg, np, rp, dirty);
+      mod._free(rp);
+    }
+  });
+  const d = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, d); }
+  postMessage({ type: "stampChanged", op: msg.type, page: msg.page, nm: msg.nm, ok: !!ok,
+                stamps: readStamps(msg.page) });
+  postHistory(true);
+}
+
+/** A signature dropped on ANOTHER page (W4b = I135, PdfSession.moveStampToPage): one core call,
+ *  then both pages are repainted whole and their text pages reloaded (refreshAfterCrossPage). */
+function stampMoveToPage(msg) {
+  if (!doc) return;
+  const from = acquirePage(msg.from), to = acquirePage(msg.to);
+  const rp = mod._malloc(16);
+  hF32().set(msg.rect, rp >> 2);
+  const ok = withUtf8(msg.nm || "", (np) => F.stampMoveToPage(doc, from, np, to, rp, 0));
+  mod._free(rp);
+  for (const p of [msg.from, msg.to]) {
+    if (ok) {
+      const tp = textPages.get(p);
+      if (tp && p !== editPage) { dropTextModel(p); F.closeTextPage(tp); textPages.delete(p); }
+      noteMutation(p);
+    }
+    renderDirtyStrip(p, [0, 0, pages[p].w, pages[p].h]);
+  }
+  postMessage({ type: "stampMovedToPage", from: msg.from, to: msg.to, nm: msg.nm, ok: !!ok,
+                fromStamps: readStamps(msg.from), toStamps: readStamps(msg.to),
+                fromMarks: readMarkups(msg.from), toMarks: readMarkups(msg.to) });
+  postHistory(true);
+}
+
+/** The drag's clamp range, taken once at touch-down (pdfe_stamp_limits). */
+function stampLimits(msg) {
+  if (!doc) return;
+  const pg = acquirePage(msg.page);
+  const mv = mod._malloc(16), pb = mod._malloc(16);
+  const ok = withUtf8(msg.nm || "", (np) => F.stampLimits(doc, pg, np, mv, pb));
+  const limits = ok ? readF32(mv, 4) : null;
+  mod._free(mv); mod._free(pb);
+  postMessage({ type: "stampLimits", page: msg.page, nm: msg.nm, limits });
+}
+
+/** The annotate-mode messages. Returns true when |msg| was one of them. */
+function handleAnnotateMessage(msg) {
+  switch (msg.type) {
+    case "signaturePick":          // W4: a picture is prepared once, at the pick
+      preparePicture(msg.pictureId | 0, msg.width | 0, msg.height | 0, msg.pixels || null);
+      if (msg.fontName) stageFace(msg.fontName);
+      return true;
+    case "signaturePlace": placeSignature(msg); return true;
+    case "stampSetRect": case "stampDelete": case "stampRotate": case "stampTransform": stampOp(msg); return true;
+    case "stampLimits": stampLimits(msg); return true;
+    case "stampMoveToPage": stampMoveToPage(msg); return true;
+    case "inkCreate": if (doc) inkCreate(msg); return true;
+    case "inkErase": if (doc) inkErase(msg); return true;
+    case "inkDelete": case "inkTransform": case "inkStyle": if (doc) inkOp(msg); return true;
+    case "annotateReset":          // a mode change: every snapshot is re-taken on demand
+      dropAllTextModels();
+      pageSel = null;
+      return true;
+    case "marks":
+      if (doc) postMessage({ type: "marks", page: msg.page, marks: readMarkups(msg.page),
+                             stamps: readStamps(msg.page), inks: readInks(msg.page), matrix: pageMatrix(msg.page) });
+      return true;
+    case "pageSelPress": {
+      if (!doc) return true;
+      pressPageSel(msg.page, msg.xPt, msg.yPt, msg.tolPt, msg.unit);
+      postPageSel({ reason: "press", lp: msg.lp });
+      return true;
+    }
+    case "pageSelDragFrom": {      // a one-finger drag with a tool armed (§23)
+      if (!doc) return true;
+      if (!pressPageSel(msg.page, msg.ax, msg.ay, msg.tolPt, "char") &&
+          !pressPageSel(msg.page, msg.xPt, msg.yPt, msg.tolPt, "char")) {
+        postPageSel({ reason: "drag" });
+        return true;
+      }
+      dragPageSel(1, msg.xPt, msg.yPt);
+      postPageSel({ reason: "drag" });
+      return true;
+    }
+    case "pageSelDrag": {
+      if (!pageSel) return true;
+      const now = dragPageSel(msg.which | 0, msg.xPt, msg.yPt);
+      postPageSel({ reason: "drag", which: now });
+      return true;
+    }
+    case "pageSelEnd":
+      if (pageSel) pageSel.held = false;
+      postPageSel({ reason: "end", settled: true });
+      return true;
+    case "pageSelClear":
+      if (!pageSel) return true;
+      pageSel = null;
+      postPageSel({ reason: "clear" });
+      return true;
+    case "markupSelection":
+      if (doc) createMarkupFromSel(msg);
+      return true;
+    case "markupDelete": {
+      if (!doc) return true;
+      const ok = deleteMarkupByName(msg.page, msg.nm || "");
+      postMessage({ type: "markupDeleted", ok, page: msg.page, nm: msg.nm, kind: msg.kind,
+                    marks: readMarkups(msg.page) });
+      postHistory(true);
+      return true;
+    }
+    case "markupRecolor": {
+      if (!doc) return true;
+      const pg = acquirePage(msg.page);
+      const rect = mod._malloc(16);
+      const ok = withUtf8(msg.nm || "", (p) => F.markupSetColor(doc, pg, p, Number(msg.color) >>> 0, rect));
+      const r = readF32(rect, 4);
+      mod._free(rect);
+      if (ok) repaintRect(msg.page, r);
+      postMessage({ type: "markupRecolored", ok: !!ok, page: msg.page, nm: msg.nm,
+                    marks: readMarkups(msg.page) });
+      postHistory(true);
+      return true;
+    }
+  }
+  return false;
+}
+
 onmessage = async (e) => {
   await ready;
   const msg = e.data;
@@ -2394,14 +3288,18 @@ onmessage = async (e) => {
         if (tp) textPages.set(editPage, tp);
         editor = 0; editPage = -1; editParaBounds = null;
       }
+      dropAllTextModels();
+      pageSel = null;
       for (const tp of textPages.values()) F.closeTextPage(tp);
       textPages.clear();
       for (const p of pageHandles.values()) F.closePage(p);
       pageHandles.clear(); canvases.clear(); paintGen.clear(); pageScale.clear();
       tileQueue.length = 0; paintQueue.length = 0; pendingEdit = null;
       groupQueue.length = 0; groupQueued.clear(); groupCache.clear(); imageCache.clear();
-      flowGroups = []; flowRedoGroups = [];   // the flow stacks died with the document
+      matrixCache.clear();
       coreGroupedPage = -1; coreGroupFresh = false; dirtyPages.clear();
+      markPinned.clear(); markPinning = false;   // the mark died with the document
+      stagedFaces.clear();                       // loaded faces are DOCUMENT-owned
       // Font handles are DOCUMENT-owned (pdfe_close_doc frees them), so the registry
       // must not outlive the doc — a stale handle applied to the next file is a
       // use-after-free. A host re-registers its faces after opening.
@@ -2459,24 +3357,6 @@ onmessage = async (e) => {
     // accumulates inactive objects until the journal is cleared. Must be enabled
     // BEFORE the first edit — enabling later starts an empty journal.
     F.historySetEnabled(doc, 1);
-    // DOCUMENT REFLOW, opt-in per open. Enabling BUILDS THE MODEL, which groups every
-    // page — so it must happen here, before anything is edited: grouping moves the
-    // identity scope, and doing it later would wipe the pin the edit session is relying
-    // on. It also arms doc-wide id allocation, which has to precede the first mint.
-    flowOn = !!msg.documentReflow;
-    if (flowOn) {
-      const t0 = performance.now();
-      const built = F.flowEnable(doc, 1);
-      // The build left the core's one-slot grouping pointing at the LAST page it
-      // touched, so our own cache must not believe it holds page 0.
-      coreGroupedPage = -1; coreGroupFresh = false;
-      groupCache.clear(); imageCache.clear();
-      for (const tp of textPages.values()) F.closeTextPage(tp);
-      textPages.clear();
-      flowOn = built === 1;
-      console.log(`[pdfe] documentReflow: model ${flowOn ? "built" : "FAILED"} in ` +
-                  `${Math.round(performance.now() - t0)} ms`);
-    }
     const n = F.pageCount(doc);
     const dims = mod._malloc(8);
     // Measure WITHOUT loading pages: FPDF_LoadPage makes the document retain
@@ -2585,6 +3465,13 @@ onmessage = async (e) => {
     return;
   }
 
+    // [tap-precedence: BEGIN web-worker-tap]
+    // ── THE SINGLE-TAP CHAIN ──────────────────────────────────────
+    // Declared once in scripts/tap_precedence.data.mjs, rendered in
+    // docs/TAP_PRECEDENCE.md, and checked against PdfPageView.handleTap by
+    // scripts/check_tap_precedence.mjs. Each marker opens a rung; the checker
+    // asserts the code it names is inside it, so moving code without moving the
+    // marker is a build failure rather than a silent divergence.
   if (msg.type === "tap") {
     // Renderer-as-editor tap routing (the Android onTapParagraph analog, all
     // in the worker where the state lives): a tap INSIDE the open paragraph
@@ -2595,6 +3482,7 @@ onmessage = async (e) => {
     // ADD TEXT: the arm outranks every branch below and is CONSUMED here. Placed
     // before the "inside the open run" test on purpose — while armed, a tap means
     // "put a box here", even if it lands inside the box being edited.
+    // [tap-rung: arm-add-text]
     if (addTextArmed) {
       setAddTextArmed(false);            // spent, and reported spent
       if (editor) commitEditor();        // tap-outside-commits still holds
@@ -2602,6 +3490,17 @@ onmessage = async (e) => {
       placeNewBoxAt(msg.page, msg.xPt, msg.yPt);
       return;
     }
+    // [tap-rung: arm-insert-image]
+    // A picture is armed (armInsertImage): the tap is where it goes. The arm is spent here and the
+    // shell, which holds the pixels, inserts it centred on the tap (PdfPageView.onPlaceImage).
+    if (imageInsertArmed) {
+      imageInsertArmed = false;
+      if (editor) commitEditor();
+      clearSelection();
+      postMessage({ type: "imageArmTap", page: msg.page, xPt: msg.xPt, yPt: msg.yPt });
+      return;
+    }
+    // [tap-rung: caret-in-open-run]
     if (editor && msg.page === editPage && editParaBounds &&
         msg.xPt >= editParaBounds[0] && msg.xPt <= editParaBounds[2] &&
         msg.yPt >= editParaBounds[1] && msg.yPt <= editParaBounds[3]) {
@@ -2609,17 +3508,29 @@ onmessage = async (e) => {
       postCaretMoved(idx);
       return;
     }
+    // [tap-rung: commit-open-run]
+    // NOTE PdfPageView.handleTap has NO rung here: that shell finalizes the open
+    // edit one level up, in its view-layer callbacks. Declared in the table as an
+    // absence with that reason. The `rotate-control` rung Android has at this
+    // point is, on this platform, a DOM button whose pointerdown is swallowed
+    // (pdfe-editor.js) — same rule, different layer.
     if (editor) commitEditor();   // tap outside / another paragraph: commit first
+    // [tap-rung: hit-text-wins]
     const item = hitItem(msg.page, msg.xPt, msg.yPt);   // cached bounds: instant
+    // [tap-rung: empty-deselect]
     if (!item) { clearSelection(); return; }   // empty space: just deselect
+    // [tap-rung: image-select]
     if (item.kind === "image") {
-      // A picture has no second-tap-to-edit: there is nothing to open. Tapping
-      // the selected one again simply keeps it selected.
+      // A picture has no second-tap-to-edit: there is nothing to open, so
+      // tapping the selected one again toggles it OFF (3.1.0) — the same
+      // deselect as a tap on empty space, and the host hears `select` null.
       const same = selectedImage && selectedImage.page === msg.page &&
                    selectedImage.index === item.image.index;
-      if (!same) { clearSelection(); selectImage(msg.page, item.image); }
+      clearSelection();
+      if (!same) selectImage(msg.page, item.image);
       return;
     }
+    // [tap-rung: para-reopen]
     const hit = item.para;
     const again = selectedPara &&
       selectedPara.page === msg.page && selectedPara.index === hit.index;
@@ -2627,12 +3538,14 @@ onmessage = async (e) => {
     if (again) {
       openEditorAt(msg.page, msg.xPt, msg.yPt, -1);   // re-groups only if the gate demands
     } else {
+      // [tap-rung: para-select]
       selectPara(msg.page, hit, msg.xPt, msg.yPt);
       // Warm the core's one-slot grouping in the background so the Edit /
       // Delete that usually follows a select doesn't pay the re-group.
       if (coreGroupedPage !== msg.page || !coreGroupFresh) requestGroupJob(msg.page);
     }
     return;
+    // [tap-precedence: END web-worker-tap]
   }
 
   if (msg.type === "openSelected") {
@@ -2673,6 +3586,12 @@ onmessage = async (e) => {
     moveSelectedImage(Number(msg.dx) || 0, Number(msg.dy) || 0);
     return;
   }
+  if (msg.type === "liveItem") { liveItem(msg); return; }
+  if (msg.type === "imageApplyMatrix") {
+    if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
+    applySelectedImageMatrix(msg.m);
+    return;
+  }
   if (msg.type === "rotateImage") {
     if (!doc || !selectedImage) { postMessage({ type: "imageRotated", ok: false }); return; }
     rotateSelectedImage(Number(msg.turns) || 0);
@@ -2691,8 +3610,42 @@ onmessage = async (e) => {
   }
 
   // ---- ADD TEXT ------------------------------------------------------------
-  if (msg.type === "armAddText") { setAddTextArmed(true); return; }
-  if (msg.type === "cancelAddText") { setAddTextArmed(false); return; }
+  if (msg.type === "armAddText") {
+    pendingAddText = typeof msg.text === "string" && msg.text ? msg.text : null;
+    setAddTextArmed(true);
+    return;
+  }
+  if (msg.type === "cancelAddText") { pendingAddText = null; setAddTextArmed(false); return; }
+  // W7a: the MOVE button above the box being typed in (PdfeEditorView.moveOpenBox): an empty new
+  // box is placed again at the new point; a box with text is committed, moved (one undo step, as a
+  // drag) and reopened where it landed.
+  if (msg.type === "moveOpenBox") {
+    if (!doc || !editor) return;
+    const dx = Number(msg.dx) || 0, dy = Number(msg.dy) || 0, page = editPage;
+    const anchor = newBoxAnchor, b = editParaBounds && editParaBounds.slice();
+    if (anchor && readEditorText() === "") {
+      commitEditor();                       // an empty box leaves nothing behind
+      placeNewBoxAt(page, anchor[0] + dx, anchor[1] + dy);
+      return;
+    }
+    if (!b) return;
+    commitEditor();
+    const cx = (b[0] + b[2]) / 2, cy = (b[1] + b[3]) / 2;
+    moveBlockAt(page, cx, cy, dx, dy, b);
+    openEditorAt(page, cx + dx, cy + dy, -1);
+    return;
+  }
+  if (msg.type === "addTextScreenSize") { addTextScreenDev = Math.max(0, Number(msg.dev) || 0); return; }
+  // W7a: a box holding the app's text at a page point, no tap (addTextAt / addTextAtCenter).
+  if (msg.type === "addTextAt") {
+    if (!doc || !msg.text) return;
+    setAddTextArmed(false);
+    if (editor) commitEditor();
+    clearSelection();
+    pendingAddText = msg.text;
+    placeNewBoxAt(Number(msg.page), Number(msg.xPt), Number(msg.yPt));
+    return;
+  }
   if (msg.type === "setNewTextStyle") {
     // Every field is optional and independent, so a host can set only the colour and
     // leave the face and size on the core's floor. null/0 means "not specified".
@@ -2705,8 +3658,32 @@ onmessage = async (e) => {
 
   // Undo/redo take NO arguments: the core knows which page each step belongs
   // to, and a shell that passed one could pass a stale one.
-  if (msg.type === "undo") { applyHistory("undo"); return; }
-  if (msg.type === "redo") { applyHistory("redo"); return; }
+  // The shell names the journal (its mode decides, 12-VOCABULARY §7). No scope = text,
+  // which is what every message before step 19 meant.
+  if (msg.type === "undo") {
+    if (msg.scope === "markup") applyMarkupHistory("undo"); else applyHistory("undo");
+    return;
+  }
+  if (msg.type === "redo") {
+    if (msg.scope === "markup") applyMarkupHistory("redo"); else applyHistory("redo");
+    return;
+  }
+  if (handleAnnotateMessage(msg)) return;
+  // W2: a mode was entered — mark "here" in the journal it drives (FIFO with every edit the
+  // user then makes), and pin the pages changed from now on.
+  if (msg.type === "setHistoryMark") {
+    markGen = msg.gen | 0;
+    if (doc && (msg.journal === "text" || msg.journal === "markup")) {
+      (msg.journal === "text" ? F.historySetMark : F.markupHistorySetMark)(doc);
+      markPinned.clear(); markPinning = true;
+    }
+    postHistory(true);
+    return;
+  }
+  // The mode was left KEEPING its work: stop pinning. The core's mark stays until the next
+  // entry replaces it, which is harmless — nothing records in view mode.
+  if (msg.type === "releaseMarkPins") { markPinned.clear(); markPinning = false; return; }
+  if (msg.type === "discard") { rewindToMark(msg.journal); return; }
   // Phase 5: the SDK's ~300 ms idle debounce (and blur) says "the pause
   // happened" — the next keystroke starts a fresh word-level undo entry.
   if (msg.type === "sealHistory") { if (doc) F.historySeal(doc); return; }
@@ -2716,7 +3693,7 @@ onmessage = async (e) => {
   // 2026-08-24 with Android's markSaved(): the SDK cannot see where a host puts
   // the bytes, so only the host can say a save happened (I78).
   if (msg.type === "markSaved") {
-    if (doc) { F.historyClear(doc); postHistory(true); }
+    if (doc) { F.historyClear(doc); F.markupHistoryClear(doc); postHistory(true); }
     postMessage({ type: "markedSaved" });
     return;
   }
@@ -2808,7 +3785,7 @@ onmessage = async (e) => {
     const cached = groupCache.get(msg.page);
     if (cached) {
       postMessage({ type: "groups", page: msg.page, blocks: cached,
-                    images: imageCache.get(msg.page) || [] });
+                    images: imageCache.get(msg.page) || [], matrix: pageMatrix(msg.page) });
       return;
     }
     requestGroupJob(msg.page);
@@ -3336,6 +4313,9 @@ onmessage = async (e) => {
     return;
   }
 
+  if (msg.type === "insertImage") { insertImage(msg); return; }
+  if (msg.type === "armInsertImage") { imageInsertArmed = !!msg.armed; return; }
+
   if (msg.type === "commit") {
     commitEditor();
     return;
@@ -3343,6 +4323,43 @@ onmessage = async (e) => {
 
   if (msg.type === "save") {
     await saveDocument(!!msg.forceInHeap);
+    return;
+  }
+
+  if (msg.type === "exportFlattened") {
+    exportFlattened();
+    return;
+  }
+
+  // TEXT SEARCH (3.3.0): pages in the order given, one per task turn, so a newer
+  // search or a clear (a higher gen) stops this one after at most one page.
+  // W7b: the magnifier — a region of the displayed page (device px |x|, |y| of the page scaled by
+  // |scale|) as an ImageBitmap. Read-only.
+  if (msg.type === "loupe") {
+    const w = msg.w | 0, h = msg.h | 0;
+    if (!doc || w <= 0 || h <= 0 || w * h > 1e6) { postMessage({ type: "loupe", seq: msg.seq, ok: false }); return; }
+    const ptr = mod._malloc(w * h * 4);
+    try {
+      mod.HEAPU8.fill(255, ptr, ptr + w * h * 4);
+      F.renderRegion(acquirePage(msg.page), ptr, w, h, w * 4, msg.scale, msg.x, msg.y, PDFE_RENDER_RGBA);
+      const img = new ImageData(new Uint8ClampedArray(mod.HEAPU8.slice(ptr, ptr + w * h * 4).buffer), w, h);
+      createImageBitmap(img).then((bitmap) => postMessage({ type: "loupe", seq: msg.seq, ok: true, bitmap }, [bitmap]));
+    } finally { mod._free(ptr); }
+    return;
+  }
+  if (msg.type === "links") { postMessage({ type: "links", page: msg.page, links: pageLinks(msg.page) }); return; }
+  if (msg.type === "textCheck") { await runTextCheck(msg); return; }
+  if (msg.type === "pageKind") {
+    postMessage({ type: "pageKindIs", seq: msg.seq, kind: doc ? F.pageKind(doc, msg.page | 0) : -1 });
+    return;
+  }
+  if (msg.type === "search") {
+    searchGen = msg.gen;
+    await runSearch(msg);
+    return;
+  }
+  if (msg.type === "clearSearch") {
+    searchGen = msg.gen;
     return;
   }
 

@@ -195,6 +195,32 @@
       border-radius: var(--r); overflow: hidden;
     }
     .seg > * + * { border-left: 1px solid var(--line); }
+    /* `hidden` must win over the pill's display (the font + colour pills showed in every mode). */
+    .seg[hidden] { display: none; }
+    /* Plain dropdowns in the bar take the buttons' height and look. */
+    #bar select {
+      height: 34px; max-width: 160px; padding: 0 8px; border: 1px solid var(--line-strong);
+      border-radius: var(--r); background: var(--surface); color: var(--text); font: 500 12.5px/1 var(--ui);
+    }
+    #bar .seg select { border: 0; border-radius: 0; height: 100%; }
+    /* The mode segment. Its pressed state is scoped on the CLASS and never on an id,
+       for the reason written above .btn.active: an id-scoped rule was a bug the
+       moment a second toggle arrived. */
+    #modeseg { flex: none; }
+    #modeseg .modebtn, #markupseg .modebtn, #drawseg .modebtn {
+      width: auto; padding: 0 10px; border: 0; background: transparent;
+      color: var(--text-2); font: 500 12px/1 var(--ui); cursor: pointer;
+      display: grid; place-items: center; transition: background .12s, color .12s;
+    }
+    #modeseg .modebtn:hover { background: var(--surface-2); color: var(--text); }
+    #markupseg .modebtn.active, #drawseg .modebtn.active { background: var(--accent); color: #fff; }
+    #markupseg, #drawseg { display: inline-flex; align-items: center; gap: 2px; }
+    #markupseg[hidden], #drawseg[hidden] { display: none; }
+    /* A colour or width control inside a pill: sized to the pill, never the browser's default
+       (an unsized colour input overflowed the drawing group). */
+    .seg input[type=color] { width: 30px; height: 24px; margin: 0 4px; padding: 0; border: 0; background: none; flex: none; }
+    .seg input[type=range] { width: 70px; margin: 0 6px; flex: none; }
+    #modeseg .modebtn.active { background: var(--accent); color: #fff; }
     .seg button {
       width: 32px; border: 0; background: transparent; color: var(--text-2);
       font: 500 15px/1 var(--ui); cursor: pointer; display: grid; place-items: center;
@@ -387,8 +413,13 @@
        is exactly the problem the 2026-07-28 report was about. */
     @media (max-width: 560px) {
       #viewctl { order: 10; flex: 1 0 100%; justify-content: center; }
-      #openlabel span, #save span, #editmode span { display: none; }
-      #openlabel, #save, #editmode { padding: 0 9px; }
+      #openlabel span, #save span, #editmode span, #print span { display: none; }
+      #openlabel, #save, #editmode, #print { padding: 0 9px; }
+      /* The tool pills and dropdowns slim down so two groups share a row (3.16.0: the bar was
+         over a third of a phone screen in annotate mode). */
+      #modeseg .modebtn, #markupseg .modebtn, #drawseg .modebtn { padding: 0 7px; font-size: 11.5px; }
+      #bar select { max-width: 112px; }
+      .seg input[type=range] { width: 56px; }
       #appver { font-size: 10px; padding: 1px 6px; }
       #statusbar { min-height: 30px; }
     }
@@ -411,7 +442,7 @@
         </svg>
       </span>
       <span class="name">pdfium<span>-editor</span></span>
-      <span id="appver" title="deployed version">2.1.0-15a5991-we442fd8</span>
+      <span id="appver" title="deployed version">3.16.0-68216cc-w82f5615</span>
     </div>
 
     <div class="rule"></div>
@@ -462,6 +493,51 @@
       <button id="zin" title="zoom in" aria-label="zoom in">+</button>
     </span>
 
+    </div>
+
+    <!-- THE MODE (docs/annotations/12-VOCABULARY.md). Three peers, never combinable.
+         The Edit button below STAYS and keeps its id: it is the pre-mode door, other
+         verification scripts drive this page by id, and two CSS rules name it. It is
+         also the live proof that editMode === (mode === "text") in both directions —
+         pressing either control must move the other.
+         Annotate is labelled "(inert)" on purpose: it is a reachable VALUE that does
+         nothing until roadmap step 13, and an unlabelled dead button in the tester UI
+         would be reported as a bug. -->
+    <span class="seg" id="modeseg">
+      <button class="modebtn" data-mode="view" title="reading only">View</button>
+      <button class="modebtn" data-mode="text" title="edit the text">Text</button>
+      <button class="modebtn" data-mode="annotate"
+              title="mark up text: highlight, underline, squiggle, strikeout">Annotate</button>
+    </span>
+
+    <!-- ANNOTATE MODE (step 19): the four tools + the armed tool's colour. Painted from
+         the SDK's `markuptool` / `markupcolor` events, never from the click. -->
+    <span class="seg" id="markupseg" hidden>
+      <button class="modebtn" data-tool="highlight" title="highlight">Highlight</button>
+      <button class="modebtn" data-tool="underline" title="underline">Underline</button>
+      <button class="modebtn" data-tool="squiggle" title="squiggle">Squiggle</button>
+      <button class="modebtn" data-tool="strikeout" title="strikeout">Strikeout</button>
+      <input type="color" id="markupcolor" title="the armed tool's colour" disabled>
+    </span>
+    <!-- DRAWING (3.16.0): pen, eraser, colour, width. Painted from the SDK's `drawingtool`. -->
+    <span class="seg" id="drawseg" hidden>
+      <button class="modebtn" data-draw="pen" title="draw with one finger / the mouse">Pen</button>
+      <button class="modebtn" data-draw="eraser" title="rub strokes out">Eraser</button>
+      <input type="color" id="drawcolor" title="pen colour (also recolours a selected drawing)">
+      <input type="range" id="drawwidth" min="1" max="34" value="7" title="pen width, px" style="width:70px">
+    </span>
+    <select id="signpick" title="pick a signature; a tap in annotate places it">
+      <option value="">Sign…</option><option value="pad">Draw on the pad…</option><option value="drawn">Drawn</option>
+      <option value="typed">Typed name</option><option value="date">Date</option>
+    </select>
+    <button class="btn" id="discard" title="leave the mode, reverting everything done in it" disabled>Discard</button>
+    <div id="padpanel" hidden style="position:fixed;left:50%;top:20%;transform:translateX(-50%);z-index:50;background:#fff;border:1px solid #ccc;border-radius:12px;padding:12px;box-shadow:0 8px 30px rgba(0,0,0,.2)">
+      <div id="padbox" style="width:420px;max-width:80vw;height:160px;border:1px solid #ddd;border-radius:8px;overflow:hidden"></div>
+      <div style="display:flex;gap:6px;margin-top:8px">
+        <button class="btn" id="padundo">Undo</button><button class="btn" id="padclear">Clear</button>
+        <label style="display:flex;align-items:center;gap:4px"><input type="checkbox" id="paderase">Eraser</label>
+        <span style="flex:1"></span><button class="btn" id="padcancel">Cancel</button><button class="btn" id="paduse" disabled>Use</button>
+      </div>
     </div>
 
     <button class="btn" id="editmode" title="toggle edit mode">
@@ -541,6 +617,15 @@
       </svg><span>Save</span>
     </button>
 
+    <!-- PRINT (3.2.0): exportFlattened() -> a copy with the marks burned in -> the
+         browser's own print. Host chrome; the SDK opens no dialog. -->
+    <button class="btn" id="print" title="print, with the marks">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+           stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M6 9V3h12v6"/><rect x="3" y="9" width="18" height="8" rx="2"/><path d="M7 14h10v7H7z"/>
+      </svg><span>Print</span>
+    </button>
+
     <!-- Persistent §7 badge: unlike #status (which every paint overwrites),
          this stays visible for as long as saves cannot stream. -->
     <span id="opfsbadge" hidden title="This browser has no OPFS sync handle: saves are held in memory">In-memory saves</span>
@@ -568,6 +653,31 @@
         <label class="mrow" for="stickyfont">
           <input type="checkbox" id="stickyfont">
           <span>Sticky typeface (font + bold/italic)</span>
+        </label>
+        <!-- PAGE TEXT SELECTION + THE SDK'S WORDS MENU (W3): the switches a host sets.
+             Off by default in the SDK; the dev demo shows them so testers can try both. -->
+        <!-- THE TEXT CHECK (3.16.0): off by default in the SDK. The switch checks every document
+             as it opens; the button asks (forced once an answer is saved) and shows page 1's kind. -->
+        <label class="mrow" for="opt-textcheck">
+          <input type="checkbox" id="opt-textcheck" data-opt="textCheckOnOpen">
+          <span>Text check at every open</span>
+        </label>
+        <button class="mrow" id="checktext" type="button">Check text (real text or a scan?)</button>
+        <label class="mrow" for="opt-viewsel">
+          <input type="checkbox" id="opt-viewsel" data-opt="viewTextSelectionEnabled">
+          <span>View: select text</span>
+        </label>
+        <label class="mrow" for="opt-viewmenu">
+          <input type="checkbox" id="opt-viewmenu" data-opt="viewSelectionMenuEnabled">
+          <span>View: SDK menu over selected text</span>
+        </label>
+        <label class="mrow" for="opt-annmenu">
+          <input type="checkbox" id="opt-annmenu" data-opt="annotateSelectionMenuEnabled">
+          <span>Annotate: SDK menu (no tool picked)</span>
+        </label>
+        <label class="mrow" for="opt-markend">
+          <input type="checkbox" id="opt-markend" data-opt="markupOnSelectionEnd">
+          <span>Annotate: mark when the drag ends</span>
         </label>
         <div class="mnote" id="enginenote">engine — checking…</div>
       </div>
@@ -649,7 +759,7 @@
     </div>
   </div>
 
-  <script type="module" src="demo.js?v=2.1.0-15a5991-we442fd8"></script>
+  <script type="module" src="demo.js?v=3.16.0-68216cc-w82f5615"></script>
 </body>
 </html>
 <style>

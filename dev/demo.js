@@ -17,7 +17,7 @@
 // window.lastOpen, window.lastSave, window.lastSavedFile, window.latencySamples,
 // window.showWarning) plus window.pdfe for the instance itself.
 
-import { PdfeEditor } from "./pdfe-editor.js?v=2.1.0-15a5991-we442fd8";
+import { PdfeEditor, PdfeSignaturePadView } from "./pdfe-editor.js?v=3.16.0-68216cc-w82f5615";
 
 const SAMPLE_PDF = "./sample.pdf";   // build_site.sh → ./sample.pdf
 const ENGINE_URL = "./editor.js";            // build_site.sh → ./editor.js
@@ -104,13 +104,6 @@ const BLOCK_MOVE_DEFAULT = true;
 // ?move=1 opt-in, which existed while the default was off.)
 const blockMoveOn = params.get("move") === "0" ? false : BLOCK_MOVE_DEFAULT;
 
-// DOCUMENT REFLOW (docs/DOCUMENT_REFLOW.md) — EXPERIMENTAL, off unless asked for.
-// ?documentReflow=1 turns it on for a load. Off by default because enabling it builds a
-// model over EVERY page at open time, and because it is not finished: the destination
-// page is not itself re-settled, so a big enough insertion can hang past the bottom of
-// the page it lands on.
-const documentReflowOn = params.get("documentReflow") === "1" || params.get("flow") === "1";
-
 const editor = new PdfeEditor({
   container: $("editor"),
   engineUrl: ENGINE_URL,
@@ -118,28 +111,7 @@ const editor = new PdfeEditor({
   version,                                     // cache-buster (build_site stamps it)
   simulateNoOpfs: forceInHeap,
   blockMove: blockMoveOn,
-  documentReflow: documentReflowOn,
 });
-if (documentReflowOn) {
-  // The host's own readout, so what the feature did is visible rather than inferred
-  // from the pixels — which is the whole reason this page exists.
-  editor.on("documentReflowed", (e) => {
-    const bits = [];
-    if (e.nudged) bits.push(`${e.nudged} item(s) nudged`);
-    if (e.linesMigrated) bits.push(`${e.linesMigrated} line(s) moved to the next page`);
-    if (e.itemsMigrated) bits.push(`${e.itemsMigrated} whole item(s) moved`);
-    if (e.pagesAdded) bits.push(`${e.pagesAdded} page(s) added`);
-    if (e.cascadedPages && e.cascadedPages.length > 1)
-      bits.push(`rippled across pages ${e.cascadedPages.map((p) => p + 1).join(", ")}`);
-    setStatus(e.undone
-      ? `documentReflow: UNDONE — the reflow was reversed (now ${e.pages} pages)`
-      : e.redone
-      ? `documentReflow: REDONE — the reflow was replayed (now ${e.pages} pages)`
-      : `documentReflow: ${bits.join(", ") || "nothing to do"} (now ${e.pages} pages)`);
-    console.log("[demo] documentReflowed", e);
-  });
-  editor.on("pagesChanged", (e) => console.log("[demo] pagesChanged", e));
-}
 window.pdfe = editor;
 window.worker = editor.worker;                 // verification hook (drive the worker directly)
 window.latencySamples = editor.latencySamples; // the latency-gate harness reads this
@@ -393,7 +365,126 @@ moreBtn.addEventListener("click", (ev) => {
 document.addEventListener("click", (ev) => { if (!menu.contains(ev.target)) closeMenu(); });
 document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") closeMenu(); });
 
-// ---- edit mode + line mode -------------------------------------------------
+// ---- mode + edit mode + line mode ------------------------------------------
+//
+// TWO CONTROLS, ONE STATE. The Edit button is the pre-mode door and the segment is
+// the general one; both are painted from SDK EVENTS and never from the click, so
+// pressing either visibly moves the other. That is the demo's own live check of
+// `editMode === (mode === "text")`.
+const modeBtns = [...document.querySelectorAll("#modeseg .modebtn")];
+for (const b of modeBtns) {
+  b.addEventListener("click", () => editor.setMode(b.dataset.mode));
+}
+const paintMode = (mode) => {
+  for (const b of modeBtns) b.classList.toggle("active", b.dataset.mode === mode);
+};
+paintMode(editor.mode);          // readable, not only observable — no event to replay
+// Signatures (W4): a sample of each kind; a tap in annotate places the pick, and it stays on.
+const SAMPLE_SIGNATURES = {
+  drawn: { type: "drawn", frameWidth: 300, frameHeight: 100,
+           strokes: [{ points: [10, 80, 60, 20, 110, 80, 160, 20, 210, 80, 260, 30], width: 3, color: "#1030c0" }] },
+  typed: { type: "typed", text: "A. Signer", fontName: "DancingScript-Regular", color: "#0a3d91" },
+  date: { type: "text", text: new Date().toDateString() },
+};
+// The SDK's own pad (W4b): draw, then Use places the drawing with the next tap.
+let pad = null;
+$("signpick").addEventListener("change", (e) => {
+  const v = e.target.value;
+  if (v === "pad") {
+    $("padpanel").hidden = false;
+    if (!pad) {
+      pad = new PdfeSignaturePadView($("padbox"), { fontsUrl: FONTS_URL });
+      pad.inkColor = "#0a3d91";
+      pad.listener = { onPadChanged: (empty) => { $("paduse").disabled = empty; } };
+    }
+    return;
+  }
+  if (v && editor.mode !== "annotate") editor.setMode("annotate");
+  editor.setSignatureTool(SAMPLE_SIGNATURES[v] || null);
+});
+$("padundo").addEventListener("click", () => pad?.undo());
+$("padclear").addEventListener("click", () => pad?.clear());
+$("paderase").addEventListener("change", (e) => { if (pad) pad.eraser = e.target.checked; });
+$("padcancel").addEventListener("click", () => { $("padpanel").hidden = true; $("signpick").value = ""; });
+$("paduse").addEventListener("click", () => {
+  const sig = pad?.toSignature();
+  $("padpanel").hidden = true;
+  if (!sig) return;
+  if (editor.mode !== "annotate") editor.setMode("annotate");
+  editor.setSignatureTool(sig);
+});
+editor.on("signaturetool", ({ signature }) => {
+  if (!signature) $("signpick").value = "";
+  if (signature) setHint("Sign", "Sign — tap the page to place it (the tool stays on)");
+});
+
+// discardModeChanges (W2): grey until something changed in the mode; ask, then revert.
+const paintDiscard = () => { $("discard").disabled = !editor.canDiscard; };
+editor.on("history", paintDiscard);
+$("discard").addEventListener("click", async () => {
+  if (!confirm("Discard every change made since you entered this mode? This cannot be undone.")) return;
+  try { await editor.discardModeChanges(); setStatus("changes discarded"); }
+  catch (e) { setStatus(`discard: ${e.code}`); }
+});
+editor.on("mode", ({ mode, previous }) => {
+  paintMode(mode);
+  paintDiscard();
+  $("markupseg").hidden = mode !== "annotate";
+  $("drawseg").hidden = mode !== "annotate";
+  if (mode === "annotate") setHint("Annotate", editor.markupTool
+    ? "Annotate — drag over text to mark it; tap a mark to select it"
+    : "Annotate — pick a tool, or drag over text to select it; tap a mark to select it");
+  console.log(`[demo] mode ${previous} -> ${mode}`);
+});
+
+// ---- annotate mode (step 19): the four tools and the armed colour -------------------
+// Tapping the armed tool again disarms it. Painted from the SDK's own reports.
+const toolBtns = [...document.querySelectorAll("#markupseg .modebtn")];
+for (const b of toolBtns) {
+  b.addEventListener("click", () =>
+    editor.setMarkupTool(editor.markupTool === b.dataset.tool ? null : b.dataset.tool));
+}
+const argbHex = (argb) => "#" + (argb & 0xffffff).toString(16).padStart(6, "0");
+const markupColorIn = $("markupcolor");
+markupColorIn.addEventListener("input", () => {
+  // keep the tool's own alpha: a highlight stays see-through
+  const a = (editor.markupColor >>> 24).toString(16).padStart(2, "0");
+  editor.setMarkupColor(markupColorIn.value + a);
+});
+const paintMarkup = () => {
+  const t = editor.markupTool;
+  for (const b of toolBtns) b.classList.toggle("active", b.dataset.tool === t);
+  markupColorIn.disabled = !t;
+  if (t) markupColorIn.value = argbHex(editor.markupColor);
+};
+paintMarkup();
+editor.on("markuptool", paintMarkup);
+editor.on("markupcolor", paintMarkup);
+editor.on("markupcreated", ({ page, tool }) => setHint("Marked", `${tool} added on page ${page + 1}`));
+
+// ---- drawing (3.16.0): pen / eraser, colour, width — painted from `drawingtool` ------------
+const drawBtns = [...document.querySelectorAll("#drawseg .modebtn")];
+for (const b of drawBtns) {
+  b.addEventListener("click", () => editor.setDrawingTool(editor.drawingTool === b.dataset.draw ? null : b.dataset.draw));
+}
+const drawColorIn = $("drawcolor"), drawWidthIn = $("drawwidth");
+drawColorIn.addEventListener("input", () => {
+  editor.setDrawingColor(drawColorIn.value);
+  if (editor.selectedDrawing) editor.setSelectedDrawingStyle({ color: drawColorIn.value });
+});
+drawWidthIn.addEventListener("input", () => editor.setDrawingWidth(Number(drawWidthIn.value)));
+editor.on("drawingtool", ({ tool, color, widthDp }) => {
+  for (const b of drawBtns) b.classList.toggle("active", b.dataset.draw === tool);
+  drawColorIn.value = argbHex(color);
+  drawWidthIn.value = String(widthDp);
+});
+editor.on("drawingcreated", ({ page, id }) => setHint("Drew", `${id} on page ${page + 1}`));
+editor.on("drawingchanged", ({ id, what }) => setHint("Drawing", `${id} ${what}`));
+editor.on("drawingdeleted", ({ id }) => setHint("Drawing", `${id} deleted`));
+editor.on("pagetextselection", ({ selection }) => {
+  if (selection) setHint("Selected", `"${selection.text.slice(0, 60)}" — pick a tool to mark it`);
+});
+
 const editBtn = $("editmode");
 editBtn.addEventListener("click", () => editor.toggleEditMode());
 editor.on("editmode", ({ editMode }) => {
@@ -871,6 +962,14 @@ colorInput.addEventListener("change", (ev) => {
 
 // STICKY vs FOLLOW-THE-CARET — host chrome for the SDK's own switch (§2). Checked means
 // the pick is fixed until cleared; unchecked (default) means the caret decides.
+// W3: the page-selection switches, read back from the SDK (it owns the defaults).
+for (const box of document.querySelectorAll("input[data-opt]")) {
+  box.checked = !!editor[box.dataset.opt];
+  box.addEventListener("change", () => { editor[box.dataset.opt] = box.checked; });
+}
+editor.on("pagelongpress", ({ selected }) => {
+  if (!selected && editor.needsMarkupTool) setHint("Annotate", "Pick a tool first");
+});
 const stickyColor = $("stickycolor");
 stickyColor.addEventListener("change", () => {
   const sticky = stickyColor.checked;
@@ -960,10 +1059,18 @@ editor.on("select", ({ selection }) => {
   // A PICTURE IS NOT A PARAGRAPH, and the hint must not offer what it cannot do:
   // neither Edit nor Delete applies to one, and the rotate control is the handle
   // the SDK draws on the picture itself.
+  if (["signature", "signaturetext", "stamp"].includes(selection.kind)) {
+    setHint("Selected", `Selected a ${selection.kind} on p${selection.page + 1} — drag it, or Delete removes it`);
+    return;
+  }
+  if (selection.kind === "markup") {
+    setHint("Selected", `Selected a ${selection.markupKind} on p${selection.page + 1} — Delete removes it`);
+    return;
+  }
   if (selection.kind === "image") {
     setHint("Selected", `Selected a picture on p${selection.page + 1}` +
       (selection.quarterTurns ? ` (turned ${selection.quarterTurns * 90}°)` : "") +
-      " — drag it, or use the round button on its corner to rotate");
+      " — drag it to move; drag a knob to resize or stretch; two fingers turn it");
     return;
   }
   setHint("Selected",
@@ -1082,6 +1189,43 @@ function showWarning({ title, body, okLabel = "Save anyway" }) {
   });
 }
 window.showWarning = showWarning;   // verification hook
+
+// PRINT (3.2.0) — what a client's Print button looks like: the flattened copy, loaded
+// into a hidden iframe and printed there. The copy, not the open document, because a
+// print path that draws no annotations would drop every mark. The open document is not
+// touched: dirty and undo read the same after (window.lastPrint records both).
+// THE TEXT CHECK (3.16.0): the saved answer is re-asked with force so a tester sees it worked out
+// again; a NEW answer also arrives as `textcheck`.
+$("checktext").addEventListener("click", async () => {
+  try {
+    const p = editor.checkText({ force: editor.textCheck() !== null });
+    setStatus(`text check: ${editor.textCheckState()} (in progress: ${editor.textCheckInProgress})`);
+    const r = await p;
+    setStatus(`text check: hasText=${r.hasText} · this page: ${await editor.pageKind(editor.currentPage)}`);
+  } catch (e) { setStatus(`text check: ${e.code || e.message}`); }
+});
+editor.on("textcheck", ({ hasText }) => setStatus(hasText ? "this PDF has text" : "this PDF is pictures only (a scan)"));
+
+$("print").addEventListener("click", async () => {
+  const before = { dirty: editor.dirty, canUndo: editor.canUndo };
+  let bytes;
+  try { bytes = await editor.exportFlattened(); }
+  catch (e) { setStatus(`print: ${e.code || e.message}`); return; }
+  window.lastPrint = { bytes: bytes.length, before, after: { dirty: editor.dirty, canUndo: editor.canUndo } };
+  window.lastPrintBytes = bytes;   // verification hook
+  const url = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  const frame = document.createElement("iframe");
+  frame.style.cssText = "position:fixed;right:0;bottom:0;width:0;height:0;border:0";
+  frame.src = url;
+  frame.onload = () => {
+    const done = () => { URL.revokeObjectURL(url); frame.remove(); };
+    frame.contentWindow.addEventListener("afterprint", done, { once: true });
+    setTimeout(done, 60_000);   // a browser that never fires afterprint
+    frame.contentWindow.print();
+  };
+  document.body.appendChild(frame);
+  setStatus(`print copy: ${(bytes.length / 1024).toFixed(0)} KB`);
+});
 
 $("save").addEventListener("click", async () => {
   const caps = editor.capabilities;

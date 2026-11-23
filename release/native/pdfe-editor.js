@@ -297,7 +297,69 @@ export const PdfeSignatureFonts = Object.freeze({
   DEFAULT: "LiberationSerif-Regular",
   HANDWRITING: Object.freeze(["DancingScript-Regular", "GreatVibes-Regular", "Caveat-Regular", "MrDafoe-Regular"]),
 });
-const PDFE_STAMP_KIND_NAMES = ["signature", "signaturetext", "stamp"];   // PDFE_STAMP_SIGNATURE/DATE/FOREIGN
+const PDFE_STAMP_KIND_NAMES = ["signature", "signaturetext", "stamp"];
+const PDFE_PAGE_KIND_NAMES = ["noText", "text", "scanned", "scannedWithOcr"];   // PDFE_PAGE_KIND_* (3.16.0)   // PDFE_STAMP_SIGNATURE/DATE/FOREIGN
+/** DRAWING (DR3, vocabulary §25): the tools, and Android's defaults (DrawingToolState). The pen's
+ *  width is in CSS px (Android dp) at the zoom it is drawn, as the reference app's slider: 1–34,
+ *  default 7; the eraser's 5–60, default 10. A stroke keeps a point only once the pointer moved
+ *  MIN_DIST_PX, and is smoothed in pieces of PIECE_PX — both handed to the core in page points. */
+const PDFE_DRAWING_TOOLS = ["pen", "eraser"];
+const PDFE_DRAWING = Object.freeze({
+  color: 0xff000000, widthDp: 7, widthMinDp: 1, widthMaxDp: 34,
+  eraserWidthDp: 10, eraserMinDp: 5, eraserMaxDp: 60,
+  minDistPx: 2, piecePx: 3, eraserTrail: "rgba(120, 134, 157, 0.2)",   // the reference's 0x3378869D
+});
+/** pdfe_ink_distance's rule in JS (the cached points, no worker hop): the nearest segment or dot. */
+function inkDistance(paths, x, y) {
+  let best = -1;
+  for (const p of paths) {
+    const n = p.length >> 1;
+    if (!n) continue;
+    if (n === 1) { const d = Math.hypot(p[0] - x, p[1] - y); if (best < 0 || d < best) best = d; continue; }
+    for (let i = 0; i + 1 < n; i++) {
+      const ax = p[2 * i], ay = p[2 * i + 1], dx = p[2 * i + 2] - ax, dy = p[2 * i + 3] - ay, l2 = dx * dx + dy * dy;
+      const t = l2 > 0 ? Math.min(1, Math.max(0, ((x - ax) * dx + (y - ay) * dy) / l2)) : 0;
+      const d = Math.hypot(ax + t * dx - x, ay + t * dy - y);
+      if (best < 0 || d < best) best = d;
+    }
+  }
+  return best;
+}
+/** The topmost ink a point reaches (within half its width + |slop|), or null. Hidden and nameless
+ *  inks are never hit; other apps' only with |foreign| (otherAppInkEditable). */
+function inkHit(list, x, y, slop, foreign) {
+  let hit = null;
+  for (const k of list) {
+    if (k.flags & 6) continue;                     // PDFE_INK_F_HIDDEN | _NONAME
+    if (k.foreign && !foreign) continue;
+    const r = k.rect, reach = k.widthPt / 2 + slop;
+    if (x < r[0] - slop || x > r[2] + slop || y < r[1] - slop || y > r[3] + slop) continue;
+    const d = inkDistance(k.paths, x, y);
+    if (d >= 0 && d <= reach && (!hit || k.annotIndex > hit.annotIndex)) hit = k;
+  }
+  return hit;
+}
+/** A drawing's box /Rect [l, b, r, t] (its points grown by |hw|, half the width) dragged onto
+ *  |to|: the matrix [sx, 0, 0, sy, ox, oy] that carries the POINTS so the new /Rect is |to|
+ *  exactly — the width does not scale, so the points' own span maps onto |to| less the same
+ *  margin (DrawingToolState.inkBoxMatrix, the Kotlin twin). A span too thin to scale (a straight
+ *  line along that axis) scales with the whole box, or only moves. |page| [l, b, r, t] (optional):
+ *  an edge that was on the page stays on it (the knobs' limits allow half a pixel over, and a box
+ *  over the edge may no longer grow). */
+function inkBoxMatrix(rect, hw, to, page) {
+  if (page) {
+    to = [rect[0] >= page[0] ? Math.max(to[0], page[0]) : to[0], rect[1] >= page[1] ? Math.max(to[1], page[1]) : to[1],
+          rect[2] <= page[2] ? Math.min(to[2], page[2]) : to[2], rect[3] <= page[3] ? Math.min(to[3], page[3]) : to[3]];
+  }
+  const axis = (a0, a1, b0, b1) => {
+    const fa = a1 - a0 - 2 * hw, fb = b1 - b0 - 2 * hw;
+    if (fa > 1e-3 && fb > 1e-3) { const s = fb / fa; return [s, b0 + hw - s * (a0 + hw)]; }
+    if (a1 - a0 > 1e-3) { const s = (b1 - b0) / (a1 - a0); return [s, b0 - s * a0]; }
+    return [1, (b0 + b1 - a0 - a1) / 2];
+  };
+  const [sx, ox] = axis(rect[0], rect[2], to[0], to[2]), [sy, oy] = axis(rect[1], rect[3], to[1], to[3]);
+  return [sx, 0, 0, sy, ox, oy];
+}
 /** SignaturePlacement.signatureSize: 30% of the page wide, height from the shape, at most half the page tall. */
 function signatureSize(aspect, pw, ph) {
   const a = Number.isFinite(aspect) && aspect > 0 ? aspect : 3;
@@ -521,6 +583,9 @@ export const PdfeHandleConfig = Object.freeze({
   IMAGE_DEFAULT: normalizeHandleConfig({ corners: "resize", edges: "stretch", cornerButton: "none" }),
   /** A signature's default: the ↘ button on its bottom corner. */
   SIGNATURE_DEFAULT: normalizeHandleConfig({}),
+  /** A drawing's default (3.16.0): corners resize, middles stretch, no ↘ button, no pinch (two
+   *  fingers zoom the page). A drawing never turns: a turn job resizes or hides. */
+  DRAWING_DEFAULT: normalizeHandleConfig({ corners: "resize", edges: "stretch", cornerButton: "none", pinch: "none" }),
 });
 
 /**
@@ -1124,11 +1189,24 @@ export class PdfeEditor {
     this._pageStamps = new Map();
     this._otherAppStampsEditable = true;          // PageSelectionPolicy.DEFAULT_OTHER_APP_STAMPS_EDITABLE (D34)
     this._signatureToolSelectsExisting = true;    // PageSelectionPolicy.DEFAULT_SIGNATURE_TOOL_SELECTS_EXISTING (I136)
+    // DRAWING (DR3, vocabulary §25): shell state, read without a worker hop (§4bis).
+    this._drawingTool = null;                     // "pen" | "eraser" | null
+    this._drawingColor = PDFE_DRAWING.color;
+    this._drawingWidthDp = PDFE_DRAWING.widthDp;
+    this._eraserWidthDp = PDFE_DRAWING.eraserWidthDp;
+    this._eraserCutsStrokes = opts.eraserCutsStrokes ?? true;
+    this._drawingStylusOnly = opts.drawingStylusOnly ?? false;
+    this._otherAppInkEditable = opts.otherAppInkEditable ?? true;     // D37
+    this._pageInks = new Map();
+    this._selectedInk = null;                     // {page, ink}
+    this._drawStroke = null;                      // the stroke in flight (isDrawing)
+    this._drawLive = [];                          // live stroke canvases waiting for the engine's paint
     // THE KNOBS (W5c): one config per kind, Android's defaults. |_signatureHandlesSet|: the host
     // set the signature one itself, so the older showCornerKnobs switch no longer speaks for it.
     this._imageHandles = PdfeHandleConfig.IMAGE_DEFAULT;
     this._signatureHandles = PdfeHandleConfig.SIGNATURE_DEFAULT;
     this._signatureHandlesSet = false;
+    this._drawingHandles = PdfeHandleConfig.DRAWING_DEFAULT;
     this._itemGesture = null;           // the knob / ↘ / pinch / move in flight
     this._gestureKind = null;           // isSelectionGestureActive's kind, until the result landed
     this._live = null;                  // the dragged item's own pixels (the live drag)
@@ -1140,6 +1218,17 @@ export class PdfeEditor {
     this._markupOnSelectionEnd = opts.markupOnSelectionEnd ?? true;
     this._markupOnToolPick = opts.markupOnToolPick ?? true;
     this._annotateDragSelectEnabled = opts.annotateDragSelectEnabled ?? true;
+    // TEXT CHECK (3.16.0): off by default — nothing is worked out until checkText() is called.
+    this._textCheckOnOpen = opts.textCheckOnOpen ?? false;
+    this._textCheck = null;
+    this._textCheckWaiters = null;   // [{resolve, reject}] while a check runs
+    this._textCheckGen = 0;
+    this._pageKindSeq = 0;
+    this._pageKindWaiters = new Map();
+    // PageSelectionPolicy.DEFAULT_NEW_SELECTION_DESELECTS_ANNOTATION (I167)
+    this._newSelectionDeselectsAnnotation = opts.newSelectionDeselectsAnnotation ?? true;
+    // PageSelectionPolicy.DEFAULT_TAP_KEEPS_ANNOTATION_SELECTED
+    this._tapKeepsAnnotationSelected = opts.tapKeepsAnnotationSelected ?? true;
     this._pageSel = null;          // the worker's page selection as last painted
     this._reportedPageSel = null;  // what the host was last told (pagetextselection)
     this._pageMarks = new Map();   // page -> marks, for the tap hit-test and outlines
@@ -1608,6 +1697,7 @@ export class PdfeEditor {
         this._groupsPending.delete(p.page);
       } else {
         this._pageMarks?.set(p.page, p.marks || []);
+        if (p.inks) this._pageInks.set(p.page, p.inks);
       }
     }
     // NO scroll and no re-selection: "a discard does not go sightseeing" (12-VOCABULARY §4).
@@ -1656,8 +1746,17 @@ export class PdfeEditor {
    *  Default true. A mouse always drags to select in annotate mode. @since 3.15.0 */
   get annotateDragSelectEnabled() { return this._annotateDragSelectEnabled; }
   set annotateDragSelectEnabled(v) { this._annotateDragSelectEnabled = !!v; this._syncAnnotatePolicy(); }
+  /** In annotate mode, does a long-press (or a one-finger drag with a tool armed) on OTHER text
+   *  unselect the selected mark / signature / drawing first, then select as usual? A press ON it
+   *  starts nothing. Default true. false = while one is selected nothing starts. @since 3.16.0 */
+  get newSelectionDeselectsAnnotation() { return this._newSelectionDeselectsAnnotation; }
+  set newSelectionDeselectsAnnotation(v) { this._newSelectionDeselectsAnnotation = !!v; }
+  /** In annotate mode, does a tap on the mark / signature / drawing that is ALREADY selected keep
+   *  it selected? Default true. false = that tap unselects it. @since 3.16.0 */
+  get tapKeepsAnnotationSelected() { return this._tapKeepsAnnotationSelected; }
+  set tapKeepsAnnotationSelected(v) { this._tapKeepsAnnotationSelected = !!v; }
   /** true while one finger marks instead of scrolling (a tool armed + annotateDragSelectEnabled). @since 3.15.0 */
-  get oneFingerScrollFrozen() { return this._dragSelects(); }
+  get oneFingerScrollFrozen() { return this._dragSelects() || this._draws("touch"); }
   /** In annotate mode, does a long-press only REPORT (no tool armed and text selection
    *  off)? The "pick a tool first" check as one reader. @since 3.15.0 */
   get needsMarkupTool() { return this._mode === "annotate" && !this._canSelectPageText(); }
@@ -1675,6 +1774,7 @@ export class PdfeEditor {
     this._markupTool = tool;
     this._emit("markuptool", { tool, color: this.markupColor });
     if (tool !== null && this._signatureTool) this._publishSignatureTool(null);   // one tool at a time
+    if (tool !== null && this._drawingTool) this._publishDrawingTool(null);
     this._syncAnnotatePolicy();
     if (markNow) this._markSelection(tool, this._markupColors[tool]);
   }
@@ -1762,6 +1862,7 @@ export class PdfeEditor {
       this._post({ type: "signaturePick", fontName: sig.fontName });   // stage a handwriting face early
     }
     if (this._markupTool) this.setMarkupTool(null);   // one tool at a time; reports markuptool
+    if (this._drawingTool) this._publishDrawingTool(null);
     this._publishSignatureTool(sig);
   }
   /** The picked signature as validated, or null. A picture reads {type, width, height} with the
@@ -1782,6 +1883,259 @@ export class PdfeEditor {
    *  another. Default true (I136). @since 3.15.0 */
   get signatureToolSelectsExisting() { return this._signatureToolSelectsExisting; }
   set signatureToolSelectsExisting(v) { this._signatureToolSelectsExisting = !!v; }
+
+  // ---- DRAWING (DR3 — vocabulary §25; the core's pdfe_ink_*, 19-DRAWING.md) ----------------
+
+  /**
+   * PICK UP THE PEN OR THE ERASER, or put it down with null. In annotate mode one finger (or the
+   * mouse, or a stylus) then draws a stroke — or rubs strokes out — and two fingers still pinch.
+   * Each stroke is ONE drawing (one undo step); the eraser cuts through strokes (eraserCutsStrokes).
+   * Picking a tool puts a markup or signature tool down (each reports). Always reports
+   * `drawingtool`. @since 3.16.0
+   */
+  setDrawingTool(tool) {
+    if (tool !== null && !PDFE_DRAWING_TOOLS.includes(tool)) return;
+    if (tool !== null && this._markupTool) this.setMarkupTool(null);
+    if (tool !== null && this._signatureTool) this._publishSignatureTool(null);
+    this._publishDrawingTool(tool);
+  }
+  /** "pen", "eraser" or null. @since 3.16.0 */
+  get drawingTool() { return this._drawingTool; }
+  /** The pen's colour, 0xAARRGGBB — a see-through alpha draws a see-through stroke. Accepts what
+   *  applyTextColor accepts; reports `drawingtool`. Default black. @since 3.16.0 */
+  setDrawingColor(color) {
+    const argb = parseArgb(color);
+    if (argb === null) return;
+    this._drawingColor = argb;
+    this._emitDrawingTool();
+  }
+  /** The pen colour, 0xAARRGGBB. @since 3.16.0 */
+  get drawingColor() { return this._drawingColor; }
+  /** The pen's width in CSS px at the zoom it is drawn (1–34, default 7); reports `drawingtool`. @since 3.16.0 */
+  setDrawingWidth(widthDp) {
+    const v = Number(widthDp);
+    if (!Number.isFinite(v)) return;
+    this._drawingWidthDp = Math.min(PDFE_DRAWING.widthMaxDp, Math.max(PDFE_DRAWING.widthMinDp, v));
+    this._emitDrawingTool();
+  }
+  /** The pen width, CSS px. @since 3.16.0 */
+  get drawingWidthDp() { return this._drawingWidthDp; }
+  /** The eraser's width in CSS px (5–60, default 10); reports `drawingtool`. @since 3.16.0 */
+  get eraserWidthDp() { return this._eraserWidthDp; }
+  set eraserWidthDp(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return;
+    this._eraserWidthDp = Math.min(PDFE_DRAWING.eraserMaxDp, Math.max(PDFE_DRAWING.eraserMinDp, n));
+    this._emitDrawingTool();
+  }
+  /** true (default): the eraser removes only the part it rubs; false: every stroke it touches, whole. @since 3.16.0 */
+  get eraserCutsStrokes() { return this._eraserCutsStrokes; }
+  set eraserCutsStrokes(v) { this._eraserCutsStrokes = !!v; }
+  /** true: only a stylus draws and a finger scrolls (palm rejection); the mouse always draws.
+   *  Default false. @since 3.16.0 */
+  get drawingStylusOnly() { return this._drawingStylusOnly; }
+  set drawingStylusOnly(v) { this._drawingStylusOnly = !!v; this._syncTouchAction(); }
+  /** Other apps' drawings can be selected, moved, restyled, deleted and erased. Default true (D37). @since 3.16.0 */
+  get otherAppInkEditable() { return this._otherAppInkEditable; }
+  set otherAppInkEditable(v) {
+    this._otherAppInkEditable = !!v;
+    if (!v && this._selectedInk && this._selectedInk.ink.foreign) this._setSelectedInk(null);
+  }
+  /** true while a finger (mouse, stylus) is drawing or erasing a stroke. @since 3.16.0 */
+  get isDrawing() { return !!this._drawStroke; }
+  /** The selected drawing, or null: {page, id, bounds, color, widthPt, ownedBySdk}. @since 3.16.0 */
+  get selectedDrawing() {
+    const s = this._selectedInk;
+    return s ? this._inkPayload(s.page, s.ink) : null;
+  }
+  /** Restyle the SELECTED drawing: {color?, widthPt?} (one undo step). Ignored with none. @since 3.16.0 */
+  setSelectedDrawingStyle(style = {}) {
+    const sel = this._selectedInk;
+    if (!sel || !style) return;
+    let what = 0, color = 0, widthPt = 0;
+    if (style.color != null) { const c = parseArgb(style.color); if (c === null) return; color = c; what |= 1; }
+    if (style.widthPt != null) { const w = Number(style.widthPt); if (!(w > 0)) return; widthPt = w; what |= 2; }
+    if (!what) return;
+    this._post({ type: "inkStyle", page: sel.page, nm: sel.ink.nm, what, color, widthPt });
+  }
+
+  _inkPayload(page, k) {
+    return { page, id: k.nm || null, bounds: [...k.rect], color: k.colorKnown ? k.color : null,
+             widthPt: k.widthPt, ownedBySdk: !k.foreign };
+  }
+  /** The funnel every tool change goes through: one event, always (rule 14). */
+  _publishDrawingTool(tool) {
+    this._drawingTool = tool;
+    this._emitDrawingTool();
+    this._syncTouchAction();
+  }
+  _emitDrawingTool() {
+    this._emit("drawingtool", { tool: this._drawingTool, color: this._drawingColor,
+                                widthDp: this._drawingWidthDp, eraserWidthDp: this._eraserWidthDp });
+  }
+  /** Does one pointer of |type| draw here? (annotate, a tool in hand, a stylus when stylusOnly). */
+  _draws(type) {
+    if (this._mode !== "annotate" || !this._drawingTool) return false;
+    return !this._drawingStylusOnly || type === "pen" || type === "mouse";
+  }
+  _setSelectedInk(sel) {
+    const had = !!this._selectedInk;
+    if (sel && this._selectedMark) this._selectedMark = null;   // at most one selection
+    if (sel && this._selectedStamp) this._selectedStamp = null;
+    this._selectedInk = sel;
+    this._renderBoxes();
+    if (sel) {
+      this._emit("select", { selection: { kind: "drawing", page: sel.page, id: sel.ink.nm || null,
+                                          bounds: [...sel.ink.rect] } });
+    } else if (had && !this._selectedMark && !this._selectedStamp && !this._selected && !this._selectedImage) {
+      this._emit("select", { selection: null });
+    }
+  }
+  _deleteSelectedInk() {
+    const sel = this._selectedInk;
+    this._setSelectedInk(null);
+    this._post({ type: "inkDelete", page: sel.page, nm: sel.ink.nm });
+  }
+  /** The selected drawing's outline and its bar (Delete by default). */
+  _renderSelectedInk(scaleCss) {
+    const sel = this._selectedInk;
+    if (!sel || this._draggingBox) return;
+    const rect = this._pageRect(sel.page);
+    if (!rect || !this._pageCanvases[sel.page]) return;
+    const div = this._doc.createElement("div");
+    div.className = "pdfe-parabox pdfe-selected";
+    const v = this._viewBox(sel.page, sel.ink.rect);
+    div.style.left = `${rect.left + v.left * scaleCss}px`;
+    div.style.top = `${rect.top + v.top * scaleCss}px`;
+    div.style.width = `${v.width * scaleCss}px`;
+    div.style.height = `${v.height * scaleCss}px`;
+    this.boxesEl.appendChild(div);
+    if (this._fillActions("drawing")) this._placeActions(sel.page, sel.ink.rect, scaleCss);
+  }
+  _inkAt(page, xPt, yPt) {
+    return inkHit(this._pageInks.get(page) || [], xPt, yPt, PDFE_PAGE_PRESS_REACH_PX / 2 / this._k(page),
+                  this._otherAppInkEditable);
+  }
+
+  /** ONE STROKE of the pen or the eraser, from the press to the lift (the reference's Doodle:
+   *  a stroke that never moved makes no dot; a second finger ends it unsaved). The finger's path
+   *  is drawn live over the page and handed to the core in page points on the lift. */
+  _drawStrokeGesture(ev, canvas, page, toPt) {
+    const tool = this._drawingTool, k = this._k(page);
+    try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+    const rect = this._pageRect(page);
+    const live = this._doc.createElement("canvas");
+    const dpr = this._dpr || 1;
+    live.className = "pdfe-drawlive";
+    Object.assign(live.style, { position: "absolute", pointerEvents: "none", zIndex: "3",
+      left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
+    live.width = Math.round(rect.width * dpr); live.height = Math.round(rect.height * dpr);
+    this.strip.appendChild(live);
+    const g = live.getContext("2d");
+    g.scale(dpr, dpr);
+    g.lineCap = "round"; g.lineJoin = "round";
+    const pen = tool === "pen", c = this._drawingColor >>> 0;
+    g.strokeStyle = pen ? `rgba(${(c >> 16) & 255}, ${(c >> 8) & 255}, ${c & 255}, ${((c >>> 24) & 255) / 255})`
+                        : PDFE_DRAWING.eraserTrail;
+    g.lineWidth = pen ? this._drawingWidthDp : this._eraserWidthDp;
+    const cr = canvas.getBoundingClientRect();
+    const pts = [], sx = ev.clientX, sy = ev.clientY;
+    let lx = sx - cr.left, ly = sy - cr.top, moved = false;
+    // Kept ON the page: a point past an edge lands on that edge (off the page it would be saved and
+    // never seen).
+    const box = this._pageUserBox(page) || [-1e9, -1e9, 1e9, 1e9];
+    const add = (cx, cy) => {
+      const q = toPt(cx, cy);
+      pts.push(Math.min(box[2], Math.max(box[0], q.xPt)), Math.min(box[3], Math.max(box[1], q.yPt)));
+    };
+    add(sx, sy);
+    this._drawStroke = { page, tool, cancel: () => finish(false) };
+    this._emit("drawingstroke", { phase: "start", page, tool });
+    const finish = (commit) => {
+      canvas.removeEventListener("pointermove", move);
+      canvas.removeEventListener("pointerup", up);
+      canvas.removeEventListener("pointercancel", cancel);
+      this._drawStroke = null;
+      const keep = commit && (moved || !pen);   // a pen tap is no dot; an eraser tap rubs a spot
+      this._emit("drawingstroke", { phase: "end", page, tool, saved: keep });
+      if (!keep) { live.remove(); return; }
+      this._drawLive.push(live);
+      if (pen) {
+        this._post({ type: "inkCreate", page, points: pts, widthPt: this._drawingWidthDp / k, color: c,
+                     minDistPt: PDFE_DRAWING.minDistPx / k, pieceLenPt: PDFE_DRAWING.piecePx / k,
+                     author: this._markupAuthor });
+      } else {
+        this._post({ type: "inkErase", page, points: pts, radiusPt: this._eraserWidthDp / 2 / k,
+                     whole: !this._eraserCutsStrokes, foreign: this._otherAppInkEditable });
+      }
+    };
+    const move = (mv) => {
+      if (this._pinchActive) { finish(false); return; }
+      const evs = mv.getCoalescedEvents ? mv.getCoalescedEvents() : [];
+      for (const e of evs.length ? evs : [mv]) {
+        const x = e.clientX - cr.left, y = e.clientY - cr.top;
+        if (Math.hypot(x - lx, y - ly) < PDFE_DRAWING.minDistPx) continue;
+        moved = true;
+        g.beginPath(); g.moveTo(lx, ly); g.lineTo(x, y); g.stroke();
+        lx = x; ly = y;
+        add(e.clientX, e.clientY);
+      }
+    };
+    const up = (uv) => { add(uv.clientX, uv.clientY); finish(true); };
+    const cancel = () => finish(false);
+    if (!pen) { g.beginPath(); g.moveTo(lx, ly); g.lineTo(lx, ly); g.stroke(); }
+    canvas.addEventListener("pointermove", move);
+    canvas.addEventListener("pointerup", up);
+    canvas.addEventListener("pointercancel", cancel);
+  }
+  /** The engine painted the stroke: drop the live copy a moment later (a timer, not a frame —
+   *  a hidden tab runs no frames, W5c). */
+  _dropDrawLive() {
+    const done = this._drawLive.shift();
+    if (done) setTimeout(() => done.remove(), 60);
+  }
+  /** A selected drawing dragged to a new place: an outline follows, ONE transform on the lift. */
+  _dragInkGesture(ev, canvas, page, toPt, down) {
+    const sel = this._selectedInk;
+    try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
+    let dragging = false;
+    const end = () => {
+      canvas.removeEventListener("pointermove", move);
+      canvas.removeEventListener("pointerup", up);
+      canvas.removeEventListener("pointercancel", cancel);
+    };
+    const move = (mv) => {
+      const c = toPt(mv.clientX, mv.clientY);
+      if (!dragging) {
+        if (Math.hypot(mv.clientX - ev.clientX, mv.clientY - ev.clientY) <= 8) return;
+        dragging = true;
+        this._draggingBox = true;
+        this.actionsEl.style.display = "none";
+        this._beginSelectionGesture("drawing");
+        this._renderBoxes();
+      }
+      this._showMoveGhost(page, sel.ink.rect, c.xPt - down.xPt, c.yPt - down.yPt);
+    };
+    const up = (uv) => {
+      end();
+      if (!dragging) {     // a tap on the selected drawing: what a tap there means
+        const q = toPt(uv.clientX, uv.clientY);
+        this._annotateTap(page, q.xPt, q.yPt);
+        return;
+      }
+      const c = toPt(uv.clientX, uv.clientY);
+      const [dx, dy] = this._ghostDelta || [c.xPt - down.xPt, c.yPt - down.yPt];
+      this._draggingBox = false;
+      this._hideMoveGhost();
+      this._endSelectionGesture();
+      if (dx || dy) this._post({ type: "inkTransform", page, nm: sel.ink.nm, m: [1, 0, 0, 1, dx, dy], scaleWidth: false, change: "moved" });
+      else this._renderBoxes();
+    };
+    const cancel = () => { end(); if (dragging) { this._draggingBox = false; this._hideMoveGhost(); this._endSelectionGesture(); this._renderBoxes(); } };
+    canvas.addEventListener("pointermove", move);
+    canvas.addEventListener("pointerup", up);
+    canvas.addEventListener("pointercancel", cancel);
+  }
 
   /** The funnel every pick goes through: one event, always (rule 14). */
   _publishSignatureTool(sig) {
@@ -1860,12 +2214,13 @@ export class PdfeEditor {
   _setSelectedStamp(sel) {
     const had = !!this._selectedStamp;
     if (sel && this._selectedMark) this._selectedMark = null;
+    if (sel && this._selectedInk) this._selectedInk = null;
     this._selectedStamp = sel;
     this._renderBoxes();
     if (sel) {
       this._emit("select", { selection: { kind: sel.stamp.kindName, page: sel.page, id: sel.stamp.nm || null,
                                           bounds: [...sel.stamp.rect] } });
-    } else if (had && !this._selectedMark && !this._selected && !this._selectedImage) {
+    } else if (had && !this._selectedMark && !this._selectedInk && !this._selected && !this._selectedImage) {
       this._emit("select", { selection: null });
     }
   }
@@ -2001,7 +2356,7 @@ export class PdfeEditor {
   }
   /** One finger marks while a tool is armed (§23): the canvases stop the browser's pan. */
   _syncTouchAction() {
-    const freeze = this._dragSelects();
+    const freeze = this._dragSelects() || this._draws("touch");   // DR3: one finger draws
     for (const c of this._pageCanvases || []) if (c) c.style.touchAction = freeze ? "none" : "";
   }
 
@@ -2011,8 +2366,10 @@ export class PdfeEditor {
     this._reportPageSel();
     if (this._selectedMark) this._setSelectedMark(null);
     if (this._selectedStamp) this._setSelectedStamp(null);
+    if (this._selectedInk) this._setSelectedInk(null);
     this._pageMarks.clear();
     this._pageStamps?.clear();
+    this._pageInks?.clear();
     if (entering) for (const p of this._painted) this._post({ type: "marks", page: p });
     this._syncTouchAction();
     this._renderAnnotate();
@@ -2067,13 +2424,14 @@ export class PdfeEditor {
   _setSelectedMark(sel) {
     const had = !!this._selectedMark;
     if (sel && this._selectedStamp) this._selectedStamp = null;   // at most one selection
+    if (sel && this._selectedInk) this._selectedInk = null;
     this._selectedMark = sel;
     this._renderBoxes();
     if (sel) {
       const p = this._markupPayload(sel.page, sel.mark);
       this._emit("select", { selection: { kind: "markup", page: sel.page, id: p.id,
                                           markupKind: p.tool, color: p.color, bounds: p.bounds } });
-    } else if (had && !this._selected && !this._selectedImage) {
+    } else if (had && !this._selectedInk && !this._selected && !this._selectedImage) {
       this._emit("select", { selection: null });
     }
   }
@@ -2091,6 +2449,20 @@ export class PdfeEditor {
 
   /** A tap in annotate mode: a mark selects it, anything else clears (the
    *  `android-annotate-tap` chain, minus the signature rungs that land later). */
+  /** Is the point on the selected mark, signature or drawing? */
+  _pressOnSelectedAnnotation(page, pt) {
+    const sm = this._selectedMark, ss = this._selectedStamp, si = this._selectedInk;
+    return (!!sm && sm.page === page && topmostMark([sm.mark], pt.xPt, pt.yPt) >= 0) ||
+           (!!ss && ss.page === page && this._inBounds(ss.stamp.rect, pt)) ||
+           (!!si && si.page === page && this._inBounds(si.ink.rect, pt));
+  }
+  /** I167: a long-press or drag-select deselects first (the empty tap's path). */
+  _dropAnnotationSelection() {
+    if (this._selectedMark) this._setSelectedMark(null);
+    if (this._selectedStamp) this._setSelectedStamp(null);
+    if (this._selectedInk) this._setSelectedInk(null);
+  }
+
   _annotateTap(page, xPt, yPt) {
     // [tap-precedence: BEGIN web-annotate-tap]
     const marks = this._pageMarks.get(page) || [];
@@ -2103,10 +2475,33 @@ export class PdfeEditor {
       this._placeSignature(page, xPt, yPt);
       return;
     }
+    // [tap-rung: annotate-retap-unselect]
+    // A tap on the annotation ALREADY selected keeps it, or with tapKeepsAnnotationSelected off
+    // unselects it (PageSelectionPolicy.tapUnselects) — the empty tap's path.
+    if (!this._tapKeepsAnnotationSelected) {
+      const ink0 = st ? null : this._inkAt(page, xPt, yPt);
+      const mi = st || ink0 ? -1 : topmostMark(marks, xPt, yPt);
+      const ss = this._selectedStamp, si = this._selectedInk, sm = this._selectedMark;
+      const same = (a, b) => a === b || (!!a.nm && a.nm === b.nm);
+      if ((st && ss && ss.page === page && same(st, ss.stamp)) ||
+          (ink0 && si && si.page === page && same(ink0, si.ink)) ||
+          (mi >= 0 && sm && sm.page === page && same(marks[mi], sm.mark))) {
+        if (this._pageSel) this._clearPageSel();
+        this._dropAnnotationSelection();
+        return;
+      }
+    }
     // [tap-rung: stamp-hit]
     if (st) {   // drawn OVER the page and its marks, so it outranks a mark
       if (this._pageSel) this._clearPageSel();
       this._setSelectedStamp({ page, stamp: st });
+      return;
+    }
+    // [tap-rung: ink-hit]
+    const ink = this._inkAt(page, xPt, yPt);
+    if (ink) {   // drawn over the page's marks (DR3)
+      if (this._pageSel) this._clearPageSel();
+      this._setSelectedInk({ page, ink });
       return;
     }
     // [tap-rung: markup-hit]
@@ -2116,6 +2511,7 @@ export class PdfeEditor {
     // [tap-rung: annotate-empty-clear]
     if (this._selectedMark) this._setSelectedMark(null);   // _annotateTapEmpty
     if (this._selectedStamp) this._setSelectedStamp(null);
+    if (this._selectedInk) this._setSelectedInk(null);
     // [tap-precedence: END web-annotate-tap]
   }
 
@@ -2302,6 +2698,24 @@ export class PdfeEditor {
     const down = toPt(sx, sy);
     const canSelect = this._canSelectPageText();
     // [tap-precedence: BEGIN web-annotate-down]
+    // [tap-rung: annotate-draw-grab]
+    // DRAWING (DR3): with the pen or the eraser in hand one pointer draws (a stylus only when
+    // drawingStylusOnly); two fingers pinch, and a second finger ends the stroke unsaved.
+    if (annotate && this._draws(ev.pointerType || this._lastPointerType)) {
+      // A SECOND pointer while one draws: that stroke ends unsaved and the pinch takes over.
+      if (this._drawStroke) { this._drawStroke.cancel(); return; }
+      ev.preventDefault();
+      this._drawStrokeGesture(ev, canvas, page, toPt);
+      return;
+    }
+    // [tap-rung: ink-drag]
+    // A SELECTED DRAWING DRAGS: an outline follows, ONE transform on the lift (a tap selects again).
+    const si = annotate ? this._selectedInk : null;
+    if (si && si.page === page && this._inBounds(si.ink.rect, down)) {
+      ev.preventDefault();
+      this._dragInkGesture(ev, canvas, page, toPt, down);
+      return;
+    }
     // A SELECTED SIGNATURE DRAGS (W4 = SG10): a ghost follows, the stamp is written ONCE on the lift.
     const ss = annotate ? this._selectedStamp : null;
     const stampDrag = !!ss && ss.page === page && this._inBounds(ss.stamp.rect, down);
@@ -2316,17 +2730,24 @@ export class PdfeEditor {
       try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
     }
     const onStamp = annotate && !!this._stampAt(page, down.xPt, down.yPt);
+    // I138/I167 (PageSelectionPolicy.swallowsLongPress): a press ON the selected annotation starts
+    // nothing; elsewhere it unselects it first — or, with newSelectionDeselectsAnnotation off,
+    // starts nothing while one is selected.
+    const anySel = !!(this._selectedMark || this._selectedStamp || this._selectedInk);
+    const blocked = annotate && anySel &&
+      (!this._newSelectionDeselectsAnnotation || this._pressOnSelectedAnnotation(page, down));
     // [tap-rung: annotate-drag-select-grab]
-    const dragSel = !stampDrag && !onStamp && (mouse ? canSelect : this._dragSelects());
+    const dragSel = !stampDrag && !onStamp && !blocked && (mouse ? canSelect : this._dragSelects());
     if ((mouse && canSelect) || stampDrag) ev.preventDefault();   // no native text selection / image drag
     let pressed = false, selecting = false, moved = false, reported = false, dragging = false;
     // [tap-rung: long-press-stamp-swallow]
-    // A long-press ON a signature, or while a mark or signature is selected, means nothing
-    // (15-SIGNATURE §5.6, I138 — PageSelectionPolicy.swallowsLongPress, and stampAt( on Android).
-    const lpArmed = !(annotate && (this._selectedMark || this._selectedStamp || onStamp));
+    // A long-press ON a signature means nothing (15-SIGNATURE §5.6, stampAt( on Android); with an
+    // annotation selected it unselects it first (I167), or with the switch off means nothing (I138).
+    const lpArmed = !(annotate && (blocked || onStamp));
     // [tap-rung: long-press-page-word]
     const lp = lpArmed ? setTimeout(() => {
       if (this._pinchActive || this._mode === "text") return;
+      if (annotate) this._dropAnnotationSelection();
       const at = { page, xPt: down.xPt, yPt: down.yPt };
       // Selection off for this mode: only REPORTED, so a host can say "pick a tool first".
       if (!this._canSelectPageText()) { reported = true; this._emit("pagelongpress", { ...at, selected: false }); return; }
@@ -2382,7 +2803,7 @@ export class PdfeEditor {
           this._annotSelecting = true;
           try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* synthetic */ }
           const c = toPt(mv.clientX, mv.clientY);
-          if (this._selectedMark) this._setSelectedMark(null);
+          if (annotate) this._dropAnnotationSelection();
           this._post({ type: "pageSelDragFrom", page, ax: down.xPt, ay: down.yPt,
                        xPt: c.xPt, yPt: c.yPt, tolPt });
           return;
@@ -2530,6 +2951,50 @@ export class PdfeEditor {
     if (this._fillActions("markup")) this._placeActions(sel.page, sel.mark.rect, scaleCss);
   }
 
+  /** The engine answered a drawing call (DR3): the lists, the events, the selection. */
+  _onInkChanged(msg) {
+    this._pageInks.set(msg.page, msg.inks || []);
+    const find = (nm) => (msg.inks || []).find((k) => k.nm === nm);
+    if (msg.op === "create" || msg.op === "erase") this._dropDrawLive();
+    if (!msg.ok) {
+      this._emit("error", errorEvent(msg.op === "create" ? "drawing-failed" : "drawing-not-found",
+        msg.op === "create" ? "The drawing could not be written" : "That drawing is no longer on the page"));
+      if (msg.op === "delete") this._emit("deleted", { page: msg.page, ok: false, kind: "drawing" });
+      if (this._selectedInk && !find(this._selectedInk.ink.nm)) this._setSelectedInk(null);
+      else this._renderBoxes();
+      return;
+    }
+    if (msg.op === "erase" && !msg.count) return;   // touched nothing, changed nothing
+    if (!this._history.recording) this._setDirty(true);
+    switch (msg.op) {
+      case "create": {
+        const k = find(msg.nm);
+        this._emit("drawingcreated", { page: msg.page, id: msg.nm, bounds: k ? [...k.rect] : null });
+        return;
+      }
+      case "erase":
+        for (const nm of msg.changed || []) {
+          const k = find(nm);
+          this._emit("drawingchanged", { page: msg.page, id: nm, what: "erased", bounds: k ? [...k.rect] : null });
+        }
+        for (const nm of msg.deleted || []) this._emit("drawingdeleted", { page: msg.page, id: nm });
+        if (this._selectedInk && !find(this._selectedInk.ink.nm)) this._setSelectedInk(null);
+        return;
+      case "delete":
+        this._emit("deleted", { page: msg.page, ok: true, kind: "drawing" });
+        this._emit("drawingdeleted", { page: msg.page, id: msg.nm });
+        return;
+      default: {   // transform (moved / resized) or style
+        if (msg.op === "transform") this._settleItemGesture();
+        const k = find(msg.nm);
+        if (k) this._setSelectedInk({ page: msg.page, ink: k });
+        const what = msg.op === "style" ? "restyled" : (msg.change || "moved");
+        this._emit("drawingchanged", { page: msg.page, id: msg.nm, what, bounds: k ? [...k.rect] : null });
+        if (msg.op === "transform") this._emit("moved", { page: msg.page, ok: true, kind: "drawing", bounds: k ? [...k.rect] : null });
+      }
+    }
+  }
+
   /** The worker's annotate replies. Returns true when |msg| was one. */
   _onAnnotateMessage(msg) {
     switch (msg.type) {
@@ -2537,7 +3002,9 @@ export class PdfeEditor {
         if (msg.matrix !== undefined) this._pageMatrices.set(msg.page, msg.matrix);
         this._pageMarks.set(msg.page, msg.marks || []);
         this._pageStamps.set(msg.page, msg.stamps || []);
+        if (msg.inks) this._pageInks.set(msg.page, msg.inks);
         return true;
+      case "inkChanged": this._onInkChanged(msg); return true;
       case "signaturePlaced": {
         this._pageStamps.set(msg.page, msg.stamps || []);
         if (!msg.ok) {
@@ -2665,6 +3132,18 @@ export class PdfeEditor {
       case "markupHistoryApplied": {
         if (msg.marks) this._pageMarks.set(msg.page, msg.marks);
         if (msg.stamps) this._pageStamps.set(msg.page, msg.stamps);
+        if (msg.inks) this._pageInks.set(msg.page, msg.inks);
+        if (msg.other?.inks) this._pageInks.set(msg.other.page, msg.other.inks);
+        if (msg.stepKind === 2) {   // DR3: an INK step — the drawing it brought back is selected
+          const back = msg.ok && msg.present && msg.nm && (msg.inks || []).find((k) => k.nm === msg.nm);
+          if (back) this._setSelectedInk({ page: msg.page, ink: back });
+          else if (this._selectedInk && !(this._pageInks.get(this._selectedInk.page) || [])
+                     .some((k) => k.nm === this._selectedInk.ink.nm)) this._setSelectedInk(null);
+          if (msg.ok) this._scrollRectIntoViewIfOffscreen(msg.page, msg.focus);
+          else this._emit("error", errorEvent("history-unavailable", "Undo failed."));
+          this._emit(msg.kind, { page: msg.page, ok: !!msg.ok, live: false });
+          return true;
+        }
         if (msg.other) { this._pageMarks.set(msg.other.page, msg.other.marks); this._pageStamps.set(msg.other.page, msg.other.stamps); }
         // A SIGNATURE the step brought back is selected; one it took away is deselected (W4).
         const stBack = msg.ok && msg.present && msg.nm &&
@@ -2741,6 +3220,7 @@ export class PdfeEditor {
    * is parity rule 13's requirement, and this is its sixth state.
    */
   get selectionKind() {
+    if (this._selectedInk) return "drawing";   // annotate only (DR3)
     if (this._selectedStamp) return this._selectedStamp.stamp.kindName;   // annotate only (W4)
     if (this._selectedMark) return "markup";   // annotate mode only (step 19)
     if (this._selectedImage) return "image";
@@ -2771,6 +3251,8 @@ export class PdfeEditor {
   _transformTarget() {
     if (this._mode === "text" && this._selectedImage) return { kind: "image", page: this._selectedImage.page, item: this._selectedImage };
     if (this._mode === "annotate" && this._selectedStamp) return { kind: "stamp", page: this._selectedStamp.page, item: this._selectedStamp.stamp };
+    // A drawing: its box (/Rect), which never turns; the knobs resize / stretch it.
+    if (this._mode === "annotate" && this._selectedInk) return { kind: "ink", page: this._selectedInk.page, item: this._selectedInk.ink };
     return null;
   }
   /** A page point on screen as client px [x, y]. */
@@ -2851,6 +3333,13 @@ export class PdfeEditor {
   }
   /** PdfeEditorView.transformSelection: |scale| and |pageAngle| (radians, CCW in page space). */
   _transformSelection(t, scale, pageAngle) {
+    if (t.kind === "ink") {
+      if (Math.abs(scale - 1) <= 0.002 || !t.item.nm) return false;
+      const r = t.item.rect, cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2, hw = (r[2] - r[0]) * scale / 2, hh = (r[3] - r[1]) * scale / 2;
+      this._post({ type: "inkTransform", page: t.page, nm: t.item.nm, m: inkBoxMatrix(r, t.item.widthPt / 2, [cx - hw, cy - hh, cx + hw, cy + hh], this._pageUserBox(t.page)),
+                   scaleWidth: false, change: "resized" });
+      return true;
+    }
     if (t.kind === "image") {
       const q = t.item.quad, cx = (q[0] + q[2] + q[4] + q[6]) / 4, cy = (q[1] + q[3] + q[5] + q[7]) / 4;
       const a = scale * Math.cos(pageAngle), b = scale * Math.sin(pageAngle);
@@ -2869,6 +3358,14 @@ export class PdfeEditor {
   }
   /** PdfeEditorView.applyKnobTransform: the new corners |pts| (page points, own order). */
   _applyKnobTransform(t, sx, sy, angle, pts) {
+    if (t.kind === "ink") {   // the points follow their box onto the new corners; the width stays
+      if (!t.item.nm) return false;
+      const xs = [pts[0], pts[2], pts[4], pts[6]], ys = [pts[1], pts[3], pts[5], pts[7]];
+      const m = inkBoxMatrix(t.item.rect, t.item.widthPt / 2, [Math.min(...xs), Math.min(...ys), Math.max(...xs), Math.max(...ys)],
+                             this._pageUserBox(t.page));
+      this._post({ type: "inkTransform", page: t.page, nm: t.item.nm, m, scaleWidth: false, change: "resized" });
+      return true;
+    }
     if (t.kind === "image") {
       const m = HandlePolicy.affine(t.item.quad, pts);
       if (!m) return false;
@@ -2917,6 +3414,12 @@ export class PdfeEditor {
    *  PdfeHandleConfig.SIGNATURE_DEFAULT: the ↘ button. @since 3.15.0 */
   get signatureHandles() { return this._signatureHandles; }
   set signatureHandles(v) { this._signatureHandles = normalizeHandleConfig(v); this._signatureHandlesSet = true; this._renderBoxes(); }
+  /** The same for a selected DRAWING. Default PdfeHandleConfig.DRAWING_DEFAULT: corners resize,
+   *  middles stretch, no ↘ button, no pinch. A drawing never turns, so a turn job resizes (or, a
+   *  plain ROTATE, hides the knob). A knob drag is ONE undo step, reported as `drawingchanged`
+   *  with what "resized"; the stroke width stays. @since 3.16.0 */
+  get drawingHandles() { return this._drawingHandles; }
+  set drawingHandles(v) { this._drawingHandles = normalizeHandleConfig(v); this._renderBoxes(); }
   /** True while a finger (or the mouse) is MOVING, RESIZING or TURNING the selection — a drag,
    *  a knob, the ↘ button or a pinch — and, for a picture or signature, until the result is on
    *  the page. Reported by the `selectiongesture` event. @since 3.15.0 */
@@ -2937,6 +3440,7 @@ export class PdfeEditor {
   /** The knob config of what is selected now, the released switches applied (handleCfg). */
   _handleCfg(t) {
     const ap = this._appearance, tf = ap.transformHandleEnabled !== false, corners = ap.showCornerKnobs === true;
+    if (t && t.kind === "ink") return HandlePolicy.effective(this._drawingHandles, true, false, corners, tf);
     return t && t.kind === "image" ? HandlePolicy.effective(this._imageHandles, true, false, corners, tf)
       : HandlePolicy.effective(this._signatureHandles, this._signatureHandlesSet, true, corners, tf);
   }
@@ -3677,12 +4181,14 @@ export class PdfeEditor {
    * owns confirm policy, as it owns save). It IS undoable — see `undo()`.
    */
   deleteSelection() {
+    if (this._selectedInk) { this._deleteSelectedInk(); return; }
     if (this._selectedStamp) { this._deleteSelectedStamp(); return; }
     if (this._selectedMark) { this._deleteSelectedMark(); return; }
     if (this._selected || this._selectedImage) this._post({ type: "deleteSelected" });
   }
   /** Drop the selection (the tap-on-empty-space gesture) — a mark and page text too. */
   clearSelection() {
+    if (this._selectedInk) this._setSelectedInk(null);
     if (this._selectedMark) this._setSelectedMark(null);
     if (this._selectedStamp) this._setSelectedStamp(null);
     if (this._pageSel) this._clearPageSel();
@@ -4551,7 +5057,7 @@ export class PdfeEditor {
       selectedTextBoxText: this.selectedTextBoxText,
       imageSelection: this.imageSelection,
       imageRotateControl: this.imageRotateControl,
-      imageHandles: this.imageHandles, signatureHandles: this.signatureHandles,
+      imageHandles: this.imageHandles, signatureHandles: this.signatureHandles, drawingHandles: this.drawingHandles,
       imageDeleteControl: this.imageDeleteControl,
       capabilities: this.capabilities,
       documentName: this.documentName, documentBytes: this.documentBytes,
@@ -4566,6 +5072,11 @@ export class PdfeEditor {
       markupLineMinWidth: this.markupLineMinWidth,
       pageTextSelection: this.pageTextSelection, selectedMarkup: this.selectedMarkup,
       signatureTool: this.signatureTool, selectedSignature: this.selectedSignature,
+      // DR3 — drawing
+      drawingTool: this.drawingTool, drawingColor: this.drawingColor, drawingWidthDp: this.drawingWidthDp,
+      eraserWidthDp: this.eraserWidthDp, isDrawing: this.isDrawing, selectedDrawing: this.selectedDrawing,
+      textCheck: this.textCheck(),
+      textCheckState: this.textCheckState(), textCheckInProgress: this.textCheckInProgress,
     };
   }
   /** 0-based page the next undo would affect, or -1. Lets a host label the button. */
@@ -4711,6 +5222,83 @@ export class PdfeEditor {
       this._emit("scrollstate", { scrolling: false });
     }, 150);
     this._reportScroll();
+  }
+
+  // ---- TEXT CHECK (3.16.0, docs/api/text-check.md) ------------------------------------
+
+  /** Work the text check out as soon as a document opens (and send `textcheck`). Default
+   *  false. Set it before open(); a document already open is not checked. @since 3.16.0 */
+  get textCheckOnOpen() { return this._textCheckOnOpen; }
+  set textCheckOnOpen(v) { this._textCheckOnOpen = !!v; }
+
+  /** The text check's answer for the open document, `{ hasText }`, or null until it has been
+   *  worked out. Never touches the engine. @since 3.16.0 */
+  textCheck() { return this._textCheck ? { ...this._textCheck } : null; }
+
+  /** true from the moment a check starts until its answer or failure arrives. @since 3.16.0 */
+  get textCheckInProgress() { return !!this._textCheckWaiters; }
+
+  /** Where the text check stands: "checking" while one runs (forced ones too), else the saved
+   *  answer "hasText" / "noText", else "notChecked". Never touches the engine. @since 3.16.0 */
+  textCheckState() {
+    if (this._textCheckWaiters) return "checking";
+    if (!this._textCheck) return "notChecked";
+    return this._textCheck.hasText ? "hasText" : "noText";
+  }
+
+  /** Does the document have text a highlight can land on (visible text or a scan's OCR layer),
+   *  or only pictures? Resolves `{ hasText }`. The first call works it out in the worker; later
+   *  calls answer from the saved answer unless `force` is true. Rejects with a PdfeError
+   *  `no-document` or `superseded`. A NEW answer is also sent as `textcheck`. @since 3.16.0 */
+  checkText({ force = false } = {}) {
+    if (!this._pages || !this._pages.length) {
+      return Promise.reject(new PdfeError("no-document", "No document is open"));
+    }
+    if (this._textCheck && !force) return Promise.resolve({ ...this._textCheck });
+    return new Promise((resolve, reject) => {
+      if (this._textCheckWaiters) { this._textCheckWaiters.push({ resolve, reject }); return; }
+      this._textCheckWaiters = [{ resolve, reject }];
+      this._post({ type: "textCheck", gen: ++this._textCheckGen });
+    });
+  }
+
+  /** What page `page` (0-based) holds: "text" | "scanned" | "scannedWithOcr" | "noText", or
+   *  null when nothing is open or the page is out of range. Worked out in the worker each call.
+   *  @since 3.16.0 */
+  pageKind(page) {
+    const n = this._pages ? this._pages.length : 0;
+    if (!Number.isInteger(page) || page < 0 || page >= n) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      const seq = ++this._pageKindSeq;
+      this._pageKindWaiters.set(seq, resolve);
+      this._post({ type: "pageKind", seq, page });
+    });
+  }
+
+  _onTextChecked(msg) {
+    if (msg.gen !== this._textCheckGen || !this._textCheckWaiters) return;
+    const waiters = this._textCheckWaiters;
+    this._textCheckWaiters = null;
+    if (msg.error) {
+      for (const w of waiters) w.reject(new PdfeError(msg.error, msg.error === "superseded"
+        ? "A different document was opened before the text check finished" : "No document is open"));
+      return;
+    }
+    this._textCheck = { hasText: !!msg.hasText };
+    this._emit("textcheck", { ...this._textCheck });
+    for (const w of waiters) w.resolve({ ...this._textCheck });
+  }
+
+  /** A new document (or destroy): the saved answer and any running check named the old one. */
+  _resetTextCheck(code) {
+    this._textCheck = null;
+    this._textCheckGen++;
+    const waiters = this._textCheckWaiters;
+    this._textCheckWaiters = null;
+    for (const w of waiters || []) w.reject(new PdfeError(code, code === "superseded"
+      ? "A different document was opened before the text check finished" : "The editor was destroyed"));
+    for (const r of this._pageKindWaiters?.values() ?? []) r(null);
+    this._pageKindWaiters?.clear();
   }
 
   // ---- TEXT SEARCH (3.3.0) ------------------------------------------------------------
@@ -5005,6 +5593,7 @@ export class PdfeEditor {
   destroy() {
     if (this._destroyed) return;
     this._destroyed = true;
+    this._resetTextCheck("no-document");   // 3.16.0: nobody will answer a running check now
     try { this._io?.disconnect(); } catch (e) { /* already gone */ }
     try { this._resizeObs?.disconnect(); } catch (e) { /* already gone */ }
     clearTimeout(this._evictTimer);
@@ -5257,13 +5846,23 @@ export class PdfeEditor {
         break;
       }
       case "searchPage": this._onSearchPage(msg); break;
+      case "textChecked": this._onTextChecked(msg); break;
+      case "pageKindIs": {
+        const r = this._pageKindWaiters.get(msg.seq);
+        this._pageKindWaiters.delete(msg.seq);
+        if (r) r(PDFE_PAGE_KIND_NAMES[msg.kind] ?? null);
+        break;
+      }
       case "opened": {
         this._pages = msg.pages;
+        this._resetTextCheck("superseded");   // 3.16.0
         this._pageMatrices.clear();
         // Annotate state named the previous document's marks and text (the worker dropped
         // its snapshots in its own open). The mode and the armed tool survive, as on Android.
         this._pageMarks?.clear();
         this._pageStamps?.clear();
+        this._pageInks?.clear();
+        this._selectedInk = null;
         if (this._armedImage) this._setInsertArmed(null);   // an arm belongs to the document it was made on
         this._pageLinks?.clear();          // W6: links belong to the document they were read from
         this._linksAsked?.clear();
@@ -5287,6 +5886,8 @@ export class PdfeEditor {
         // The new document starts with no mark: inside a mode, "entered" is now (W2).
         this._markModeEntry();
         this._settle("open", true, info);
+        // 3.16.0: started BEFORE "opened", so a host reading textCheckState() there sees "checking".
+        if (this._textCheckOnOpen) this.checkText().catch(() => {});
         this._emit("opened", info);
         this._reportedScroll = undefined; this._reportedEdge = undefined;
         this._reportScroll();   // a reader is told where it starts: the top
@@ -6075,7 +6676,7 @@ export class PdfeEditor {
       // Canvases go BEFORE the overlay layers so overlays paint on top.
       this.strip.insertBefore(canvas, this.boxesEl);
       this._pageCanvases[i] = canvas;
-      if (this._dragSelects()) canvas.style.touchAction = "none";
+      if (this._dragSelects() || this._draws("touch")) canvas.style.touchAction = "none";
       // One-time ownership transfer; from here the WORKER draws (§2).
       const off = canvas.transferControlToOffscreen();
       this._post({ type: "attach", page: i, canvas: off }, [off]);
@@ -6253,6 +6854,7 @@ export class PdfeEditor {
       if (this._mode === "annotate") {
         this._renderSelectedMark(this._k(this._selectedMark?.page));
         this._renderSelectedStamp(this._k(this._selectedStamp?.page));
+        this._renderSelectedInk(this._k(this._selectedInk?.page));
         this._renderItemHandles();
         this._liveSchedulePrefetch();
       }
@@ -7442,6 +8044,10 @@ export class PdfeEditor {
 PdfeEditor._HandlePolicy = HandlePolicy;
 // …and the pinch's rules + the zoom config's corrections, for web/sdk/reader_test.mjs.
 PdfeEditor._PinchZoom = PinchZoom;
+/** DR3: the shell's ink hit test (pdfe_ink_distance's rule in JS), for web/sdk/drawing_test.mjs. */
+PdfeEditor._inkHit = inkHit;
+PdfeEditor._inkDistance = inkDistance;
+PdfeEditor._inkBoxMatrix = inkBoxMatrix;
 PdfeEditor._normalizeZoomConfig = normalizeZoomConfig;
 
 export default PdfeEditor;

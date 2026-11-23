@@ -145,6 +145,9 @@ const ready = createPdfe({
   // W6 (reader R2): the page's /Link annotations and a link's web address.
   F.links   = m.cwrap("pdfe_links", "number", ["number", "number", "number", "number", "number", "number"]);
   F.linkUri = m.cwrap("pdfe_link_uri", "number", ["number", "number", "number", "number", "number"]);
+  // TEXT CHECK (3.16.0): the first page a highlight can land on, and one page's kind
+  F.findTextPage  = m.cwrap("pdfe_find_text_page", "number", ["number", "number", "number"]);
+  F.pageKind      = m.cwrap("pdfe_page_kind", "number", ["number", "number"]);
   F.findOnPage    = m.cwrap("pdfe_find_on_page", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.markupQuads   = m.cwrap("pdfe_markup_quads_for_range", "number",
@@ -166,6 +169,8 @@ const ready = createPdfe({
   F.markupStructSize = m.cwrap("pdfe_markup_struct_size", "number", []);
   F.markupSpecSize = m.cwrap("pdfe_markup_spec_size", "number", []);
   F.markupUndoPage = m.cwrap("pdfe_markup_undo_page", "number", ["number"]);
+  F.markupUndoKind = m.cwrap("pdfe_markup_undo_kind", "number", ["number"]);
+  F.markupRedoKind = m.cwrap("pdfe_markup_redo_kind", "number", ["number"]);
   F.markupRedoPage = m.cwrap("pdfe_markup_redo_page", "number", ["number"]);
   F.markupUndo    = m.cwrap("pdfe_markup_undo", "number",
     ["number", "number", "number", "number", "number", "number"]);
@@ -212,6 +217,19 @@ const ready = createPdfe({
   F.stampAddPreparedPicture = m.cwrap("pdfe_stamp_add_prepared_picture", "number",
     ["number", "number", "number", "number"]);
   F.picturePrepare = m.cwrap("pdfe_picture_prepare", "number", ["number", "number", "number", "number", "number"]);
+  // DRAWING (DR3 = the core's pdfe_ink_*, docs/annotations/19-DRAWING.md).
+  F.inkStructSize = m.cwrap("pdfe_ink_struct_size", "number", []);
+  F.inkSpecSize = m.cwrap("pdfe_ink_spec_size", "number", []);
+  F.inkCount = m.cwrap("pdfe_ink_count", "number", ["number", "number"]);
+  F.inkInfo = m.cwrap("pdfe_ink_info", "number", ["number", "number", "number", "number"]);
+  F.inkName = m.cwrap("pdfe_ink_name", "number", ["number", "number", "number", "number", "number"]);
+  F.inkPath = m.cwrap("pdfe_ink_path", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkCreate = m.cwrap("pdfe_ink_create", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkDelete = m.cwrap("pdfe_ink_delete", "number", ["number", "number", "number", "number"]);
+  F.inkTransform = m.cwrap("pdfe_ink_transform", "number", ["number", "number", "number", "number", "number", "number"]);
+  F.inkSetStyle = m.cwrap("pdfe_ink_set_style", "number", ["number", "number", "number", "number", "number", "number", "number"]);
+  F.inkErase = m.cwrap("pdfe_ink_erase", "number", ["number", "number", "number", "number", "number", "number", "number"]);
+  F.inkSmooth = m.cwrap("pdfe_ink_smooth", "number", ["number", "number", "number", "number", "number", "number"]);
   F.pictureFree = m.cwrap("pdfe_picture_free", null, ["number"]);
   F.markupUndoOtherPage = m.cwrap("pdfe_markup_undo_other_page", "number", ["number"]);
   F.markupRedoOtherPage = m.cwrap("pdfe_markup_redo_other_page", "number", ["number"]);
@@ -409,6 +427,23 @@ function findOnPage(page, query, flags) {
   }
   mod._free(qp);
   return hits;
+}
+
+// TEXT CHECK (3.16.0, docs/api/text-check.md): slices of 16 pages, yielding between them so
+// renders and edits are never held up; stops at the first page with text. A document replaced
+// meanwhile ends it as `superseded` (the editor drops it when it already said so at "opened").
+async function runTextCheck(msg) {
+  const d = doc, n = d ? F.pageCount(d) : 0;
+  for (let from = 0; d && from < n; from += 16) {
+    if (from) await new Promise((r) => setTimeout(r, 0));
+    if (doc !== d) break;
+    const r = F.findTextPage(d, from, 16);
+    if (r >= 0) { postMessage({ type: "textChecked", gen: msg.gen, hasText: true }); return; }
+    if (r !== -1) break;
+  }
+  postMessage(!d ? { type: "textChecked", gen: msg.gen, error: "no-document" }
+    : doc !== d ? { type: "textChecked", gen: msg.gen, error: "superseded" }
+    : { type: "textChecked", gen: msg.gen, hasText: false });
 }
 
 async function runSearch(msg) {
@@ -2734,6 +2769,7 @@ function applyMarkupHistory(kind) {
   const page = undo ? F.markupUndoPage(doc) : F.markupRedoPage(doc);
   if (page < 0) { postHistory(true); return; }
   const otherPage = undo ? F.markupUndoOtherPage(doc) : F.markupRedoOtherPage(doc);
+  const stepKind = undo ? F.markupUndoKind(doc) : F.markupRedoKind(doc);   // 2 = an INK step (DR3)
   const pg = acquirePage(page);
   const rect = mod._malloc(16), nmBuf = mod._malloc(128), pres = mod._malloc(4);
   const code = (undo ? F.markupUndo : F.markupRedo)(doc, pg, rect, nmBuf, 128, pres);
@@ -2758,10 +2794,10 @@ function applyMarkupHistory(kind) {
   if (twoPages) {
     acquirePage(otherPage);
     renderDirtyStrip(otherPage, [0, 0, pages[otherPage].w, pages[otherPage].h]);
-    other = { page: otherPage, marks: readMarkups(otherPage), stamps: readStamps(otherPage) };
+    other = { page: otherPage, marks: readMarkups(otherPage), stamps: readStamps(otherPage), inks: readInks(otherPage) };
   }
   postMessage({ type: "markupHistoryApplied", kind, page, ok: code > 0, code, nm, present,
-                focus: r, marks: readMarkups(page), stamps: readStamps(page), other });
+                stepKind, focus: r, marks: readMarkups(page), stamps: readStamps(page), inks: readInks(page), other });
   postHistory(true);
 }
 
@@ -2827,7 +2863,7 @@ function rewindToMark(journal) {
     acquirePage(p);
     renderDirtyStrip(p, [0, 0, pages[p].w, pages[p].h]);
     out.push(text ? { page: p, blocks: groupPage(p), images: cachedImages(p) }
-                  : { page: p, marks: readMarkups(p) });
+                  : { page: p, marks: readMarkups(p), inks: readInks(p) });
   }
   markPinned.clear(); markPinning = false;
   postMessage({ type: "discarded", journal, kind, wanted: Math.abs(steps), done,
@@ -2869,6 +2905,132 @@ function readStamps(page) {
   }
   mod._free(buf); mod._free(tb);
   return out;
+}
+
+// ---- DRAWING (DR3 = the core's pdfe_ink_*; 19-DRAWING.md) ----------------------------------
+
+/** Every ink on |page|: {index, flags, foreign, annotIndex, rect, widthPt, color, colorKnown, nm,
+ *  paths} — the shell hit-tests a stroke by its points (pdfe_ink_distance's rule, in JS). */
+function readInks(page) {
+  if (!doc || page < 0 || page >= pages.length) return [];
+  if (F.inkStructSize() !== 40) throw new Error("PdfeInk layout changed");
+  const pg = acquirePage(page);
+  const n = F.inkCount(doc, pg);
+  if (n <= 0) return [];
+  const buf = mod._malloc(40);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    if (!F.inkInfo(doc, pg, i, buf)) continue;
+    const o = buf >> 2;
+    const flags = hI32()[o], annotIndex = hI32()[o + 1], pathCount = hI32()[o + 2];
+    const rect = Array.from(hF32().subarray(o + 4, o + 8));
+    const widthPt = hF32()[o + 8], color = hU32()[o + 9] >>> 0;
+    const len = F.inkName(doc, pg, i, 0, 0);
+    let nm = null;
+    if (len > 1) {
+      const nb = mod._malloc(len);
+      F.inkName(doc, pg, i, nb, len);
+      nm = new TextDecoder().decode(mod.HEAPU8.slice(nb, nb + len - 1));
+      mod._free(nb);
+    }
+    const paths = [];
+    for (let k = 0; k < pathCount; k++) {
+      const c = F.inkPath(doc, pg, i, k, 0, 0);
+      if (c <= 0) { paths.push([]); continue; }
+      const pp = mod._malloc(c * 8);
+      F.inkPath(doc, pg, i, k, pp, c);
+      paths.push(Array.from(hF32().subarray(pp >> 2, (pp >> 2) + c * 2)));
+      mod._free(pp);
+    }
+    out.push({ index: i, flags, foreign: (flags & 1) !== 0, annotIndex, rect, widthPt, color,
+               colorKnown: (flags & 8) === 0, nm, paths });
+  }
+  mod._free(buf);
+  return out;
+}
+
+/** The finger's path (page points), smoothed by THE core rule, written as one ink. */
+function inkCreate(msg) {
+  if (F.inkSpecSize() !== 32) throw new Error("PdfeInkSpec layout changed");
+  const raw = (msg.points || []).map(Number);
+  const n = raw.length >> 1;
+  const pg = acquirePage(msg.page);
+  let nm = "", ok = 0;
+  const dirty = mod._malloc(16);
+  if (n >= 1) {
+    const ip = mod._malloc(n * 8);
+    hF32().set(raw.slice(0, n * 2), ip >> 2);
+    const m = F.inkSmooth(ip, n, msg.minDistPt, msg.pieceLenPt, 0, 0);
+    const sp = mod._malloc(m * 8);
+    F.inkSmooth(ip, n, msg.minDistPt, msg.pieceLenPt, sp, m);
+    const cp = mod._malloc(4), spec = mod._malloc(32), out = mod._malloc(64);
+    hI32()[cp >> 2] = m;
+    const ap = msg.author ? (() => { const b = new TextEncoder().encode(msg.author + "\0");
+      const p = mod._malloc(b.length); mod.HEAPU8.set(b, p); return p; })() : 0;
+    const o = spec >> 2;
+    hU32()[o] = sp; hU32()[o + 1] = cp; hI32()[o + 2] = 1; hF32()[o + 3] = msg.widthPt;
+    hU32()[o + 4] = Number(msg.color) >>> 0; hU32()[o + 5] = 0; hU32()[o + 6] = ap; hU32()[o + 7] = 0;
+    ok = F.inkCreate(doc, pg, spec, out, 64, dirty);
+    if (ok) nm = cstr(out);
+    for (const p of [ip, sp, cp, spec, out, ap]) if (p) mod._free(p);
+  }
+  const r = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  postMessage({ type: "inkChanged", op: "create", page: msg.page, ok: !!ok, nm, inks: readInks(msg.page) });
+  postHistory(true);
+}
+
+/** One eraser pass; replies which inks it changed and which it deleted (by /NM). */
+function inkErase(msg) {
+  const before = readInks(msg.page);
+  const raw = (msg.points || []).map(Number);
+  const n = raw.length >> 1;
+  const pg = acquirePage(msg.page);
+  const ep = mod._malloc(Math.max(1, n) * 8), dirty = mod._malloc(16);
+  hF32().set(raw.slice(0, n * 2), ep >> 2);
+  const flags = (msg.whole ? 1 : 0) | (msg.foreign ? 2 : 0);
+  const done = n >= 1 ? F.inkErase(doc, pg, ep, n, msg.radiusPt, flags, dirty) : 0;
+  const r = readF32(dirty, 4);
+  mod._free(ep); mod._free(dirty);
+  if (done > 0) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  const inks = readInks(msg.page);
+  const now = new Map(inks.map((k) => [k.nm, k]));
+  const deleted = [], changed = [];
+  for (const b of before) {
+    if (!b.nm) continue;
+    const a = now.get(b.nm);
+    if (!a) deleted.push(b.nm);
+    else if (a.annotIndex !== b.annotIndex || a.paths.length !== b.paths.length) changed.push(b.nm);
+  }
+  postMessage({ type: "inkChanged", op: "erase", page: msg.page, ok: done >= 0, count: done,
+                changed: done > 0 ? changed : [], deleted: done > 0 ? deleted : [], inks });
+  postHistory(true);
+}
+
+/** Delete / move-resize / restyle one ink by /NM; replies "inkChanged". */
+function inkOp(msg) {
+  const pg = acquirePage(msg.page);
+  const dirty = mod._malloc(16);
+  let ok = 0;
+  withUtf8(msg.nm || "", (np) => {
+    if (msg.type === "inkDelete") ok = F.inkDelete(doc, pg, np, dirty);
+    else if (msg.type === "inkTransform") {
+      const mp = mod._malloc(24);
+      hF32().set(msg.m.map(Number), mp >> 2);
+      ok = F.inkTransform(doc, pg, np, mp, msg.scaleWidth ? 1 : 0, dirty);
+      mod._free(mp);
+    } else {
+      ok = F.inkSetStyle(doc, pg, np, msg.what | 0, Number(msg.color ?? 0) >>> 0, Number(msg.widthPt ?? 0), dirty);
+    }
+  });
+  const r = readF32(dirty, 4);
+  mod._free(dirty);
+  if (ok) { noteMutation(msg.page); repaintRect(msg.page, r); }
+  const op = msg.type === "inkDelete" ? "delete" : msg.type === "inkTransform" ? "transform" : "style";
+  postMessage({ type: "inkChanged", op, page: msg.page, ok: !!ok, nm: msg.nm, what: msg.what | 0,
+                change: msg.change || null, inks: readInks(msg.page) });
+  postHistory(true);
 }
 
 /** A handwriting face is LOADED (never registered — text editing can never pick it), once per
@@ -3043,13 +3205,16 @@ function handleAnnotateMessage(msg) {
     case "stampSetRect": case "stampDelete": case "stampRotate": case "stampTransform": stampOp(msg); return true;
     case "stampLimits": stampLimits(msg); return true;
     case "stampMoveToPage": stampMoveToPage(msg); return true;
+    case "inkCreate": if (doc) inkCreate(msg); return true;
+    case "inkErase": if (doc) inkErase(msg); return true;
+    case "inkDelete": case "inkTransform": case "inkStyle": if (doc) inkOp(msg); return true;
     case "annotateReset":          // a mode change: every snapshot is re-taken on demand
       dropAllTextModels();
       pageSel = null;
       return true;
     case "marks":
       if (doc) postMessage({ type: "marks", page: msg.page, marks: readMarkups(msg.page),
-                             stamps: readStamps(msg.page), matrix: pageMatrix(msg.page) });
+                             stamps: readStamps(msg.page), inks: readInks(msg.page), matrix: pageMatrix(msg.page) });
       return true;
     case "pageSelPress": {
       if (!doc) return true;
@@ -4183,6 +4348,11 @@ onmessage = async (e) => {
     return;
   }
   if (msg.type === "links") { postMessage({ type: "links", page: msg.page, links: pageLinks(msg.page) }); return; }
+  if (msg.type === "textCheck") { await runTextCheck(msg); return; }
+  if (msg.type === "pageKind") {
+    postMessage({ type: "pageKindIs", seq: msg.seq, kind: doc ? F.pageKind(doc, msg.page | 0) : -1 });
+    return;
+  }
   if (msg.type === "search") {
     searchGen = msg.gen;
     await runSearch(msg);

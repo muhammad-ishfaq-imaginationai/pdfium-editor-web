@@ -69,7 +69,8 @@ function bridgeSignature(sig) {
 // The page-selection switches setSelectionOptions takes (W3) — PdfeEditorView's names.
 const SELECTION_BOOLS = ["viewTextSelectionEnabled", "viewSelectionMenuEnabled",
   "annotateTextSelectionEnabled", "annotateSelectionMenuEnabled", "markupOnSelectionEnd",
-  "markupOnToolPick", "annotateDragSelectEnabled"];
+  "markupOnToolPick", "annotateDragSelectEnabled", "newSelectionDeselectsAnnotation",
+  "tapKeepsAnnotationSelected"];
 
 export function attachNativeHost(editor, opts = {}) {
   const send = detectTransport(opts.handlerName || "pdfe");
@@ -135,6 +136,9 @@ export function attachNativeHost(editor, opts = {}) {
                     // W4: signatures — the pick (turning off too), the start and end of a
                     // placement, and the WHICH of a delete.
                     "signaturetool", "signatureplacing", "signatureplaced", "signaturedeleted",
+                    // DR3: drawing — the tool (and its colour / width), each stroke's start and
+                    // end, and what a stroke, an eraser pass, a move or a restyle did.
+                    "drawingtool", "drawingstroke", "drawingcreated", "drawingchanged", "drawingdeleted",
                     // W5a: a picture armed for the next tap, or the arm spent / dropped.
                     "imageinserting",
                     // W5c: a finger moves / resizes / turns the selection (and when it is over).
@@ -152,7 +156,9 @@ export function attachNativeHost(editor, opts = {}) {
                     // The reader (3.3.0): where it is, its scroll state, the ends, a reading tap.
                     "scroll", "scrollstate", "scrolledge", "pagetap",
                     // Text search (3.3.0): the whole snapshot on every change.
-                    "search"]) {
+                    "search",
+                    // The text check (3.16.0): a NEW answer, { hasText }.
+                    "textcheck"]) {
     // "select" carries WHERE the selection is on screen too (3.3.0), so a native shell
     // that turned the SDK's bar off (setActionBarEnabled) can put its own buttons there.
     // "pagelongpress" carries the press ON SCREEN and "pagetextselection" the selection's
@@ -495,10 +501,10 @@ export function attachNativeHost(editor, opts = {}) {
       return { markupLineRatio: editor.markupLineRatio, markupLineMinWidth: editor.markupLineMinWidth };
     },
     /**
-     * The page-selection switches and the words menu, by name — any subset: the seven booleans
+     * The page-selection switches and the words menu, by name — any subset: the nine booleans
      * (viewTextSelectionEnabled, viewSelectionMenuEnabled, annotateTextSelectionEnabled,
      * annotateSelectionMenuEnabled, markupOnSelectionEnd, markupOnToolPick,
-     * annotateDragSelectEnabled), `selectionMenuItems` (ids) and the per-mode button lists
+     * annotateDragSelectEnabled, newSelectionDeselectsAnnotation, tapKeepsAnnotationSelected), `selectionMenuItems` (ids) and the per-mode button lists
      * `viewSelectionMenuActions` / `annotateSelectionMenuActions` ([{id, label?, icon?}] or
      * null). The menu LAYOUTS are DOM elements and so web-only. Returns every value as it stands.
      */
@@ -558,16 +564,19 @@ export function attachNativeHost(editor, opts = {}) {
     selectionGeometry: () => ({ corners: editor.selectionScreenCorners, topAnchor: editor.selectionTopAnchor,
                                 angle: editor.selectionAngle, canRotate: editor.canRotateSelection }),
     /**
-     * W5c: the knobs of a selected picture and/or signature — `{imageHandles, signatureHandles}`,
+     * W5c: the knobs of a selected picture, signature and/or drawing (3.16.0) —
+     * `{imageHandles, signatureHandles, drawingHandles}`,
      * either may be left out. Each is a PdfeHandleConfig object: `corners`, `edges`,
      * `cornerButton`, `pinch` ("none" | "resize" | "rotate" | "resizeAndRotate" | "stretch"),
      * `cornerStyle`, `edgeStyle`, `knobs` ({topLeft: {job, filled, fillColor, …}, …}).
      * Replies both as they stand (cleaned).
      */
-    setSelectionHandles: ({ imageHandles, signatureHandles } = {}) => {
+    setSelectionHandles: ({ imageHandles, signatureHandles, drawingHandles } = {}) => {
       if (imageHandles !== undefined) editor.imageHandles = imageHandles;
       if (signatureHandles !== undefined) editor.signatureHandles = signatureHandles;
+      if (drawingHandles !== undefined) editor.drawingHandles = drawingHandles;
       return { imageHandles: editor.imageHandles, signatureHandles: editor.signatureHandles,
+               drawingHandles: editor.drawingHandles,
                isSelectionGestureActive: editor.isSelectionGestureActive };
     },
     /**
@@ -596,6 +605,29 @@ export function attachNativeHost(editor, opts = {}) {
                signatureToolSelectsExisting: editor.signatureToolSelectsExisting };
     },
     pageToScreen: ({ page, xPt, yPt } = {}) => ({ point: editor.pageToScreen(Number(page), Number(xPt), Number(yPt)) }),
+
+    // ---- DRAWING (DR3, vocabulary §25) --------------------------------------
+    /** Pick up "pen" or "eraser", or put it down with null. Replies the tool state. */
+    setDrawingTool: ({ tool = null } = {}) => {
+      editor.setDrawingTool(tool ?? null);
+      return { drawingTool: editor.drawingTool };
+    },
+    /** Any subset of `color`, `widthDp`, `eraserWidthDp`, `eraserCutsStrokes`, `drawingStylusOnly`,
+     *  `otherAppInkEditable`. Replies all of them as they stand. */
+    setDrawingOptions: (o = {}) => {
+      if ("color" in o) editor.setDrawingColor(o.color);
+      if ("widthDp" in o) editor.setDrawingWidth(Number(o.widthDp));
+      if ("eraserWidthDp" in o) editor.eraserWidthDp = Number(o.eraserWidthDp);
+      for (const k of ["eraserCutsStrokes", "drawingStylusOnly", "otherAppInkEditable"]) if (k in o) editor[k] = !!o[k];
+      return { drawingTool: editor.drawingTool, color: editor.drawingColor, widthDp: editor.drawingWidthDp,
+               eraserWidthDp: editor.eraserWidthDp, eraserCutsStrokes: editor.eraserCutsStrokes,
+               drawingStylusOnly: editor.drawingStylusOnly, otherAppInkEditable: editor.otherAppInkEditable };
+    },
+    /** Restyle the selected drawing: `{color?, widthPt?}` (one undo step). Replies `{selectedDrawing}`. */
+    setSelectedDrawingStyle: ({ color, widthPt } = {}) => {
+      editor.setSelectedDrawingStyle({ color, widthPt });
+      return { selectedDrawing: editor.selectedDrawing };
+    },
 
     // ---- ADD TEXT (docs/ADD_TEXT.md) ---------------------------------------
     // Placing a NEW text box where the document has none. An ARMED mode, so this is
@@ -672,6 +704,13 @@ export function attachNativeHost(editor, opts = {}) {
     goToNextResult: () => ({ ok: editor.goToNextResult(), search: editor.searchState() }),
     goToPreviousResult: () => ({ ok: editor.goToPreviousResult(), search: editor.searchState() }),
     clearSearch: () => { editor.clearSearch(); return { ok: true }; },
+    // The text check (3.16.0, docs/api/text-check.md). Off by default.
+    setTextCheckOnOpen: ({ enabled } = {}) => { editor.textCheckOnOpen = enabled === true; return { textCheckOnOpen: editor.textCheckOnOpen }; },
+    /** { hasText } — saved after the first time; `force: true` works it out again. Fails with
+     *  `no-document` or `superseded`. A NEW answer also arrives as the `textcheck` event. */
+    checkText: async ({ force } = {}) => editor.checkText({ force: force === true }),
+    /** { kind }: "text" | "scanned" | "scannedWithOcr" | "noText", or null (out of range). */
+    pageKind: async ({ page } = {}) => ({ kind: await editor.pageKind(Number(page)) }),
     /** Deprecated alias kept for shells built against the older bridge. */
     scrollToPage: ({ page }) => ({ ok: editor.goToPage(Number(page)), page: editor.currentPage }),
 

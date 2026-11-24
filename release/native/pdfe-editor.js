@@ -82,6 +82,9 @@ const PDFE_CSS = `
   min-width: max-content;
 }
 .pdfe-strip canvas { background: #fff; box-shadow: 0 1px 6px rgba(0,0,0,.45); display: block; }
+/* The live pen / eraser trail is a canvas in the strip too: it must stay see-through, or the page
+   under it goes white for the whole stroke (3.16.0 report). */
+.pdfe-strip canvas.pdfe-drawlive { background: transparent; box-shadow: none; }
 .pdfe-layer { position: absolute; left: 0; top: 0; }
 /* W6, the reader: NIGHT MODE inverts the pages as drawn (the document is untouched), and a
    locked scroll keeps the pages still while pinch and taps still work. */
@@ -1381,6 +1384,39 @@ export class PdfeEditor {
    * included in any event payload.
    */
   async open(source, opts = {}) {
+    // 3.17.0: `opening` is true from this call until the LATEST open answers — after
+    // `opened` / `error`, before the caller's await resumes.
+    const tok = this._openTok = (this._openTok || 0) + 1;
+    this._setOpening(true);
+    try { return await this._open(source, opts); }
+    finally { if (tok === this._openTok) this._setOpening(false); }
+  }
+
+  /** true from an open() call until that open (the latest one) answers. Never touches the
+   *  engine. Reported by the `opening` event. @since 3.17.0 */
+  get opening() { return !!this._opening; }
+
+  /** true while a save() or an exportFlattened() is writing. The `saving` event says which
+   *  kind ("save" / "export") started or ended. Never touches the engine. @since 3.17.0 */
+  get saving() { return ((this._writes?.save || 0) + (this._writes?.export || 0)) > 0; }
+
+  _setOpening(on) {
+    if (!!this._opening === on) return;
+    this._opening = on;
+    this._emit("opening", { opening: on });
+  }
+
+  /** Count promise `p` as a write of `kind` until it settles (superseded included). */
+  _trackWrite(kind, p) {
+    this._writes ??= { save: 0, export: 0 };
+    if (this._writes[kind]++ === 0) this._emit("saving", { saving: true, kind });
+    return p.finally(() => {
+      if (this._destroyed || this._writes[kind] === 0) return;
+      if (--this._writes[kind] === 0) this._emit("saving", { saving: false, kind });
+    });
+  }
+
+  async _open(source, opts) {
     await this._readyPromise;
     let blob = source;
     if (typeof source === "string") {
@@ -1472,7 +1508,7 @@ export class PdfeEditor {
           { sizeMB, limitMB });
       }
     }
-    const p = this._promiseFor("save");
+    const p = this._trackWrite("save", this._promiseFor("save"));
     this._post({ type: "save", forceInHeap });
     return p;
   }
@@ -1504,7 +1540,7 @@ export class PdfeEditor {
         "the copy is made in memory and the document is over the in-heap ceiling",
         { sizeMB, limitMB });
     }
-    const p = this._promiseFor("exportFlattened");
+    const p = this._trackWrite("export", this._promiseFor("exportFlattened"));
     this._post({ type: "exportFlattened" });
     return p;
   }
@@ -5077,6 +5113,7 @@ export class PdfeEditor {
       eraserWidthDp: this.eraserWidthDp, isDrawing: this.isDrawing, selectedDrawing: this.selectedDrawing,
       textCheck: this.textCheck(),
       textCheckState: this.textCheckState(), textCheckInProgress: this.textCheckInProgress,
+      opening: this.opening, saving: this.saving,   // 3.17.0
     };
   }
   /** 0-based page the next undo would affect, or -1. Lets a host label the button. */
@@ -5594,6 +5631,7 @@ export class PdfeEditor {
     if (this._destroyed) return;
     this._destroyed = true;
     this._resetTextCheck("no-document");   // 3.16.0: nobody will answer a running check now
+    this._opening = false; this._writes = { save: 0, export: 0 };   // 3.17.0: nothing more is reported
     try { this._io?.disconnect(); } catch (e) { /* already gone */ }
     try { this._resizeObs?.disconnect(); } catch (e) { /* already gone */ }
     clearTimeout(this._evictTimer);

@@ -1,9 +1,9 @@
 {
-  "sdk_source_commit": "20a5a31",
-  "built_utc": "2026-11-23T14:42:55Z",
+  "sdk_source_commit": "0dcef42",
+  "built_utc": "2026-11-24T10:35:33Z",
   "pdfium_source_commit": "c2c971ad689436f3c36009603b4aa7dac9cacf21",
   "engine_wasm_sha256_16": "49848f920fc1900c",
   "entry": "pdfe-editor.js",
   "native_entry": "host.html",
-  "sdk_version": "3.16.0"
+  "sdk_version": "3.17.0"
 }

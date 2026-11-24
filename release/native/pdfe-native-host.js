@@ -158,7 +158,9 @@ export function attachNativeHost(editor, opts = {}) {
                     // Text search (3.3.0): the whole snapshot on every change.
                     "search",
                     // The text check (3.16.0): a NEW answer, { hasText }.
-                    "textcheck"]) {
+                    "textcheck",
+                    // 3.17.0: a file is opening { opening }; a save / export is writing { saving, kind }.
+                    "opening", "saving"]) {
     // "select" carries WHERE the selection is on screen too (3.3.0), so a native shell
     // that turned the SDK's bar off (setActionBarEnabled) can put its own buttons there.
     // "pagelongpress" carries the press ON SCREEN and "pagetextselection" the selection's

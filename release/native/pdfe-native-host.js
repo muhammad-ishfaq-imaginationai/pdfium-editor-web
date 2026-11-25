@@ -153,6 +153,8 @@ export function attachNativeHost(editor, opts = {}) {
                     // What an app's own chrome follows (3.3.0): the selection's place on
                     // screen, and the keyboard (the SDK's typing target focused or not).
                     "selectionrect", "keyboard",
+                    // 3.18.0: where the SDK put its bar, so an app draws its own pointer.
+                    "barpositioned",
                     // The reader (3.3.0): where it is, its scroll state, the ends, a reading tap.
                     "scroll", "scrollstate", "scrolledge", "pagetap",
                     // Text search (3.3.0): the whole snapshot on every change.

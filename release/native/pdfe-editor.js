@@ -207,8 +207,8 @@ const PDFE_CSS = `
    edge that faces the item, under the item's middle. */
 .pdfe-barptr { position: absolute; width: 0; height: 0; pointer-events: none;
                border-left: 7px solid transparent; border-right: 7px solid transparent; }
-.pdfe-barptr.pdfe-down { top: 100%; border-top: 7px solid var(--pdfe-bar-bg, #fff); filter: drop-shadow(0 2px 1px #0003); }
-.pdfe-barptr.pdfe-up { bottom: 100%; border-bottom: 7px solid var(--pdfe-bar-bg, #fff); filter: drop-shadow(0 -2px 1px #0003); }
+.pdfe-barptr.pdfe-down { top: 100%; border-top: 7px solid var(--pdfe-bar-bg, #fff); }
+.pdfe-barptr.pdfe-up { bottom: 100%; border-bottom: 7px solid var(--pdfe-bar-bg, #fff); }
 /* W7b: the MAGNIFIER (PdfeAppearance.magnifier*) — a loupe over the page under the finger while
    a finger drags a selection knob, the caret thumb or a drag-selection. Touch only, as on Android. */
 .pdfe-loupe { position: absolute; z-index: 6; display: none; pointer-events: none; background: #fff; overflow: hidden; }
@@ -2669,10 +2669,23 @@ export class PdfeEditor {
     const v = this._viewBox(s.page, s.bounds);
     const left = rect.left + v.left * k, top = rect.top + v.top * k, bot = top + v.height * k;
     const bw = el.offsetWidth, bh = el.offsetHeight;
-    let y = top - bh - 8;
-    if (y < rect.top) y = bot + 8;
-    el.style.left = `${Math.max(rect.left, Math.min(left, rect.left + rect.width - bw))}px`;
+    // The SDK's own menu has the bar's pointer (part of it, one colour, no shadow) and is then
+    // centred over the words; the app's own menu draws its own from "barpositioned".
+    const ptr = !host && this._appearance.barPointer !== false, gap = 8 + (ptr ? 7 : 0);
+    const cx = left + v.width * k / 2;
+    let y = top - bh - gap;
+    const below = y < rect.top;
+    if (below) y = bot + gap;
+    const x = Math.max(rect.left, Math.min(ptr ? cx - bw / 2 : left, rect.left + rect.width - bw));
+    el.style.left = `${x}px`;
     el.style.top = `${y}px`;
+    this._reportBarPlace(el, "pagetext", below, x, y, bw, cx);
+    if (!this.menuPtrEl) this.menuPtrEl = this.barPtrEl.cloneNode();
+    const p = this.menuPtrEl;
+    if (!ptr) { p.remove(); return; }
+    if (p.parentNode !== el) el.appendChild(p);
+    p.className = `pdfe-barptr ${below ? "pdfe-up" : "pdfe-down"}`;
+    p.style.left = `${Math.min(Math.max(cx - x - 7, 10), Math.max(10, bw - 24))}px`;
   }
 
   /** A menu button: the app is asked first (`action`, then for the five built-ins
@@ -7086,6 +7099,17 @@ export class PdfeEditor {
     this._ghostDelta = null;
   }
 
+  /** "barpositioned" when the bar's place changed (PdfeEditorView.reportBarPlace): anchorX in the
+   *  bar's own px under the item's middle, kept inside its corners. */
+  _reportBarPlace(bar, kind, below, left, top, bw, itemCx) {
+    const corner = this._appearance.barCornerRadiusDp ?? 8;
+    const anchorX = Math.min(Math.max(itemCx - left, Math.min(corner, bw / 2)), Math.max(bw / 2, bw - corner));
+    const key = `${bar === this.actionsEl}|${kind}|${below}|${left}|${top}|${anchorX}`;
+    if (key === this._barPlaceKey) return;
+    this._barPlaceKey = key;
+    this._emit("barpositioned", { kind, below, anchorX });
+  }
+
   /** Park the Edit/Delete bar just above the selected box (below it when the
    *  box is at the page top), clamped to the page's own width. */
   _placeActions(page, b, scaleCss) {
@@ -7110,7 +7134,9 @@ export class PdfeEditor {
     // W7b (PdfeEditorView.positionBar): with barPointer (Android's default since 3.11.0) the bar is
     // CENTRED over the item and a pointer under the item's middle aims at it; the gap is 8 + the
     // pointer + the item's knobs (selectedKnobReach), or exactly barGapDp when the host set one.
-    const ap = this._appearance, ptr = ap.barPointer !== false;
+    const ap = this._appearance, centred = ap.barPointer !== false;
+    // The pointer is part of the SDK's own bar only; the app's bar draws its own (barpositioned).
+    const ptr = centred && !this._actionBarElement;
     let itemTop = boxTop, itemBot = boxBot, itemCx = boxLeft + v.width * scaleCss / 2;
     const t = this._transformTarget(), c = t && t.page === page && this._itemCorners(t);
     if (c) {   // a turned picture/signature: its own corners, not its bounding rect
@@ -7125,9 +7151,10 @@ export class PdfeEditor {
     const below = top < rect.top;
     if (below) top = itemBot + gap;
     const maxLeft = rect.left + rect.width - bw;
-    const left = Math.max(rect.left, Math.min(ptr ? itemCx - bw / 2 : boxLeft, maxLeft));
+    const left = Math.max(rect.left, Math.min(centred ? itemCx - bw / 2 : boxLeft, maxLeft));
     bar.style.left = `${left}px`;
     bar.style.top = `${top}px`;
+    this._reportBarPlace(bar, (this._actionsKey || "").split("|")[0], below, left, top, bw, itemCx);
     const p = this.barPtrEl;
     if (!ptr) { p.remove(); return; }
     if (p.parentNode !== bar) bar.appendChild(p);

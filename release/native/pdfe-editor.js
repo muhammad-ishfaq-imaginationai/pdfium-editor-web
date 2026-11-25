@@ -1857,11 +1857,8 @@ export class PdfeEditor {
     if (!sel) return;
     const argb = parseArgb(color);
     if (argb === null) return;
-    if (!sel.mark.nm) {
-      this._emit("error", errorEvent("markup-not-found", "This mark has no name in the file, so it cannot be recoloured"));
-      return;
-    }
-    this._post({ type: "markupRecolor", page: sel.page, nm: sel.mark.nm, color: argb });
+    // A mark the file gave no name is named by the core right before the recolour (3.18.1).
+    this._post({ type: "markupRecolor", page: sel.page, index: sel.mark.index, nm: sel.mark.nm, color: argb });
   }
   /** The text selected on a page in annotate mode, or null: {page, start, end, text, bounds}. @since 3.15.0 */
   get pageTextSelection() {
@@ -2474,13 +2471,9 @@ export class PdfeEditor {
 
   _deleteSelectedMark() {
     const sel = this._selectedMark;
-    if (!sel.mark.nm) {
-      this._emit("error", errorEvent("markup-not-found", "This mark has no name in the file, so it cannot be deleted"));
-      this._emit("deleted", { page: sel.page, ok: false, kind: "markup" });
-      return;
-    }
+    // A mark the file gave no name is named by the core right before the delete (3.18.1).
     this._setSelectedMark(null);
-    this._post({ type: "markupDelete", page: sel.page, nm: sel.mark.nm, kind: sel.mark.tool });
+    this._post({ type: "markupDelete", page: sel.page, index: sel.mark.index, nm: sel.mark.nm, kind: sel.mark.tool });
   }
 
   /** A tap in annotate mode: a mark selects it, anything else clears (the
@@ -3175,7 +3168,7 @@ export class PdfeEditor {
         if (!this._history.recording) this._setDirty(true);
         const back = (msg.marks || []).find((m) => m.nm === msg.nm);
         if (back && this._selectedMark && this._selectedMark.page === msg.page &&
-            this._selectedMark.mark.nm === msg.nm) this._setSelectedMark({ page: msg.page, mark: back });
+            (this._selectedMark.mark.nm ?? null) === ("asked" in msg ? msg.asked : msg.nm)) this._setSelectedMark({ page: msg.page, mark: back });
         return true;
       }
       case "markupHistoryApplied": {

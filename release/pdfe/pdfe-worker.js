@@ -160,6 +160,8 @@ const ready = createPdfe({
     ["number", "number", "number", "number", "number"]);
   F.markupName    = m.cwrap("pdfe_markup_name", "number",
     ["number", "number", "number", "number", "number"]);
+  F.markupEnsureName = m.cwrap("pdfe_markup_ensure_name", "number",
+    ["number", "number", "number", "number", "number", "number"]);
   F.markupCreate  = m.cwrap("pdfe_markup_create", "number",
     ["number", "number", "number", "number", "number", "number"]);
   F.markupDelete  = m.cwrap("pdfe_markup_delete", "number", ["number", "number", "number", "number"]);
@@ -2763,6 +2765,21 @@ function deleteMarkupByName(page, nm) {
   return !!ok;
 }
 
+// 3.18.1: the name to delete / recolour mark |index| by — its own /NM, or one the core mints and
+// writes when the file gave none (or an earlier mark shares it). |nm| is the name the shell last
+// listed (null for none); "" when the index is stale. Never called while listing.
+function nameToActOn(page, index, nm) {
+  if (!Number.isInteger(index) || index < 0) return "";
+  const pg = acquirePage(page);
+  const len = withUtf8(nm || "", (p) => F.markupEnsureName(doc, pg, index, p, 0, 0));
+  if (len <= 1) return "";
+  const nb = mod._malloc(len);
+  F.markupName(doc, pg, index, nb, len);
+  const out = cstr(nb);
+  mod._free(nb);
+  return out;
+}
+
 function applyMarkupHistory(kind) {
   if (!doc) return;
   const undo = kind === "undo";
@@ -3253,22 +3270,25 @@ function handleAnnotateMessage(msg) {
       return true;
     case "markupDelete": {
       if (!doc) return true;
-      const ok = deleteMarkupByName(msg.page, msg.nm || "");
-      postMessage({ type: "markupDeleted", ok, page: msg.page, nm: msg.nm, kind: msg.kind,
+      const nm = nameToActOn(msg.page, msg.index, msg.nm);
+      const ok = !!nm && deleteMarkupByName(msg.page, nm);
+      postMessage({ type: "markupDeleted", ok, page: msg.page, nm: nm || msg.nm, kind: msg.kind,
                     marks: readMarkups(msg.page) });
       postHistory(true);
       return true;
     }
     case "markupRecolor": {
       if (!doc) return true;
+      const nm = nameToActOn(msg.page, msg.index, msg.nm);
       const pg = acquirePage(msg.page);
       const rect = mod._malloc(16);
-      const ok = withUtf8(msg.nm || "", (p) => F.markupSetColor(doc, pg, p, Number(msg.color) >>> 0, rect));
+      const ok = !!nm && withUtf8(nm, (p) => F.markupSetColor(doc, pg, p, Number(msg.color) >>> 0, rect));
       const r = readF32(rect, 4);
       mod._free(rect);
       if (ok) repaintRect(msg.page, r);
-      postMessage({ type: "markupRecolored", ok: !!ok, page: msg.page, nm: msg.nm,
-                    marks: readMarkups(msg.page) });
+      // |asked|: the name the shell listed (null for a nameless mark), so it can find its selection.
+      postMessage({ type: "markupRecolored", ok: !!ok, page: msg.page, nm: nm || msg.nm,
+                    asked: msg.nm ?? null, marks: readMarkups(msg.page) });
       postHistory(true);
       return true;
     }
